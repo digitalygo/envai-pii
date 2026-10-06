@@ -463,6 +463,13 @@ curl -F "file=@atto.pdf" localhost:5005/pdf -o atto_anonimizzato.pdf   # anonymi
 curl localhost:5005/settings                     # tag legend, excluded tags, dictionary state
 ```
 
+A versioned guardrail endpoint for machine-to-machine use is available as a single-text slice:
+`POST /api/v1/analyses` takes one JSON text and an optional `placeholder -> original` dictionary
+seed and returns the anonymized text plus a delta of the new pairs, behind a Bearer token. It is
+stateless, additive and independent of the legacy routes and preferences. Contract, limits, errors
+and rationale: **[docs/GUARDRAIL_API.md](docs/GUARDRAIL_API.md)** (schema version 0.1.0; the OpenAPI
+3.1 file is [docs/guardrail-openapi.yaml](docs/guardrail-openapi.yaml)).
+
 ### Get the anonymized document back as a PDF
 
 `POST /pdf` takes the same input as `/analyze` and returns a PDF. Upload a **PDF** and you get that

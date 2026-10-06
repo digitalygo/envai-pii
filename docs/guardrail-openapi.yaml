@@ -1,0 +1,399 @@
+openapi: 3.1.0
+
+info:
+  title: envai-pii guardrail API (ENVAS-23 first slice)
+  version: 0.1.0
+  summary: Stateless PII guardrail with a caller-supplied dictionary seed
+  description: |
+    Contract for the single-text first slice of the ENVAS-23 guardrail API, schema
+    version 0.1.0. The endpoint is implemented in this repository: the dependency-free
+    engine in `src/app/pii_dictionary.py`, the HTTP shell in `src/app/guardrail_api.py`
+    and the adapter registered from `src/app/app.py`, with dedicated tests in
+    `tests/test_pii_dictionary.py` and `tests/test_guardrail_api.py`. Legacy routes and
+    preferences are unchanged; other ENVAS-23 acceptance criteria beyond this endpoint
+    are out of scope and not claimed as complete.
+
+    Scope: one endpoint, `POST /api/v1/analyses`. It accepts one UTF-8 JSON text and an
+    optional dictionary seed of known `placeholder -> original` pairs, and returns the
+    anonymized text plus a delta containing only the newly allocated pairs.
+
+    Out of scope for this slice: batch, multipart and file inputs, PDF handling and OCR,
+    and any change to the Envai AaaS monorepo or its registry. The legacy `/analyze`,
+    `/pdf`, `/pdf/preview`, `/preview` routes, the web UI and the legacy preferences are
+    unchanged.
+
+    Authentication is a server-only Bearer secret from the `PII_API_TOKEN` environment
+    variable. The value is never documented, logged or echoed. When the secret is unset
+    or blank the endpoint is disabled and answers 503; missing or wrong credentials
+    answer 401. POST errors are sanitized to `{error, code}` with stable codes and never
+    echo request values or the token; an unsupported method keeps the framework's 405 (or
+    automatic OPTIONS 200) semantics. Every response at the path sets
+    `Cache-Control: no-store`.
+
+    Limits (fixed, non-secret constants): request body 1048576 bytes, `text` 100000
+    Unicode characters, dictionary 256 entries, one original 4096 characters, aggregate
+    originals 65536 characters, placeholder index 1 to 999999999 per category. Deadline
+    30 seconds of processing after the bounded body read, cooperative and not a hard
+    cancellation or completion guarantee. One analysis in flight per process. Model
+    readiness is checked before the per-process lock, so an unavailable model answers
+    503 even when seed or existing placeholders could cover the text without inference.
+
+    Semantics and decisions are documented in `docs/GUARDRAIL_API.md`.
+
+servers:
+  - url: http://127.0.0.1:5005
+    description: |
+      Default loopback bind of the envai-pii app. Legacy routes and this endpoint share
+      the process; the versioned path keeps the new contract separate.
+  - url: https://pii.internal.invalid
+    description: |
+      Placeholder origin for an internal deployment behind an authenticated proxy with
+      TLS. Replace with the real internal origin; do not expose the endpoint directly
+      outside loopback or a private network.
+
+tags:
+  - name: guardrail
+    description: Versioned, stateless guardrail API for machine-to-machine use.
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/v1/analyses:
+    post:
+      tags:
+        - guardrail
+      operationId: createAnalysis
+      summary: Anonymize one text with an imported dictionary seed
+      description: |
+        Stateless and additive. One request processes one `text`; `results` always
+        contains exactly one element with `input_id: "text"`.
+
+        All `TAG_NAMES` categories are enabled, with no opt-out. Legacy server
+        preferences (`EXCLUDED_TAGS`, `MAPPING_ENABLED`) and request overrides such as
+        `exclude_tags` and `include_mapping` are ignored; unknown fields are rejected.
+
+        Seed pairs are immutable and are reused when category and normalized original
+        match. Known originals are located even when the model misses them. New IDs are
+        allocated above the maximum already occupied per category by seed keys and by
+        placeholder tokens found in the input. `dictionary_delta` carries new pairs only;
+        the seed and the full mapping are never returned.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnalysisRequest'
+            examples:
+              seedReusedAndNewEmail:
+                summary: Known FULLNAME reused, new email allocated as EMAIL_1
+                value:
+                  dictionary:
+                    "[FULLNAME_7]": "Mario Rossi"
+                  text: "Mario Rossi, scrivi a mario@example.com"
+      responses:
+        '200':
+          description: |
+            Anonymized text and delta of newly allocated pairs. `Cache-Control: no-store`.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalysisResponse'
+              examples:
+                seedReusedAndNewEmail:
+                  summary: Seed pair reused, new email allocated; count is 2
+                  value:
+                    results:
+                      - input_id: text
+                        anonymized_text: "[FULLNAME_7], scrivi a [EMAIL_1]"
+                        statistics:
+                          placeholder_count: 2
+                    dictionary_delta:
+                      "[EMAIL_1]": "mario@example.com"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/Busy'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/DeadlineExceeded'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Server-only secret from the `PII_API_TOKEN` environment variable. The value is
+        never documented, logged or echoed. When the variable is unset or blank the
+        endpoint is disabled and answers 503 before credentials are evaluated; a missing
+        or wrong credential answers 401. No other authentication mode is accepted.
+
+  headers:
+    NoStore:
+      description: |
+        Always `no-store`. Responses may contain personal data and must not be cached by
+        proxies. Set on every outcome, success and error.
+      schema:
+        type: string
+        enum:
+          - no-store
+
+  responses:
+    BadRequest:
+      description: |
+        Invalid request, invalid seed, seed conflict or allocation exhaustion. The code
+        is one of `invalid_request`, `invalid_seed`, `seed_conflict`,
+        `allocation_exhausted`. Unpaired UTF-16 surrogates are rejected here too: in
+        `text` as `invalid_request`, in a seed value as `invalid_seed`.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: |
+        Missing or wrong Bearer credential. Code: `unauthorized`.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    PayloadTooLarge:
+      description: |
+        A fixed size limit was exceeded: request body (1048576 bytes), `text` (100000
+        Unicode characters), dictionary entries (256), one original (4096 characters) or
+        aggregate originals (65536 characters). Code: `payload_too_large`.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    UnsupportedMediaType:
+      description: |
+        `Content-Type` is not `application/json` encoded as UTF-8 (including a non-UTF-8
+        charset, multipart and file uploads). Code: `unsupported_media_type`.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Busy:
+      description: |
+        Another analysis is already in flight in this process. The request is rejected,
+        not queued. Code: `busy`.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    InternalError:
+      description: |
+        Unexpected processing failure. Code: `internal_error`. The message never
+        contains request values, exception text or the token.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unavailable:
+      description: |
+        `PII_API_TOKEN` is unset or blank, so the endpoint is disabled; the model is not
+        ready (readiness is checked before the per-process lock, even when the text could
+        be resolved entirely from the seed or from placeholders already present); the
+        detector became unavailable mid-request; or the service is unavailable. Code:
+        `unavailable`.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    DeadlineExceeded:
+      description: |
+        The 30-second cooperative processing budget was reached. The budget starts after
+        the bounded body read and cannot interrupt an in-flight model call, so it is not
+        a cancellation or completion guarantee: deployments must also set a hard worker
+        or proxy timeout that covers slow uploads and in-flight calls. Code:
+        `deadline_exceeded`.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    PlaceholderKey:
+      type: string
+      pattern: '^\[(AGE|AMOUNT|BUILDINGNUM|CATASTO|CF|CITY|CREDITCARDNUMBER|DATE|DOCID|EMAIL|FULLNAME|GENDER|IBAN|ID_DOC|IPADDR|ORG|PIVA|PROVINCE|STREET|TARGA|TELEPHONENUM|TIME|URL|ZIPCODE)_[1-9][0-9]{0,8}\]$'
+      description: |
+        Canonical placeholder token. `LABEL` is one of the current `TAG_NAMES`
+        categories (the 22 model categories plus the regex-only `URL` and `IPADDR`); `N`
+        is a positive ASCII integer from 1 to 999999999 written without leading zeros.
+        Brackets are part of the format.
+
+    AnalysisRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - text
+      properties:
+        text:
+          type: string
+          minLength: 1
+          pattern: '\S'
+          maxLength: 100000
+          description: |
+            Required. The single text to anonymize. It must contain at least one
+            non-whitespace character and is measured in Unicode characters (code
+            points). Missing, blank or non-string values are rejected. Plain text; not
+            parsed as Markdown or HTML. An unpaired UTF-16 surrogate is rejected with
+            `invalid_request`; valid surrogate pairs (astral-plane characters, emoji)
+            are accepted.
+        dictionary:
+          type: object
+          maxProperties: 256
+          propertyNames:
+            $ref: '#/components/schemas/PlaceholderKey'
+          additionalProperties:
+            type: string
+            minLength: 1
+            pattern: '\S'
+            maxLength: 4096
+          description: |
+            Optional seed of known `placeholder -> original` pairs. Absent or `{}` means
+            an empty seed; `null` is invalid. Pairs are immutable and are reused when
+            category and normalized original match (Unicode casefold, strip and collapse
+            whitespace to one ASCII space; no accent removal, no NFC or NFKC folding, no
+            punctuation stripping). Known originals are located literally with safe word
+            boundaries even when the model misses them, and replacements are applied
+            once on original offsets with no recursive rescan.
+
+            At most 256 entries; each original at most 4096 characters; aggregate
+            originals at most 65536 characters. Two entries that normalize to the same
+            original conflict, even with different labels, and reject the request. A
+            value with an unpaired UTF-16 surrogate rejects the request with
+            `invalid_seed`; valid surrogate pairs are accepted. The seed is never echoed
+            back.
+
+    AnalysisResult:
+      type: object
+      additionalProperties: false
+      required:
+        - input_id
+        - anonymized_text
+        - statistics
+      properties:
+        input_id:
+          type: string
+          const: text
+          description: |
+            Constant `"text"` in this slice. A future batch variant would use other
+            identifiers for files or additional texts.
+        anonymized_text:
+          type: string
+          description: |
+            The input text with seed matches and new PII replaced by canonical
+            placeholders; everything else unchanged. Placeholder tokens already present
+            in the input are kept untouched and their IDs stay reserved.
+        statistics:
+          type: object
+          additionalProperties: false
+          required:
+            - placeholder_count
+          properties:
+            placeholder_count:
+              type: integer
+              minimum: 0
+              description: |
+                Number of canonical placeholder tokens in `anonymized_text`, counting
+                every occurrence; a placeholder repeated twice counts twice. Includes
+                seed placeholders reused in the output and newly allocated placeholders.
+
+    AnalysisResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - results
+        - dictionary_delta
+      properties:
+        results:
+          type: array
+          minItems: 1
+          maxItems: 1
+          description: Exactly one element in this slice.
+          items:
+            $ref: '#/components/schemas/AnalysisResult'
+        dictionary_delta:
+          type: object
+          propertyNames:
+            $ref: '#/components/schemas/PlaceholderKey'
+          additionalProperties:
+            type: string
+            minLength: 1
+            pattern: '\S'
+          description: |
+            New pairs only: placeholder -> first observed surface form of the original,
+            preserving casing and spacing. Seed pairs and placeholder tokens already
+            present in the input never appear here. Empty object when nothing new. The
+            full seed and the full mapping are never returned, and the response never
+            includes `source_text`, `segments` or per-entity original fields.
+
+    Error:
+      type: object
+      additionalProperties: false
+      description: |
+        Error envelope for `POST /api/v1/analyses` only. A request with an unsupported
+        method keeps the framework's HTTP method semantics (405, or automatic OPTIONS
+        200) and does not use this envelope; every response at the path still sets
+        `Cache-Control: no-store`.
+      required:
+        - error
+        - code
+      properties:
+        error:
+          type: string
+          description: |
+            Generic human-readable message. It contains no request values, entity names,
+            seed values, token, stack trace or exception text; clients branch on `code`.
+        code:
+          type: string
+          enum:
+            - invalid_request
+            - invalid_seed
+            - seed_conflict
+            - allocation_exhausted
+            - payload_too_large
+            - unsupported_media_type
+            - unauthorized
+            - busy
+            - unavailable
+            - deadline_exceeded
+            - internal_error

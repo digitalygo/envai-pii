@@ -57,6 +57,7 @@ import torch
 from flask import (Flask, jsonify, render_template_string, request,
                    send_from_directory)
 
+import guardrail_api
 import pdf_export
 import pdf_text
 import server_config
@@ -456,6 +457,54 @@ def analyze(text, excluded=None, mapping_enabled=True):
         "by_source": by_source,
         "excluded_tags": sorted(excluded),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Guardrail API v1 (ENVAS-23, prima slice): endpoint additivo sotto /api/v1.
+# Il contratto e' docs/GUARDRAIL_API.md + docs/guardrail-openapi.yaml; le route
+# legacy qui sopra non cambiano. Il motore del seed sta in pii_dictionary.py, il
+# guscio HTTP in guardrail_api.py. Qui c'e' solo l'adapter verso la pipeline
+# esistente: detect_model/completa-confini/regex/_merge, senza riscriverli.
+# --------------------------------------------------------------------------- #
+def _guardrail_detect(text, check_deadline):
+    """Rilevamento su un tratto NON protetto per la guardrail API.
+
+    Differenza voluta da detect_model(): l'inferenza gira un chunk per volta, cosi'
+    il callback di deadline viene controllato tra un chunk e l'altro. Una singola
+    chiamata a nlp() non e' interrompibile; il contratto lo dice esplicitamente
+    (docs/GUARDRAIL_API.md, sezione Deadline): la deadline e' cooperativa.
+    """
+    if nlp is None:
+        raise guardrail_api.ModelUnavailable()
+    ents = []
+    for chunk, offset in chunk_text(text):
+        check_deadline()
+        results = nlp([chunk])                 # stessa forma batch, un chunk per call
+        check_deadline()
+        if isinstance(results, dict):
+            results = [results]
+        res = (results[0] if len(results) == 1 and isinstance(results[0], (list, tuple))
+               else results)
+        for e in res:
+            ents.append({
+                "label": e["entity_group"],
+                "start": int(e["start"]) + offset,
+                "end": int(e["end"]) + offset,
+                "score": float(e["score"]),
+                "validated": False,
+                "source": "modello",
+            })
+    complete_time(ents, text)
+    check_deadline()
+    regex_ents = detect_regex(text)
+    check_deadline()
+    cands = ents + regex_ents
+    check_deadline()
+    return _merge(cands, text)
+
+
+guardrail_api.register_app(app, tags=TAG_NAMES, detect=_guardrail_detect,
+                           readiness=lambda: nlp is not None)
 
 
 # --------------------------------------------------------------------------- #

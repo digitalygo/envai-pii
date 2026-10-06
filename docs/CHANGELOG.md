@@ -5,6 +5,47 @@ Le voci più recenti in alto. (Codice: `src/training/train_pii.py` salvo diverso
 
 ---
 
+## 2026-10-06 - API guardrail ENVAS-23: import del dizionario e delta su testo singolo
+
+Prima slice dello endpoint guardrail `POST /api/v1/analyses` per l'integrazione Envai
+AaaS (ENVAS-23), ora implementata. La ragione d'essere e' l'import/delta: il chiamante
+passa le coppie `placeholder -> originale` che conosce gia' e riceve indietro solo le
+coppie nuove, cosi' gli ID restano coerenti col registro AAAS, i valori noti non vengono
+ricopiati e il merge non sovrascrive nulla. La slice resta di un solo testo (`text`) piu'
+un `dictionary` opzionale: niente file, multipart, array o batch.
+
+- risposta `{results: [{input_id, anonymized_text, statistics}], dictionary_delta}` con
+  il solo delta delle coppie nuove; mai il seed completo, `source_text`, `segments` o i
+  campi con i valori delle entita' note;
+- placeholder canonici `[LABEL_N]` sulle categorie di `TAG_NAMES` (incluse `URL` e
+  `IPADDR`), ID del seed immutabili e riutilizzati, originali noti localizzati anche
+  quando il modello non li rileva, ID nuovi oltre il massimo occupato per categoria,
+  conflitti sul valore normalizzato rifiutati;
+- autenticazione Bearer con segreto server-side `PII_API_TOKEN` (nessun valore nei
+  documenti), limiti fissi per corpo/testo/dizionario, deadline cooperativa di 30
+  secondi sul processing dopo la lettura del corpo, una analisi in volo per processo,
+  errori sanificati con codice stabile e `Cache-Control: no-store` su ogni esito del
+  path;
+- route e UI legacy (`/analyze`, `/pdf`, `/pdf/preview`, `/preview`) e preferenze
+  invariate: l'endpoint e' additivo sotto `/api/v1` e non riusa la `mapping`
+  request-local di `/analyze` ne' `prefs.json`.
+
+Implementazione: motore in `src/app/pii_dictionary.py` (solo standard library, nessun
+import di Flask/torch, rilevatore e deadline iniettati), guscio HTTP in
+`src/app/guardrail_api.py` (`process_request()` indipendente da Flask piu' blueprint
+sottile) e adapter in `src/app/app.py` che riusa la pipeline esistente senza riscriverla.
+Copertura dedicata in `tests/test_pii_dictionary.py` (normalizzazione, seed,
+localizzazione, allocazione, delta) e `tests/test_guardrail_api.py` (envelope JSON
+severo, auth, limiti, lock, deadline, errori sanificati, no-store, cablaggio con l'app
+legacy); i test usano un modello finto e non importano torch/transformers/fitz.
+
+Fuori ambito di questa slice, senza impegno su tempi o forme: batch e intake multipart,
+OCR e redazione raster, e ogni modifica al monorepo AAAS (registro, merge validato,
+ripristino). Il contratto implementato e' in [docs/GUARDRAIL_API.md](GUARDRAIL_API.md) e
+nello schema OpenAPI 3.1 versione 0.1.0 [docs/guardrail-openapi.yaml](guardrail-openapi.yaml).
+
+---
+
 ## 2026-09-01 — PDF fillable: i campi modulo entrano in `/analyze` (`pdf_text.py`)
 
 `_text_from_bytes` leggeva solo `page.get_text()`. Nei PDF con AcroForm (moduli

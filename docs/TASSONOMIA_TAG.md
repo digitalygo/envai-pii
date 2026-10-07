@@ -1,4 +1,4 @@
-# Tassonomia dei tag PII — versione definitiva
+# Tassonomia dei tag PII: versione definitiva
 
 Documento di riferimento sulla tassonomia dei tag che il modello mmBERT impara a
 riconoscere. È la **fonte di verità** quando si riprende il progetto: descrive i
@@ -7,7 +7,7 @@ riconoscere. È la **fonte di verità** quando si riprende il progetto: descrive
 > I file dei dataset (reale Ai4Privacy + sintetico) restano **grezzi e intatti**.
 > La tassonomia qui descritta si ottiene al **caricamento** in `train_pii.py` tramite
 > `TAG_MAP` + `DROP_TYPES` + `normalize_labels()`. Per cambiare la mappatura si edita
-> solo `TAG_MAP` — niente va riannotato a mano.
+> solo `TAG_MAP`, niente va riannotato a mano.
 
 ---
 
@@ -40,7 +40,8 @@ riconoscere. È la **fonte di verità** quando si riprende il progetto: descrive
 
 > **Due tag solo nell'app, non nel modello: `URL` e `IPADDR`.** Non compaiono nel training né in
 > `TAG_MAP`: li trova la sola rete regex di `src/app/detectors.py`. Stanno qui per completezza
-> della legenda mostrata all'utente.
+> della legenda dei 24 tag esposta dall'API (`GET /settings`).
+>
 > - `URL` matcha `http(s)://…`, `www.…` e i domini nudi **solo** con un TLD della lista chiusa nel
 >   detector: senza quella lista il legalese italiano (`p.iva`, `n.ro`, `S.r.l.`) verrebbe letto
 >   come dominio.
@@ -48,7 +49,7 @@ riconoscere. È la **fonte di verità** quando si riprende il progetto: descrive
 >   (`192.168.1.0/24`) e range (`192.168.1.1-192.168.1.20`). Il vincolo sull'ottetto è ciò che
 >   esclude le versioni software tipo `2.3.55.987` (`987` non è un ottetto valido). Limite noto:
 >   una versione con tutti i numeri per caso ≤ 255 (es. `1.2.3.4`) resta indistinguibile da un IP
->   vero — non risolvibile con la sola forma, servirebbe il modello.
+>   vero, non risolvibile con la sola forma, servirebbe il modello.
 
 Formato BIO: ogni tag esiste come `B-<TAG>` (inizio entità) e `I-<TAG>` (continuazione),
 più `O` (token non sensibile). I token adiacenti dello stesso tipo vengono fusi in una
@@ -103,13 +104,27 @@ non chiedendolo alla token-classification.
 - `AGE`, `GENDER`, `DATE`, `TIME` sono dati personali GDPR ma **non identificatori
   diretti**; in un atto spesso servono. Politica di mascheramento da decidere a valle,
   non necessariamente "sempre".
-- Questa decisione "a valle" è **esposta all'utente**: nell'app ogni tag si può deselezionare
-  (icona 🏷️, oppure `--exclude-tags` / `PII_EXCLUDE_TAGS` / `exclude_tags` nella richiesta).
-  Un tag deselezionato viene comunque **rilevato**, ma non sostituito dal placeholder: serve a chi
+- Questa decisione "a valle" è **configurabile via API legacy**: ogni tag si può escludere con
+  `--exclude-tags`, `PII_EXCLUDE_TAGS` o il campo `exclude_tags` nella richiesta, oppure salvando
+  la preferenza in `prefs.json` (esposta da `GET /settings`). Questi controlli valgono solo per
+  l'API legacy (`/analyze`, le route PDF e `/settings`): l'endpoint guardrail v1
+  `POST /api/v1/analyses` è **stateless**, ignora `prefs.json` e le esclusioni e maschera
+  **tutte le 24 categorie** di `TAG_NAMES`, restituendo solo il delta dei nuovi placeholder
+  (`dictionary_delta`). I campi legacy `exclude_tags` e `include_mapping` non esistono nel
+  contratto v1 e vengono rifiutati come sconosciuti (dettagli in `docs/GUARDRAIL_API.md`).
+  Un tag escluso viene comunque **rilevato**, ma non sostituito dal placeholder: serve a chi
   deve far confrontare gli importi a un LLM, o tenere età e sesso in una cartella clinica.
-- Anche la **reversibilità** è una scelta dell'utente, non del modello: lo switch "Dizionario
-  reversibile" (`--no-mapping` / `PII_MAPPING=0` / `include_mapping`) toglie del tutto la mappa
-  placeholder → valore. I tag restano gli stessi: cambia solo se la chiave di ripristino esiste.
+- Anche la **reversibilità di `/analyze`** è una scelta di configurazione, non del modello:
+  `--no-mapping` / `PII_MAPPING=0` / `include_mapping` controllano se la route restituisce la mappa
+  placeholder → valore. I tag restano gli stessi: cambia solo se la chiave di ripristino viene
+  restituita. Con il mapping disattivato, `/analyze` restituisce comunque `mapping: {}` (oggetto
+  vuoto, non un campo assente), omette `source_text` e toglie il campo `t` dai segmenti-entità.
+  Con il mapping attivo, `/analyze` restituisce la mappa al client HTTP: il chiamante ne è
+  proprietario e deve conservarla e proteggerla; il servizio non la conserva e non offre un
+  endpoint di ripristino. Il servizio non include più una UI browser né un'implementazione
+  `localStorage`. Le route PDF seguono un flusso distinto: costruiscono sempre il mapping
+  internamente e non restituiscono il dizionario. `POST /api/v1/analyses` non accetta
+  `include_mapping` e restituisce solo il `dictionary_delta`, mai la mappa completa.
 
 ---
 
@@ -128,6 +143,7 @@ Il training fonde **tre fonti**, tutte ricondotte ai 22 tag:
 > per la varietà di contesto; i valori italiani veri arrivano da Ai4Privacy + sintetici.
 
 **Una validation reale unificata** (`validation_real.jsonl`, da `build_validation.py`):
+
 - **base reale held-out** = Ai4Privacy validation (it) + DeepMount test;
 - per i 5 tag senza alcun esempio reale (`CF`, `PIVA`, `CATASTO`, `DOCID`, `PROVINCE`)
   le entità generate sono **iniettate in frasi reali held-out** (frasi della validation Ai4,
@@ -139,7 +155,7 @@ in training).
 
 ## Catena di derivazione
 
-```
+```text
 file grezzi (reale Ai4Privacy + sintetico)   ← tag grezzi: GIVENNAME, TAXNUM, PEC, RG, IDCARDNUM, CONTO, ...
         │
         ▼  caricamento in train_pii.py

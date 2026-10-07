@@ -1,17 +1,17 @@
-# Contributing to rizzo-pii
+# Contributing to envai-pii
 
-Thanks for helping build a privacy tool for Italy. 🦔🇮🇹
+Thanks for helping build a privacy tool for Italy.
 
-The single biggest lever on quality is **data** — a large, real, lawfully-collected Italian
+The single biggest lever on quality is **data**: a large, real, lawfully-collected Italian
 corpus, especially for **organizations (`ORG`)** and the legal identifiers that are scarce today.
 Contributions of code, documentation and (above all) data are all welcome.
 
 ## Ways to contribute
 
-- **🐛 Report a bug or a missed entity.** Open an issue with a short, **anonymized** example
+- **Report a bug or a missed entity.** Open an issue with a short, **anonymized** example
   (never paste real personal data) showing what was tagged wrong.
-- **🔀 Code / docs.** Fork, branch, and open a pull request (see workflow below).
-- **📚 Data.** The community dataset lives on Hugging Face:
+- **Code / docs.** Fork, branch, and open a pull request (see workflow below).
+- **Data.** The community dataset lives on Hugging Face:
   **[`rizzoaiacademy/anonimizzazione-testi-italiano`](https://huggingface.co/datasets/rizzoaiacademy/anonimizzazione-testi-italiano)**.
   The quickest way to help is the contribution script, which uses **your own Gemini key** to
   write **brand-new** legal prose every run, injects valid values (CF/PIVA/IBAN checksums) with
@@ -20,7 +20,7 @@ Contributions of code, documentation and (above all) data are all welcome.
   ```bash
   pip install huggingface_hub                                     # the data script needs no torch
   export GEMINI_API_KEY=...      # https://aistudio.google.com/apikey   (PowerShell: $env:GEMINI_API_KEY=...)
-  # …or write the templates with a LOCAL model instead — no API key, nothing leaves the machine:
+  # …or write the templates with a LOCAL model instead: no API key, nothing leaves the machine:
   export LLM_BASE_URL=http://127.0.0.1:8080/v1   # llama.cpp / Ollama / vLLM / LM Studio
   export LLM_MODEL=your-model-name
   hf auth login                  # or: export HF_TOKEN=hf_xxx
@@ -31,19 +31,19 @@ Contributions of code, documentation and (above all) data are all welcome.
   ```
 
   The **exact row format** (JSONL, BIO scheme, offsets, required checksums) is documented in
-  [docs/FORMATO_DATI.md](docs/FORMATO_DATI.md) — read it if you want to produce examples by
-  hand. The README also has a ready-to-paste prompt for a coding agent.
+  [docs/FORMATO_DATI.md](docs/FORMATO_DATI.md), which explains how to produce examples by
+  hand. The README has setup and workflow instructions for running and training the fork.
 
-> ⚠️ **Never contribute real personal data.** This project exists to protect PII. Examples in
+> **Warning:** Never contribute real personal data. This project exists to protect PII. Examples in
 > issues, PRs and the dataset must be synthetic or fully anonymized. The whole synthetic pipeline
 > is built on the *"LLM author, code labeler"* principle precisely so that no real PII is ever
-> handled — please keep it that way.
+> handled, so please keep it that way.
 
 ## Development setup
 
 ```bash
-git clone https://github.com/Rizzo-AI-Academy/rizzo-pii
-cd rizzo-pii
+git clone https://github.com/digitalygo/envai-pii
+cd envai-pii
 python -m venv .venv && . .venv/Scripts/activate   # Windows; use bin/activate on Linux/macOS
 pip install -r requirements.txt                    # see the cu128 note for NVIDIA Blackwell GPUs
 cp .env.example .env                               # optional: add W&B / Gemini keys

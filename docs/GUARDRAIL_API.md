@@ -55,9 +55,10 @@ The following are explicitly out of scope and must not be assumed as promised by
 ## Compatibility with existing endpoints and preferences
 
 The legacy routes (`/analyze`, `/pdf`, `/pdf/preview`, `/preview`, `/settings`, `/health`,
-`/doc/...`, `/config`, `/port-check`) and the web UI keep their current semantics, including
-`mapping` as the full `placeholder -> value` map. The new endpoint is additive and versioned under
-`/api/v1/`.
+`/doc/...`, `/config`, `/port-check`) keep their current HTTP semantics, including `mapping` as the
+full `placeholder -> value` map. The browser UI has been removed: `GET /`, the former
+`/assets/...` paths and the favicon path answer `404` with a generic JSON body, and no service
+index or other HTML page is served. The new endpoint is additive and versioned under `/api/v1/`.
 
 The new endpoint is stateless: it keeps no dictionary between requests, never reads or writes
 `prefs.json`, and never reuses the legacy app's request-local `mapping` (the
@@ -330,9 +331,10 @@ Every error response to `POST /api/v1/analyses` has exactly this body:
 - Messages must not contain request values, entity names, seed values, the token, stack traces or
   exception text.
 - This envelope covers the endpoint's own outcomes only. A request to the same path with an
-  unsupported method keeps the framework's HTTP method semantics: a wrong method answers `405` and
-  an automatic `OPTIONS` answers `200`, with the framework's body rather than this envelope. Every
-  response at `/api/v1/analyses`, including those `405` and `OPTIONS` responses, still sets
+  unsupported method keeps the framework's HTTP method semantics: a wrong method answers `405` with
+  the framework's generic JSON error body (not this envelope) and preserves the `Allow` header, and
+  an automatic `OPTIONS` answers an empty `200` with the framework's usual headers. Every response
+  at `/api/v1/analyses`, including those `405` and `OPTIONS` responses, still sets
   `Cache-Control: no-store`.
 
 Stable codes:

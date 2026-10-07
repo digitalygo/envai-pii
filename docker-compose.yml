@@ -1,4 +1,4 @@
-# docker-compose.yml — Rizzo PII webapp
+# docker-compose.yml: Rizzo PII API
 #
 # Uso:
 #   docker compose up -d --build     # build + avvio in background
@@ -36,7 +36,7 @@ services:
       OMP_NUM_THREADS: 4
 
     volumes:
-      # Preferenze UI (~/.local/share/rizzo-pii): senza questo si perdono
+      # Preferenze legacy dell'API (~/.local/share/rizzo-pii): senza questo si perdono
       # a ogni ricreazione del container.
       - rizzo-pii-home:/home/app
 

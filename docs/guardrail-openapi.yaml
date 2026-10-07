@@ -9,8 +9,9 @@ info:
     version 0.1.0. The endpoint is implemented in this repository: the dependency-free
     engine in `src/app/pii_dictionary.py`, the HTTP shell in `src/app/guardrail_api.py`
     and the adapter registered from `src/app/app.py`, with dedicated tests in
-    `tests/test_pii_dictionary.py` and `tests/test_guardrail_api.py`. Legacy routes and
-    preferences are unchanged; other ENVAS-23 acceptance criteria beyond this endpoint
+    `tests/test_pii_dictionary.py` and `tests/test_guardrail_api.py`. Legacy HTTP contracts
+    and preferences are unchanged, while the browser UI has been removed; other ENVAS-23
+    acceptance criteria beyond this endpoint
     are out of scope and not claimed as complete.
 
     Scope: one endpoint, `POST /api/v1/analyses`. It accepts one UTF-8 JSON text and an
@@ -19,15 +20,17 @@ info:
 
     Out of scope for this slice: batch, multipart and file inputs, PDF handling and OCR,
     and any change to the Envai AaaS monorepo or its registry. The legacy `/analyze`,
-    `/pdf`, `/pdf/preview`, `/preview` routes, the web UI and the legacy preferences are
-    unchanged.
+    `/pdf`, `/pdf/preview`, `/preview` routes and the legacy preferences keep their HTTP
+    contracts; the browser UI has been removed, so there is no HTML page at `/` and
+    unknown paths answer a JSON error.
 
     Authentication is a server-only Bearer secret from the `PII_API_TOKEN` environment
     variable. The value is never documented, logged or echoed. When the secret is unset
     or blank the endpoint is disabled and answers 503; missing or wrong credentials
     answer 401. POST errors are sanitized to `{error, code}` with stable codes and never
-    echo request values or the token; an unsupported method keeps the framework's 405 (or
-    automatic OPTIONS 200) semantics. Every response at the path sets
+    echo request values or the token. An unsupported method answers `405` with the
+    framework's generic JSON error body, not this envelope, and preserves the `Allow`
+    header; an automatic `OPTIONS` answers an empty `200`. Every response at the path sets
     `Cache-Control: no-store`.
 
     Limits (fixed, non-secret constants): request body 1048576 bytes, `text` 100000
@@ -371,9 +374,9 @@ components:
       additionalProperties: false
       description: |
         Error envelope for `POST /api/v1/analyses` only. A request with an unsupported
-        method keeps the framework's HTTP method semantics (405, or automatic OPTIONS
-        200) and does not use this envelope; every response at the path still sets
-        `Cache-Control: no-store`.
+        method does not use this envelope: it answers `405` with the framework's generic
+        JSON error body, preserves the `Allow` header, and an automatic `OPTIONS` answers
+        an empty `200`. Every response at the path still sets `Cache-Control: no-store`.
       required:
         - error
         - code

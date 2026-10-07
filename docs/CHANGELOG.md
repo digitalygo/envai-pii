@@ -5,6 +5,73 @@ Le voci più recenti in alto. (Codice: `src/training/train_pii.py` salvo diverso
 
 ---
 
+## 2026-10-06 - Ritiro della web UI: il servizio resta solo API
+
+Su richiesta esplicita ("la UI web non ci serve, usiamo solo gli endpoint"), il fork ritira la
+UI browser. La pagina Flask unica (`PAGE` in `src/app/app.py`, con CSS e JS incorporati) non
+esiste piu': `app.py` serve solo endpoint HTTP. La rimozione riguarda la pagina e i suoi asset;
+training, pipeline dati, contratti HTTP e redazione PDF restano come prima, e il dizionario
+(`mapping`) resta un campo delle risposte API, non viene tolto.
+
+- rimossi `PAGE`, le route `GET /`, `/assets/<path>` e `/favicon.ico` e la cartella
+  `src/app/assets/`. Prima `GET /` serviva la pagina HTML (200) e gli errori framework uscivano
+  in HTML; ora `/` e i percorsi sconosciuti rispondono `404` JSON, e anche gli errori framework
+  (`404`/`405`/`413`/`500`) escono come JSON generico, con status e header invariati
+  (`405` conserva `Allow`, corpo generico senza URL ne' dettagli dell'eccezione);
+- endpoint legacy invariati nel contratto HTTP: `POST /analyze`, `/pdf`, `/pdf/preview`,
+  `/preview`, `GET /health`, `/settings` (alias `/tags`), `/config`, `/port-check`,
+  `/doc/<id>/page/<n>.png`, `/doc/<id>/file.pdf`. Le risposte binarie (PDF, PNG) restano
+  binarie e `GET /health` resta la sonda di readiness per l'avvio;
+- il ripristino non e' mai stato lato backend e continua a non esserlo: il dizionario restituito
+  da `/analyze` va conservato dal chiamante (stile AAAS), e con `mapping` disattivato la
+  risposta resta `mapping: {}` senza `source_text`. Nessun campo del dizionario e' stato rimosso
+  e nessun endpoint di restore e' stato aggiunto;
+- rimosso il test manuale `tests/test_ripristino_placeholder.py`: richiedeva `node` e provava la
+  `reverse()` JS incorporata nella pagina, che con la pagina fuori non ha piu' un bersaglio.
+
+Esplicitamente fuori da questa modifica: training e pipeline dati (nessuna riga toccata),
+autenticazione (i route legacy restano senza auth; il Bearer `PII_API_TOKEN` resta solo su
+`POST /api/v1/analyses`), i contratti wire della guardrail API v1 (seed, delta, limiti, deadline,
+categorie e campi invariati) e container/compose (comportamento invariato, etichette API). Le
+verifiche delle gate di qualita' e sicurezza seguono questa voce e non sono dichiarate qui.
+
+---
+
+## 2026-10-06 - Pulizia fork envai-pii: fuori il packaging desktop, dentro il runtime servizio
+
+Il fork digitalygo `envai-pii` di `rizzo-pii` mantiene training, pipeline dati, utility di
+ispezione, test, app Flask (UI + PDF) e API guardrail v1. Il comportamento dell'app, dell'API, del training e dei
+test resta invariato, così come modello, dataset e dipendenze. Sono stati rimossi il packaging
+desktop non più mantenuto e il launcher `src/app/desktop_app.py`, insieme ai relativi file di
+build e workflow di release.
+
+File rimossi (non sono piu' comandi o istruzioni attive):
+
+- app desktop Tauri (`tauri/`) e il suo packaging;
+- spec e script di build desktop (`build.spec`, `build_sidecar.spec`, `build_linux.sh`,
+  `build_macos.sh`, `build_mac.sh`, `installer.iss`, `Dockerfile.linux`);
+- launcher desktop `src/app/desktop_app.py` (resta `serve.py` come entry headless);
+- workflow di release desktop (`.github/workflows/build-windows.yml`, `release.yml`);
+- landing e asset collegati (`docs/index.html`, `docs/assets/`, `docs/.nojekyll`,
+  `docs/star_history_*.png`, `scripts/plot_star_history.py`) e `docs/BUILD.md`;
+- `.env.notarize.example` e `create_mock_model.py`.
+
+Mantenuto e invariato: training (`src/training/`), pipeline dati (`src/data_pipeline/`),
+ispezione (`src/inspect/`), test, dipendenze (`requirements.txt` include intenzionalmente
+l'intero stack di training), app Flask con UI, dizionario reversibile e redazione PDF,
+endpoint versionato `POST /api/v1/analyses`, contratti API (`docs/GUARDRAIL_API.md`,
+`docs/guardrail-openapi.yaml`) e documenti DATASET/TRAINING/FORMATO/TASSONOMIA/TARGA. Il
+report scientifico con PDF, sorgente Typst e grafici resta come artefatto storico upstream.
+
+Documentazione aggiornata: README riscritto per il fork (attribuzione a Simone Rizzo /
+Rizzo AI Academy, setup e deployment attuali, niente installer desktop), CLAUDE.md allineato
+al runtime servizio (via Tauri e gli entry desktop), THIRD_PARTY_LICENSES.md focalizzato su
+servizio e container (le obbligazioni PyMuPDF AGPL/Artifex restano), note di release v2.0.0
+marcate come storiche upstream. Le voci sotto restano come traccia storica: citano percorsi
+oggi rimossi e non descrivono lo stato attuale del fork.
+
+---
+
 ## 2026-10-06 - API guardrail ENVAS-23: import del dizionario e delta su testo singolo
 
 Prima slice dello endpoint guardrail `POST /api/v1/analyses` per l'integrazione Envai

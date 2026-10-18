@@ -82,15 +82,21 @@ Legacy `/analyze` returns the request-local `mapping`. When mapping is disabled,
 
 ### Guardrail API v1
 
-`POST /api/v1/analyses` accepts one JSON `text` and an optional `dictionary` seed. It returns anonymized text and `dictionary_delta`, containing only new placeholder-to-original pairs. The seed and full mapping are not returned. The endpoint is stateless, enables all 24 categories, ignores the legacy preferences, and does not accept batches, files, multipart input, PDFs, or OCR.
+`POST /api/v1/analyses` has two implemented request arms on one route. The JSON arm accepts one `text`, an optional `dictionary` seed, and an optional `categories` whitelist, and returns exactly one result with `input_id: "text"`. The `multipart/form-data` arm accepts up to 10 optional files (`.pdf`, `.txt`, `.text`, `.md`, `.markdown`, case-insensitive), an optional `text` form field, an optional `dictionary` form string, and an optional `categories` form string, and returns one result per file in part order (`file_1` to `file_10`) followed by `text` when a non-blank text is present, with one aggregate `dictionary_delta` of new placeholder-to-original pairs. The `files`, `text` and `dictionary` fields are individually optional in the multipart arm, but at least one file or one non-blank text is required: a text-only request with no file part is valid, and the file field name is `files`, never `files[]`. The seed and full mapping are never returned.
 
-The server process needs a non-empty `PII_API_TOKEN`; clients send the same token in `Authorization: Bearer <token>`. An unset token returns 503; missing or incorrect client credentials return 401. The 30-second processing deadline is cooperative, not a hard HTTP timeout. Use a worker or proxy timeout that also covers slow body reads and in-flight inference. See the [guardrail API contract](docs/GUARDRAIL_API.md) and [OpenAPI schema](docs/guardrail-openapi.yaml) for request limits, errors, concurrency, and dictionary rules.
+`categories` is a request-only whitelist of canonical labels such as `["FULLNAME", "EMAIL"]` that selects which labels are anonymized on every file and on the optional text. When it is absent, `null`, `[]`, or an empty or whitespace-only string, all 24 categories are used, which is the historical default. A selected subset replaces only those labels: every other category stays in clear by explicit caller choice, so a subset is not a complete PII anonymization guarantee. The endpoint remains stateless and ignores the legacy preferences; there is no server-side category opt-out, the request can only narrow the default, and `include_tags` or `exclude_tags` are not aliases for `categories`. In a JSON body the value is an array of canonical, case-sensitive names; at most 24 raw items and duplicates are allowed and deduplicated, and any other value, a non-canonical entry, or more than 24 raw items answers 400 `invalid_request`. In `multipart/form-data` the field is one Text value containing strict JSON; omitted or blank content selects all, and malformed JSON or a `categories` part sent as a file answers 400. JSON arrays of texts or files are not accepted.
+
+The multifile arm is text-only: it does not OCR, redact pages, protect text inside images, or return PDF binaries or ZIP archives. Its fixed limits are 20 MiB for the multipart body, 5 MiB per file, 13 parts (10 files plus the three value fields `text`, `dictionary`, and `categories`), 1 MiB per value field, 24 raw `categories` items, 100000 aggregate characters, and 200 pages per PDF. A PDF, or a `%PDF-` file with an accepted text extension, is extracted with PyMuPDF on a strict bounded path; when native MuPDF privacy controls are unavailable, the PDF arm answers 503 while JSON and plain-text inputs keep working. See the [guardrail API contract](docs/GUARDRAIL_API.md) and [OpenAPI schema](docs/guardrail-openapi.yaml) for request limits, errors, concurrency, dictionary rules, and the multipart example.
+
+The server process needs a non-empty `PII_API_TOKEN`; clients send the same token in `Authorization: Bearer <token>`. An unset token returns 503; missing or incorrect client credentials return 401. Authentication, model readiness, and the per-process lock are evaluated before any body byte is read, so an unauthenticated or busy request is answered without touching the payload. The processing deadline is a server-side cooperative budget, not a hard HTTP timeout and not a client setting. It is read from the non-secret `PII_ANALYSIS_TIMEOUT_SECONDS` variable, a positive finite float in seconds, once per request; unset, blank, or invalid values fall back to the 60-second default. Use a worker or proxy timeout longer than the configured budget plus the upload and native-work margin, because increasing a client or Postman timeout alone does not extend the server budget.
 
 For a source deployment, set the token securely in the shell or secret manager before starting the server process:
 
 ```bash
 # PII_API_TOKEN must already be set securely in this shell.
 export PII_API_TOKEN
+# Non-secret analysis budget; 120 seconds is an example override.
+export PII_ANALYSIS_TIMEOUT_SECONDS=120
 python src/app/app.py
 ```
 
@@ -99,10 +105,12 @@ A container does not inherit host environment variables automatically. Set the h
 ```bash
 podman run -d --name envai-pii \
   -p 127.0.0.1:5005:5005 \
-  -e PII_API_TOKEN envai-pii
+  -e PII_API_TOKEN \
+  -e PII_ANALYSIS_TIMEOUT_SECONDS=120 \
+  envai-pii
 ```
 
-Use `docker run` with the same `-e PII_API_TOKEN` option for Docker. The checked-in Compose file does not pass this token; configure an override before using the endpoint through Compose. The guardrail token does not authenticate legacy routes. For access beyond loopback, place an authenticated internal proxy and TLS in front of the service, as described in the [API deployment notes](docs/GUARDRAIL_API.md#deployment).
+Use `docker run` with the same `-e PII_API_TOKEN` and `-e PII_ANALYSIS_TIMEOUT_SECONDS=120` options for Docker, or the runtime's standard environment passthrough. The budget variable is non-secret and independent of the token secret. The checked-in Compose file does not pass this token; configure an override before using the endpoint through Compose. The guardrail token does not authenticate legacy routes. For access beyond loopback, place an authenticated internal proxy and TLS in front of the service, as described in the [API deployment notes](docs/GUARDRAIL_API.md#deployment).
 
 ```bash
 curl -X POST http://127.0.0.1:5005/api/v1/analyses \
@@ -110,6 +118,47 @@ curl -X POST http://127.0.0.1:5005/api/v1/analyses \
   -H "Content-Type: application/json" \
   -d '{"dictionary": {"[FULLNAME_7]": "Mario Rossi"}, "text": "Mario Rossi, scrivi a mario@example.com"}'
 ```
+
+Selecting categories in a JSON request:
+
+```bash
+curl -X POST http://127.0.0.1:5005/api/v1/analyses \
+  -H "Authorization: Bearer $PII_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Mario Rossi, mario@example.com, telefono 333 1234567", "categories": ["FULLNAME", "EMAIL"]}'
+```
+
+Only `FULLNAME` and `EMAIL` are replaced; the phone number stays in clear because `TELEPHONENUM` was not selected.
+
+Multipart call with repeated files, an optional text, and a dictionary form string:
+
+```bash
+curl -X POST http://127.0.0.1:5005/api/v1/analyses \
+  -H "Authorization: Bearer $PII_API_TOKEN" \
+  -F 'files=@nota.txt;type=text/plain' \
+  -F 'files=@contratto.md;type=text/markdown' \
+  -F 'dictionary={"[FULLNAME_7]": "Mario Rossi"}' \
+  -F 'text=Referente: Mario Rossi.'
+```
+
+Text-only multipart call with no file parts (the `files` field is omitted; when files are present the field is named `files`, never `files[]`):
+
+```bash
+curl -X POST http://127.0.0.1:5005/api/v1/analyses \
+  -H "Authorization: Bearer $PII_API_TOKEN" \
+  -F 'text=Referente: Mario Rossi.'
+```
+
+Text-only multipart selection; `categories` is a value part, not a file:
+
+```bash
+curl -X POST http://127.0.0.1:5005/api/v1/analyses \
+  -H "Authorization: Bearer $PII_API_TOKEN" \
+  -F 'text=Referente: Mario Rossi.' \
+  -F 'categories=["FULLNAME", "EMAIL"]'
+```
+
+In Postman, leave the `files` row unchecked or remove it; do not add a file-type row with an empty placeholder, because that posts an empty file part and the all-or-nothing file checks fail the request. Add `categories` as a Text field whose value is a JSON array such as `["FULLNAME", "EMAIL"]`; do not send it as a File field, and do not send CSV, because `FULLNAME,EMAIL` is not valid JSON.
 
 ## Quickstart
 

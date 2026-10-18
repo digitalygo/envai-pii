@@ -65,8 +65,10 @@ from flask import Flask, jsonify, request
 from werkzeug.exceptions import HTTPException
 
 import guardrail_api
+import guardrail_inputs
 import pdf_export
 import pdf_text
+import pii_dictionary
 import server_config
 # Rete REGEX + CHECKSUM: modulo a parte, senza dipendenze dal modello. I nomi
 # restano importabili da qui (`app.detect_regex`) per non rompere chi li usa.
@@ -74,6 +76,90 @@ from detectors import (DETECTORS, SOFT_REGEX_LABELS, cf_ok,  # noqa: F401
                        complete_time, detect_iban, detect_regex, iban_ok, luhn_ok,
                        piva_ok)
 from transformers import pipeline
+
+
+# --------------------------------------------------------------------------- #
+# Privacy: diagnostiche native di MuPDF spente una volta per processo
+#
+# Errori e warning di MuPDF sono scritti DAL C su stdout (verificato: un content
+# stream PDF malformato con un token lo fa comparire in chiaro) e accumulati in
+# un buffer process-wide. Qui si spegne la sola STAMPA, una volta e prima di
+# qualunque richiesta; il buffer viene poi svuotato a fine di ogni estrazione PDF
+# della guardrail. Nessun re-enable a fine richiesta, nessun toggle per-richiesta
+# (le richieste legacy non lo toccano) e nessun redirect di sys.stdout/stderr.
+# --------------------------------------------------------------------------- #
+def _mupdf_tool(name):
+    """Funzione nativa di MuPDF col nome dato, se esposta da TOOLS o dal modulo."""
+    try:
+        tool = getattr(getattr(fitz, "TOOLS", None), name, None)
+    except Exception:
+        tool = None
+    if callable(tool):
+        return tool
+    try:
+        tool = getattr(fitz, name, None)
+    except Exception:
+        return None
+    return tool if callable(tool) else None
+
+
+def _silence_native_mupdf_diagnostics():
+    """Verifica il controllo privacy nativo di MuPDF una volta all'avvio.
+
+    Ogni API e' necessaria: i setter devono accettare False, i getter devono
+    confermare entrambe le flag spente e il reset del buffer deve riuscire. I
+    valori diagnostici restituiti dal reset sono scartati. Non si sollevano
+    errori, cosi' gli altri tipi di input e il servizio restano disponibili.
+    """
+    names = ("mupdf_display_errors", "mupdf_display_warnings", "mupdf_warnings")
+    tools = [_mupdf_tool(name) for name in names]
+    ok = all(callable(tool) for tool in tools)
+
+    for setter in tools[:2]:
+        if not callable(setter):
+            continue
+        try:
+            setter(False)
+        except Exception:
+            ok = False
+
+    for getter in tools[:2]:
+        if not callable(getter):
+            continue
+        try:
+            status = getter()
+            if type(status) not in (bool, int) or status != 0:
+                ok = False
+        except Exception:
+            ok = False
+
+    reset = tools[2]
+    if callable(reset):
+        try:
+            reset(reset=True)  # scartare il buffer: potrebbe contenere testo PDF
+        except Exception:
+            ok = False
+    return ok
+
+
+def _reset_native_mupdf_warnings():
+    """Svuota il buffer nativo e segnala se la privacy resta verificata."""
+    global MUPDF_PRIVACY_OK
+    reset = _mupdf_tool("mupdf_warnings")
+    if reset is None:
+        MUPDF_PRIVACY_OK = False
+        return False
+    try:
+        reset(reset=True)  # il valore puo' contenere testo PDF: non conservarlo
+    except Exception:
+        MUPDF_PRIVACY_OK = False
+        return False
+    return True
+
+
+# Le diagnostiche native possono contenere parti dei documenti. Il controllo e'
+# process-wide e non viene mai ritentato o riattivato durante le richieste.
+MUPDF_PRIVACY_OK = _silence_native_mupdf_diagnostics()
 
 
 def _resource_path(rel):
@@ -473,13 +559,16 @@ def analyze(text, excluded=None, mapping_enabled=True):
 # guscio HTTP in guardrail_api.py. Qui c'e' solo l'adapter verso la pipeline
 # esistente: detect_model/completa-confini/regex/_merge, senza riscriverli.
 # --------------------------------------------------------------------------- #
-def _guardrail_detect(text, check_deadline):
+def _guardrail_detect(text, check_deadline, categories=None):
     """Rilevamento su un tratto NON protetto per la guardrail API.
 
     Differenza voluta da detect_model(): l'inferenza gira un chunk per volta, cosi'
     il callback di deadline viene controllato tra un chunk e l'altro. Una singola
     chiamata a nlp() non e' interrompibile; il contratto lo dice esplicitamente
     (docs/GUARDRAIL_API.md, sezione Deadline): la deadline e' cooperativa.
+    `categories` opzionale restringe modello E rete regex PRIMA di _merge
+    (None = tutte): una regex di una categoria inattiva non deve sopprimere un
+    candidato attivo del modello nella fusione.
     """
     if nlp is None:
         raise guardrail_api.ModelUnavailable()
@@ -506,11 +595,106 @@ def _guardrail_detect(text, check_deadline):
     regex_ents = detect_regex(text)
     check_deadline()
     cands = ents + regex_ents
+    if categories is not None:
+        # La selezione della richiesta vale PRIMA della fusione: una regex di una
+        # categoria inattiva non deve sopprimere un candidato attivo del modello.
+        cands = [candidate for candidate in cands if candidate["label"] in categories]
     check_deadline()
     return _merge(cands, text)
 
 
+def _guardrail_detect_for_categories(categories):
+    """Binder request-local: closure immutabile per la whitelist attiva.
+
+    Ritorna un rilevatore con la stessa firma a due argomenti di _guardrail_detect
+    ma con la selezione gia' fissata: il core resta generico e il percorso senza
+    selezione non costruisce nessuna closure.
+    """
+    active = frozenset(categories)
+
+    def detect_active(text, check_deadline):
+        return _guardrail_detect(text, check_deadline, categories=active)
+
+    return detect_active
+
+
+def _guardrail_extract(name, data, remaining_chars, check_deadline):
+    """Testo di un file della guardrail v1 (multipart): nome -> estrattore.
+
+    L'estensione accettata sceglie la famiglia di input; il contenuto PDF viene
+    comunque instradato nel percorso strict e bounded anche quando il file e'
+    chiamato .txt/.md. PDF -> PyMuPDF solo con controllo nativo privacy
+    verificato, altrimenti 503 senza aprire il documento; testo -> la policy di
+    codifica legacy di `_text_from_bytes`, poi char bound e blank check. Gli
+    errori sono tipizzati con status/codice del contratto e non contengono mai
+    il nome file. Deadline e limite caratteri restano 504/413. Un reset nativo
+    fallito disabilita i PDF fino al riavvio, senza sostituire errori originali.
+    """
+    ext = os.path.splitext((name or "").lower())[1]
+    if ext not in guardrail_inputs.ACCEPTED_EXTS:
+        raise guardrail_inputs.InputError(415, "unsupported_file_type")
+
+    if _is_pdf(name, data):
+        if not MUPDF_PRIVACY_OK:
+            raise guardrail_inputs.InputError(503, "unavailable")
+        try:
+            try:
+                document = fitz.open(stream=data, filetype="pdf")
+                try:
+                    check_deadline()   # fitz.open e' nativo e non interrompibile
+                except BaseException:
+                    close = getattr(document, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception:
+                            pass
+                    raise
+                with document as doc:
+                    if not bool(getattr(doc, "is_pdf", False)):
+                        raise guardrail_inputs.InputError(422, "unreadable_file")
+                    if (bool(getattr(doc, "needs_pass", False))
+                            or bool(getattr(doc, "is_encrypted", False))):
+                        raise guardrail_inputs.InputError(422, "unreadable_file")
+                    page_count = int(doc.page_count)
+                    check_deadline()
+                    if page_count > guardrail_inputs.MAX_PDF_PAGES:
+                        raise guardrail_inputs.InputError(413, "payload_too_large")
+                    text = pdf_text.collect_readable_text(
+                        doc, max_chars=remaining_chars,
+                        check_deadline=check_deadline, strict=True)
+            except guardrail_inputs.InputError:
+                raise
+            except pii_dictionary.DeadlineExceeded:
+                raise                      # la deadline resta 504, mai un 422
+            except pdf_text.PdfTextTooLarge:
+                raise guardrail_inputs.InputError(413, "payload_too_large")
+            except Exception:
+                raise guardrail_inputs.InputError(422, "unreadable_file")
+        except BaseException:
+            # Il cleanup non deve rimpiazzare 413/504 o un altro errore originale.
+            _reset_native_mupdf_warnings()
+            raise
+        if not _reset_native_mupdf_warnings():
+            raise guardrail_inputs.InputError(503, "unavailable")
+        if not text.strip():
+            raise guardrail_inputs.InputError(422, "no_extractable_text")
+        return text
+
+    try:
+        text = _text_from_bytes(name, data)
+    except Exception:
+        raise guardrail_inputs.InputError(422, "unreadable_file")
+    if len(text) > remaining_chars:
+        raise guardrail_inputs.InputError(413, "payload_too_large")
+    if not text.strip():
+        raise guardrail_inputs.InputError(422, "empty_file")
+    return text
+
+
 guardrail_api.register_app(app, tags=TAG_NAMES, detect=_guardrail_detect,
+                           detect_for_categories=_guardrail_detect_for_categories,
+                           extract=_guardrail_extract,
                            readiness=lambda: nlp is not None)
 
 

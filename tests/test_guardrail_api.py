@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src" / "app"))
 
 import guardrail_api  # noqa: E402
+import guardrail_inputs  # noqa: E402
 
 try:
     from flask import Flask
@@ -229,6 +230,17 @@ class AppAdapter(unittest.TestCase):
 class PureCore(unittest.TestCase):
     def setUp(self):
         self.lock = threading.Lock()
+        # Igiene del test: la env del server non deve cambiare il default
+        # locale (60 s) di questi clock.
+        patcher = patch.dict(os.environ, {
+            "PII_ANALYSIS_TIMEOUT_SECONDS": "",
+            "PII_MAX_SEED_ENTRIES": "",
+            "PII_MAX_ORIGINAL_CHARS": "",
+            "PII_MAX_AGGREGATE_CHARS": "",
+            "PII_MAX_JSON_BODY_BYTES": "",
+        })
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def call(self, payload=None, raw=None, headers=None, token=TOKEN,
              detect=_detect_none, clock=None, lock=None, readiness=None):
@@ -446,6 +458,42 @@ class PureCore(unittest.TestCase):
         status, _body = self.call({"text": "x"}, lock=lock)
         self.assertEqual(status, 200)
 
+    # ---- gate prima della lettura del body -------------------------------- #
+    def test_gate_prima_della_lettura_del_body(self):
+        class Boom:
+            def __init__(self):
+                self.called = False
+
+            def __call__(self, _cap):
+                self.called = True
+                raise RuntimeError("BOOM-raw-body")
+
+        def probe(headers, *, token=TOKEN, detect=_detect_none, lock=None,
+                  readiness=None):
+            reader = Boom()
+            status, body = guardrail_api.process_request(
+                headers, reader, token=token, tags=TAGS, detect=detect,
+                lock=lock if lock is not None else threading.Lock(),
+                readiness=readiness)
+            self.assertFalse(reader.called, "il body e' stato letto troppo presto")
+            return status, body
+
+        status, body = probe({})
+        self.assertEqual((status, body["code"]), (401, "unauthorized"))
+        status, body = probe({}, token="")
+        self.assertEqual((status, body["code"]), (503, "unavailable"))
+        status, body = probe(dict(AUTH), detect=None)
+        self.assertEqual((status, body["code"]), (503, "unavailable"))
+        status, body = probe(dict(AUTH), readiness=lambda: False)
+        self.assertEqual((status, body["code"]), (503, "unavailable"))
+        lock = threading.Lock()
+        lock.acquire()
+        try:
+            status, body = probe(dict(AUTH), lock=lock)
+        finally:
+            lock.release()
+        self.assertEqual((status, body["code"]), (429, "busy"))
+
     # ---- JSON severo ------------------------------------------------------- #
     def test_json_malformato_o_non_oggetto(self):
         for raw in (b"{", b"[]", b'"x"', b"1", b"null", b"true", b"", b"   "):
@@ -527,7 +575,8 @@ class PureCore(unittest.TestCase):
         self.assertEqual(body["dictionary_delta"], {})
 
     def test_campi_sconosciuti_nell_envelope(self):
-        for extra in ({"exclude_tags": []}, {"include_mapping": False}, {"files": []}):
+        for extra in ({"exclude_tags": []}, {"include_mapping": False},
+                      {"files": []}, {"texts": ["x"]}):
             payload = {"text": "x"}
             payload.update(extra)
             status, body = self.call(payload)
@@ -559,15 +608,16 @@ class PureCore(unittest.TestCase):
         self.assertEqual(status, 413)
         self.assertEqual(body["code"], "payload_too_large")
 
-    def test_limite_voci_dizionario(self):
-        ok = {"[FULLNAME_%d]" % i: "v%d" % i for i in range(1, 257)}
-        status, _body = self.call({"text": "x", "dictionary": ok})
-        self.assertEqual(status, 200)
-        troppe = dict(ok)
-        troppe["[FULLNAME_257]"] = "v257"
-        status, body = self.call({"text": "x", "dictionary": troppe})
-        self.assertEqual(status, 413)
-        self.assertEqual(body["code"], "payload_too_large")
+    def test_limite_voci_dizionario_configurato(self):
+        with patch.dict(os.environ, {"PII_MAX_SEED_ENTRIES": "256"}):
+            ok = {"[FULLNAME_%d]" % i: "v%d" % i for i in range(1, 257)}
+            status, _body = self.call({"text": "x", "dictionary": ok})
+            self.assertEqual(status, 200)
+            troppe = dict(ok)
+            troppe["[FULLNAME_257]"] = "v257"
+            status, body = self.call({"text": "x", "dictionary": troppe})
+            self.assertEqual(status, 413)
+            self.assertEqual(body["code"], "payload_too_large")
 
     def test_limite_singolo_originale(self):
         status, _body = self.call({"text": "x", "dictionary": {"[FULLNAME_1]": "a" * 4096}})
@@ -576,15 +626,67 @@ class PureCore(unittest.TestCase):
         self.assertEqual(status, 413)
         self.assertEqual(body["code"], "payload_too_large")
 
-    def test_limite_aggregato(self):
+    def test_limite_aggregato_configurato(self):
         valori = {"[FULLNAME_%d]" % (i + 1): ("x" * 4095) + chr(0x4E00 + i)
                   for i in range(16)}
-        status, _body = self.call({"text": "x", "dictionary": valori})
+        with patch.dict(os.environ, {"PII_MAX_AGGREGATE_CHARS": "65536"}):
+            status, _body = self.call({"text": "x", "dictionary": valori})
+            self.assertEqual(status, 200)
+            valori["[FULLNAME_17]"] = "z"
+            status, body = self.call({"text": "x", "dictionary": valori})
+            self.assertEqual(status, 413)
+            self.assertEqual(body["code"], "payload_too_large")
+
+    def test_default_http_seed_cap_allows_more_than_256_entries(self):
+        dictionary = {"[FULLNAME_%d]" % index: "synthetic-%d" % index
+                      for index in range(1, 301)}
+        status, body = self.call({"text": "unmatched", "dictionary": dictionary})
         self.assertEqual(status, 200)
-        valori["[FULLNAME_17]"] = "z"
-        status, body = self.call({"text": "x", "dictionary": valori})
+        self.assertEqual(body["results"][0]["anonymized_text"], "unmatched")
+        self.assertEqual(body["dictionary_delta"], {})
+
+    def test_effective_seed_and_delta_limits_fail_without_originals(self):
+        cases = [
+            ({"PII_MAX_SEED_ENTRIES": "1"},
+             {"[FULLNAME_1]": "seed-synthetic-original"},
+             "delta-synthetic-original"),
+            ({"PII_MAX_AGGREGATE_CHARS": "24"},
+             {"[FULLNAME_1]": "seed-synthetic"},
+             "delta-synthetic-original"),
+        ]
+        for environment, dictionary, detected in cases:
+            with self.subTest(environment=environment), patch.dict(os.environ, environment):
+                status, body = self.call(
+                    {"text": detected, "dictionary": dictionary},
+                    detect=detect_literals((detected, "FULLNAME")))
+                self.assertEqual(status, 413)
+                encoded = json.dumps(body)
+                self.assertEqual(set(body), {"error", "code"})
+                self.assertNotIn(detected, encoded)
+                self.assertNotIn(next(iter(dictionary.values())), encoded)
+
+    def test_effective_original_limit_fail_no_original(self):
+        detected = "delta-synthetic-original"
+        with patch.dict(os.environ, {"PII_MAX_ORIGINAL_CHARS": "5"}):
+            status, body = self.call(
+                {"text": detected}, detect=detect_literals((detected, "FULLNAME")))
+        self.assertEqual(status, 413)
+        self.assertEqual(set(body), {"error", "code"})
+        self.assertNotIn(detected, json.dumps(body))
+
+    def test_json_body_cap_is_configurable_per_request(self):
+        raw = b'{"text":"x"}' + b" " * 32
+        with patch.dict(os.environ, {"PII_MAX_JSON_BODY_BYTES": "32"}):
+            status, body = self.call(raw=raw)
         self.assertEqual(status, 413)
         self.assertEqual(body["code"], "payload_too_large")
+
+    def test_dictionary_limits_resolved_once_per_request(self):
+        with patch.object(guardrail_api.guardrail_limits, "resolve_request_limits",
+                          wraps=guardrail_api.guardrail_limits.resolve_request_limits) as resolver:
+            status, _body = self.call({"text": "unmatched"})
+        self.assertEqual(status, 200)
+        self.assertEqual(resolver.call_count, 1)
 
     def test_esaurimento_id_400(self):
         status, body = self.call(
@@ -625,7 +727,7 @@ class PureCore(unittest.TestCase):
         clock = Clock()
 
         def detect(_text, check):
-            clock.now = 31.0
+            clock.now = 61.0
             check()
             return []
 
@@ -640,7 +742,7 @@ class PureCore(unittest.TestCase):
 
             def __call__(self):
                 self.calls += 1
-                return 31.0 if self.calls >= 85 else 0.0
+                return 61.0 if self.calls >= 85 else 0.0
 
         clock = MatchingClock()
         called = []
@@ -672,13 +774,21 @@ class PureCore(unittest.TestCase):
     # ---- media type -------------------------------------------------------- #
     def test_content_type(self):
         casi = [(None, 415), ("text/plain", 415),
-                ("multipart/form-data; boundary=x", 415),
                 ("application/json", 200),
                 ("application/json; charset=utf-8", 200),
                 ("application/json;charset=UTF-8", 200),
                 ('application/json; charset="utf-8"', 200),
                 ("application/json; charset=latin-1", 415),
                 ("APPLICATION/JSON", 200)]
+        if guardrail_inputs.native_multipart_available():
+            # multipart ora e' supportato: un boundary valido con un body JSON e'
+            # multipart malformato -> 400, non piu' 415 "media type non supportato".
+            casi.append(("multipart/form-data; boundary=x", 400))
+        else:
+            # CI stdlib senza Werkzeug: il ramo multipart non esiste (503); la
+            # copertura vera sta in test_guardrail_multifiles.py, saltata senza
+            # il parser nativo.
+            casi.append(("multipart/form-data; boundary=x", 503))
         for content_type, expected in casi:
             all_headers = dict(AUTH)
             if content_type is not None:
@@ -696,7 +806,7 @@ def _make_client(detect=_detect_none, clock=None, streaming=False, readiness=Non
     lock = threading.Lock()
     application = Flask("guardrail-test")
     application.config["TESTING"] = True
-    # come app.py: il tetto del framework e' 50 MB, quello dell'endpoint e' 1 MiB.
+    # come app.py: il tetto del framework e' 50 MB, quello JSON e' configurabile.
     application.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
     kwargs = {"clock": clock} if clock is not None else {}
     blueprint = guardrail_api.create_blueprint(TAGS, detect, lock=lock,
@@ -704,7 +814,7 @@ def _make_client(detect=_detect_none, clock=None, streaming=False, readiness=Non
     application.register_blueprint(blueprint)
     if streaming:
         # Simula una richiesta chunked: niente Content-Length e stream terminato
-        # dal server, esattamente cio' che deve reggere il tetto di 1 MiB.
+        # dal server, esattamente cio' che deve reggere il tetto JSON configurato.
         inner = application.wsgi_app
 
         def middleware(environ, start_response):
@@ -720,7 +830,16 @@ def _make_client(detect=_detect_none, clock=None, streaming=False, readiness=Non
 class FlaskEndpoint(unittest.TestCase):
     def setUp(self):
         self.client, self.lock = _make_client()
-        patcher = patch.dict(os.environ, {"PII_API_TOKEN": TOKEN})
+        # Igiene del test: la env del server non deve cambiare il default
+        # locale (60 s) di questi clock.
+        patcher = patch.dict(os.environ, {
+            "PII_API_TOKEN": TOKEN,
+            "PII_ANALYSIS_TIMEOUT_SECONDS": "",
+            "PII_MAX_SEED_ENTRIES": "",
+            "PII_MAX_ORIGINAL_CHARS": "",
+            "PII_MAX_AGGREGATE_CHARS": "",
+            "PII_MAX_JSON_BODY_BYTES": "",
+        })
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -786,8 +905,11 @@ class FlaskEndpoint(unittest.TestCase):
         response = self.post({"text": "x"}, content_type=None,
                              environ_overrides={"CONTENT_TYPE": ""})
         self.assertEqual(response.status_code, 415)
+        # multipart e' supportato: senza boundary il body e' malformato -> 400,
+        # non piu' 415 "media type non supportato".
         response = self.post({"text": "x"}, content_type="multipart/form-data")
-        self.assertEqual(response.status_code, 415)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["code"], "invalid_request")
 
     def test_body_oltre_il_limite(self):
         response = self.post(raw=b" " * (guardrail_api.MAX_BODY_BYTES + 1))
@@ -806,7 +928,7 @@ class FlaskEndpoint(unittest.TestCase):
         self.assertEqual(response.headers["Cache-Control"], "no-store")
 
     def test_content_length_mentito_non_fa_processare_oltre_il_dichiarato(self):
-        # CL=10 con body da oltre 1 MiB: il framing HTTP dice che fanno parte della
+        # CL=10 con body oltre il cap JSON: il framing HTTP dice che fanno parte della
         # richiesta solo 10 byte. L'endpoint non deve ne' bloccarsi ne' processare
         # il resto: legge il framed stream (non i byte grezzi a valle), quindi il
         # prefisso da 10 byte e' JSON invalido -> 400, mai 200.
@@ -851,6 +973,47 @@ class FlaskEndpoint(unittest.TestCase):
         self.assertEqual(response.get_json()["code"], "busy")
         self.assertEqual(self.post({"text": "x"}).status_code, 200)
 
+    def test_gate_prima_della_lettura_del_body_su_http(self):
+        class BoomStream:
+            def __init__(self):
+                self.calls = 0
+
+            def read(self, *_args):
+                self.calls += 1
+                raise RuntimeError("BOOM-stream")
+
+            def readline(self, *_args):
+                self.calls += 1
+                raise RuntimeError("BOOM-stream")
+
+        stream = BoomStream()
+        response = self.client.post(PATH, data=b'{"text":"x"}',
+                                    content_type="application/json",
+                                    headers={"Authorization": "Bearer sbagliato"},
+                                    environ_overrides={"wsgi.input": stream})
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(stream.calls, 0)
+        with patch.dict(os.environ, {"PII_API_TOKEN": ""}):
+            response = self.post({"text": "x"},
+                                 environ_overrides={"wsgi.input": stream})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(stream.calls, 0)
+        self.lock.acquire()
+        try:
+            response = self.post({"text": "x"},
+                                 environ_overrides={"wsgi.input": stream})
+        finally:
+            self.lock.release()
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(stream.calls, 0)
+        # Con i gate superati il body viene letto davvero: uno stream rotto
+        # diventa 400 sanificato, non un 500 e mai un'eccezione esposta.
+        response = self.post({"text": "x"},
+                             environ_overrides={"wsgi.input": stream})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["code"], "invalid_request")
+        self.assertGreaterEqual(stream.calls, 1)
+
     def test_lock_rilasciato_dopo_errore(self):
         self.assertEqual(self.post(raw=b"{").status_code, 400)
         self.assertEqual(self.post({"text": "x"}).status_code, 200)
@@ -865,7 +1028,7 @@ class FlaskEndpoint(unittest.TestCase):
         clock = Clock()
 
         def detect(_text, check):
-            clock.now = 31.0
+            clock.now = 61.0
             check()
             return []
 
@@ -903,7 +1066,7 @@ class FlaskEndpoint(unittest.TestCase):
         clock = Clock()
 
         def detect(_text, check):
-            clock.now = 31.0
+            clock.now = 61.0
             check()
             return []
 

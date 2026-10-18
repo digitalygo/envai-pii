@@ -18,6 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src" / "app"))
 
+import guardrail_limits  # noqa: E402
 import pii_dictionary as pd  # noqa: E402
 
 TAGS = ["FULLNAME", "EMAIL", "CITY", "ORG", "ID_DOC", "DATE", "STREET", "PROVINCE",
@@ -107,6 +108,14 @@ class ValidazioneSeed(unittest.TestCase):
         with self.assertRaises(pd.PayloadTooLarge):
             pd.parse_seed(troppe, TAGS)
 
+    def test_limiti_espliciti_permettono_seed_sopra_256(self):
+        dictionary = {"[FULLNAME_%d]" % index: "synthetic-%d" % index
+                      for index in range(1, 301)}
+        with self.assertRaises(pd.PayloadTooLarge):
+            pd.parse_seed(dictionary, TAGS)
+        limits = guardrail_limits.RequestLimits(300, 4096, 1048576, 8388608)
+        self.assertEqual(len(pd.parse_seed(dictionary, TAGS, limits=limits).pairs), 300)
+
     def test_limite_singolo_originale(self):
         ok = pd.parse_seed({"[FULLNAME_1]": "a" * 4096}, TAGS)
         self.assertEqual(len(ok.pairs[0][3]), 4096)
@@ -131,7 +140,7 @@ class ValidazioneSeed(unittest.TestCase):
                          (("[FULLNAME_1]", "FULLNAME", 1, "Mario Rossi"),))
         self.assertEqual(parsed.reserved_ids(), {"FULLNAME": 1})
         self.assertEqual(parsed.lookup("FULLNAME", "mario rossi"), "[FULLNAME_1]")
-        self.assertIsNone(parsed.lookup("EMAIL", "mario rossi"))
+        self.assertEqual(parsed.lookup("EMAIL", "mario rossi"), "[FULLNAME_1]")
 
 
 class RicercaPlaceholder(unittest.TestCase):
@@ -362,7 +371,199 @@ class Allocazione(unittest.TestCase):
             pd.anonymize(123, pd.parse_seed({}, TAGS), TAGS)
 
 
+class BatchStatoCondiviso(unittest.TestCase):
+    """`anonymize_batch`: una sola mappa di lavoro per l'intera richiesta.
+
+    La numerazione dei nuovi ID e' riservata su TUTTI gli input prima di
+    qualunque allocazione; una coppia allocata in un input e' un match noto
+    letterale negli input successivi anche se il rilevatore non la vede.
+    """
+
+    def test_riuso_cross_input_e_delta_aggregato(self):
+        calls = []
+
+        def detect(text, _check):
+            calls.append(text)
+            if len(calls) > 1:
+                return []          # il modello "dimentica" gli input successivi
+            out = []
+            for literal, label in (("Mario Rossi", "FULLNAME"),
+                                   ("mario.rossi@example.com", "EMAIL")):
+                position = text.find(literal)
+                if position >= 0:
+                    out.append(ent(label, position, position + len(literal)))
+            return out
+
+        inputs = [("file_1", "Mario Rossi scrive a mario.rossi@example.com"),
+                  ("file_2", "Conferma per Mario Rossi: mario.rossi@example.com"),
+                  ("text", "Referente Mario Rossi")]
+        results, delta = pd.anonymize_batch(inputs, seed({}), TAGS, detect=detect)
+        self.assertEqual([input_id for input_id, _out in results],
+                         ["file_1", "file_2", "text"])
+        self.assertEqual(results[0][1]["anonymized_text"],
+                         "[FULLNAME_1] scrive a [EMAIL_1]")
+        self.assertEqual(results[1][1]["anonymized_text"],
+                         "Conferma per [FULLNAME_1]: [EMAIL_1]")
+        self.assertEqual(results[2][1]["anonymized_text"], "Referente [FULLNAME_1]")
+        self.assertEqual(delta, {"[FULLNAME_1]": "Mario Rossi",
+                                 "[EMAIL_1]": "mario.rossi@example.com"})
+        self.assertGreaterEqual(len(calls), 2)
+
+    def test_id_riservati_su_tutti_gli_input_prima_di_allocare(self):
+        def detect(text, _check):
+            position = text.find("x@y.it")
+            return [ent("EMAIL", position, position + 6)] if position >= 0 else []
+
+        inputs = [("file_1", "scrivi a x@y.it"),
+                  ("file_2", "placeholder [EMAIL_9]")]
+        results, delta = pd.anonymize_batch(inputs, seed({}), TAGS, detect=detect)
+        self.assertEqual(results[0][1]["anonymized_text"], "scrivi a [EMAIL_10]")
+        self.assertEqual(results[1][1]["anonymized_text"], "placeholder [EMAIL_9]")
+        self.assertEqual(delta, {"[EMAIL_10]": "x@y.it"})
+
+    def test_categorie_diverse_stesso_originale_riusano_primo_binding(self):
+        def detect(text, _check):
+            first = text.find("Rossi")
+            second = text.find("ROSSI")
+            return [ent("FULLNAME", first, first + 5),
+                    ent("CITY", second, second + 5)]
+
+        results, delta = pd.anonymize_batch([("text", "Rossi e ROSSI")],
+                                            seed({}), TAGS, detect=detect)
+        self.assertEqual(results[0][1]["anonymized_text"],
+                         "[FULLNAME_1] e [FULLNAME_1]")
+        self.assertEqual(delta, {"[FULLNAME_1]": "Rossi"})
+        restored_seed = seed(delta)
+        restored = pd.anonymize(
+            results[0][1]["anonymized_text"], restored_seed, TAGS)
+        self.assertEqual(restored["anonymized_text"],
+                         "[FULLNAME_1] e [FULLNAME_1]")
+        self.assertEqual(restored["dictionary_delta"], {})
+
+    def test_primo_binding_segue_l_ordine_inverso_delle_occorrenze(self):
+        detect = detect_literals(("ROSSI", "CITY"), ("Rossi", "FULLNAME"))
+        out = pd.anonymize("ROSSI e Rossi", seed({}), TAGS, detect=detect)
+        self.assertEqual(out["anonymized_text"], "[CITY_1] e [CITY_1]")
+        self.assertEqual(out["dictionary_delta"], {"[CITY_1]": "ROSSI"})
+
+    def test_identita_globale_unicode_riusa_la_prima_forma(self):
+        detect = detect_literals(("Straße", "FULLNAME"), ("STRASSE", "CITY"))
+        out = pd.anonymize("Straße und STRASSE", seed({}), TAGS, detect=detect)
+        self.assertEqual(out["anonymized_text"], "[FULLNAME_1] und [FULLNAME_1]")
+        self.assertEqual(out["dictionary_delta"], {"[FULLNAME_1]": "Straße"})
+
+    def test_entita_normalizzata_vuota_non_crea_delta(self):
+        def detect(_text, _check):
+            return [ent("FULLNAME", 0, 2)]
+
+        out = pd.anonymize(" \tX", seed({}), TAGS, detect=detect)
+        self.assertEqual(out["anonymized_text"], " \tX")
+        self.assertEqual(out["dictionary_delta"], {})
+
+    def test_oltre_256_nuove_coppie_fuori_dai_limiti_del_seed(self):
+        values = ["v%03d" % index for index in range(300)]
+        text = " | ".join(values)
+
+        def detect(text, _check):
+            out = []
+            for value in values:
+                position = text.find(value)
+                out.append(ent("FULLNAME", position, position + len(value)))
+            return out
+
+        results, delta = pd.anonymize_batch([("text", text)], seed({}), TAGS,
+                                            detect=detect)
+        self.assertEqual(len(delta), 300)
+        self.assertEqual(len(results[0][1]["anonymized_text"].split(" | ")), 300)
+        self.assertEqual(results[0][1]["placeholder_count"], 300)
+        self.assertEqual(delta["[FULLNAME_1]"], "v000")
+        self.assertEqual(delta["[FULLNAME_300]"], "v299")
+
+    def test_valore_allocato_oltre_4096_caratteri(self):
+        long_value = "L" * 5000
+
+        def detect(_text, _check):
+            return [ent("FULLNAME", 0, 5000)]
+
+        results, delta = pd.anonymize_batch([("text", long_value)], seed({}), TAGS,
+                                            detect=detect)
+        self.assertEqual(results[0][1]["anonymized_text"], "[FULLNAME_1]")
+        self.assertEqual(delta, {"[FULLNAME_1]": long_value})
+
+    def test_aggregato_oltre_il_limite(self):
+        with self.assertRaises(pd.PayloadTooLarge):
+            pd.anonymize_batch([("file_1", "a" * 60000), ("file_2", "b" * 60000)],
+                               seed({}), TAGS)
+        results, _delta = pd.anonymize_batch([("text", "a" * 100000)], seed({}), TAGS)
+        self.assertEqual(len(results[0][1]["anonymized_text"]), 100000)
+
+    def test_errore_su_un_input_non_lascia_risultati_parziali(self):
+        def detect(_text, _check):
+            return [ent("EMAIL", 0, 6)]
+
+        with self.assertRaises(pd.AllocationExhausted):
+            pd.anonymize_batch([("file_1", "x@y.it"),
+                                ("file_2", "[EMAIL_999999999]")],
+                               seed({}), TAGS, detect=detect)
+
+    def test_seed_immutabile_e_riuso_tra_input(self):
+        parsed = seed({"[FULLNAME_7]": "Mario Rossi"})
+        results, delta = pd.anonymize_batch(
+            [("file_1", "Mario Rossi"), ("file_2", "MARIO   ROSSI")],
+            parsed, TAGS)
+        self.assertEqual(results[0][1]["anonymized_text"], "[FULLNAME_7]")
+        self.assertEqual(results[1][1]["anonymized_text"], "[FULLNAME_7]")
+        self.assertEqual(delta, {})
+        self.assertEqual(parsed.pairs,
+                         (("[FULLNAME_7]", "FULLNAME", 7, "Mario Rossi"),))
+
+    def test_stateless_tra_due_chiamate_batch(self):
+        inputs = [("file_1", "Mario Rossi"), ("text", "Mario Rossi")]
+        detect = detect_literals(("Mario Rossi", "FULLNAME"))
+        first = pd.anonymize_batch(inputs, seed({}), TAGS, detect=detect)
+        second = pd.anonymize_batch(inputs, seed({}), TAGS, detect=detect)
+        self.assertEqual(first, second)
+
+    def test_conteggio_placeholder_per_input(self):
+        results, _delta = pd.anonymize_batch(
+            [("file_1", "[EMAIL_1] e [EMAIL_1]"), ("text", "niente")],
+            seed({}), TAGS)
+        self.assertEqual(results[0][1]["placeholder_count"], 2)
+        self.assertEqual(results[1][1]["placeholder_count"], 0)
+
+    def test_deadline_batch(self):
+        def boom():
+            raise pd.DeadlineExceeded()
+
+        with self.assertRaises(pd.DeadlineExceeded):
+            pd.anonymize_batch([("text", "Mario")], seed({}), TAGS,
+                               check_deadline=boom)
+
+    def test_input_non_stringa(self):
+        with self.assertRaises(TypeError):
+            pd.anonymize_batch([("text", 123)], seed({}), TAGS)
+
+
 class StatoEDeadline(unittest.TestCase):
+    def test_seed_da_10000_voci_sintetiche_bounded_memory(self):
+        limits = guardrail_limits.RequestLimits(10000, 4096, 1048576, 8388608)
+        dictionary = {
+            "[FULLNAME_%d]" % index: "synthetic-value-%05d" % index
+            for index in range(1, limits.seed_entries + 1)
+        }
+        text = "x" * 100000
+        tracemalloc.start()
+        try:
+            parsed = pd.parse_seed(dictionary, TAGS, limits=limits)
+            out = pd.anonymize(text, parsed, TAGS, limits=limits)
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(len(parsed.pairs), limits.seed_entries)
+        self.assertEqual(out["anonymized_text"], text)
+        self.assertEqual(out["dictionary_delta"], {})
+        self.assertLess(peak, 64 * 1024 * 1024)
+
     def test_memoria_candidati_limitata_a_un_per_partenza(self):
         parsed = seed({"[FULLNAME_%d]" % index: "!" * index
                        for index in range(1, 257)})

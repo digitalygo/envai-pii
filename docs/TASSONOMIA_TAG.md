@@ -106,12 +106,21 @@ non chiedendolo alla token-classification.
   non necessariamente "sempre".
 - Questa decisione "a valle" è **configurabile via API legacy**: ogni tag si può escludere con
   `--exclude-tags`, `PII_EXCLUDE_TAGS` o il campo `exclude_tags` nella richiesta, oppure salvando
-  la preferenza in `prefs.json` (esposta da `GET /settings`). Questi controlli valgono solo per
-  l'API legacy (`/analyze`, le route PDF e `/settings`): l'endpoint guardrail v1
-  `POST /api/v1/analyses` è **stateless**, ignora `prefs.json` e le esclusioni e maschera
-  **tutte le 24 categorie** di `TAG_NAMES`, restituendo solo il delta dei nuovi placeholder
-  (`dictionary_delta`). I campi legacy `exclude_tags` e `include_mapping` non esistono nel
-  contratto v1 e vengono rifiutati come sconosciuti (dettagli in `docs/GUARDRAIL_API.md`).
+  la preferenza in `prefs.json` (esposta da `GET /settings`). Questi controlli restano una
+  **lista di esclusione** (blacklist) e valgono solo per
+  l'API legacy (`/analyze`, le route PDF e `/settings`). L'endpoint guardrail v1
+  `POST /api/v1/analyses` è **stateless**, ignora `prefs.json` e le esclusioni legacy e non ha
+  fallback da env, CLI o impostazioni: il chiamante sceglie le etichette da anonimizzare con il
+  campo **solo-richiesta `categories`** (schema 0.3.0). Assente, `null`, `[]`, stringa vuota o di
+  soli spazi selezionano **tutte le 24 categorie** di `TAG_NAMES` (default storico); un array di
+  nomi canonici, per esempio `["FULLNAME","EMAIL"]`, seleziona solo quelle, e le categorie non
+  selezionate **restano in chiaro per scelta esplicita del chiamante**, quindi un sottoinsieme
+  non è una garanzia di anonimizzazione completa. Il seed resta validato e copiato su tutte le
+  24 categorie anche inattive, con gli stessi conflitti e tetti e con gli ID riservati; le voci
+  inattive non fanno match e non entrano nel delta, che contiene solo le coppie nuove delle
+  categorie selezionate. I campi legacy `exclude_tags` e `include_mapping` non esistono nel
+  contratto v1 e vengono rifiutati come sconosciuti, e `categories` non ha alias
+  `include_tags`/`exclude_tags` (dettagli in `docs/GUARDRAIL_API.md`).
   Un tag escluso viene comunque **rilevato**, ma non sostituito dal placeholder: serve a chi
   deve far confrontare gli importi a un LLM, o tenere età e sesso in una cartella clinica.
 - Anche la **reversibilità di `/analyze`** è una scelta di configurazione, non del modello:

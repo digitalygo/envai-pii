@@ -16,6 +16,11 @@ ordine di incontro, delta dei soli valori nuovi e conteggio dei placeholder fina
 Una sola passata in costruzione: il testo prodotto da una sostituzione non viene mai
 riscansionato.
 
+Whitelist per-richiesta (`categories`): i match noti del seed, il filtro delle
+entita' rilevate e le allocazioni seguono SOLO le categorie attive, mentre la
+scansione, la protezione, il conteggio e la prenotazione degli ID dei placeholder
+restano sull'intero catalogo. `categories=None` = tutte le categorie attive.
+
 Tutti i valori usati nei test sono SINTETICI.
 """
 
@@ -175,8 +180,8 @@ class Seed:
     def __init__(self, pairs):
         self._pairs = tuple(pairs)
         self._by_normalized = {
-            normalize(original): (label, placeholder)
-            for placeholder, label, _index, original in pairs
+            normalize(original): placeholder
+            for placeholder, _label, _index, original in pairs
         }
         reserved = {}
         for _placeholder, label, index, _original in pairs:
@@ -194,24 +199,25 @@ class Seed:
         return dict(self._reserved)
 
     def lookup(self, label, normalized):
-        """Placeholder del seed se label e originale normalizzato combaciano, else None."""
-        entry = self._by_normalized.get(normalized)
-        if entry is not None and entry[0] == label:
-            return entry[1]
-        return None
+        """Placeholder del seed per identita' normalizzata, indipendente dalla label."""
+        return self._by_normalized.get(normalized)
 
 
-def parse_seed(dictionary, tags):
+def parse_seed(dictionary, tags, *, limits=None):
     """Valida il dizionario seed e lo congela in un Seed. Solleva errori tipizzati.
 
-    Limiti (dal contratto): <= 256 voci, un originale <= 4096 caratteri, somma degli
-    originali <= 65536. Chiavi canoniche per i `tags` passati (i TAG_NAMES reali).
+    `limits` puo' fornire limiti HTTP espliciti; senza di esso restano i limiti legacy.
     Due originali con la stessa normalizzazione confliggono, anche con label diverse.
     """
     if not isinstance(dictionary, dict):
         raise InvalidSeed()
     labels = set(tags)
-    if len(dictionary) > MAX_SEED_ENTRIES:
+    max_entries = MAX_SEED_ENTRIES if limits is None else limits.seed_entries
+    max_original_chars = (MAX_ORIGINAL_CHARS if limits is None
+                          else limits.original_chars)
+    max_aggregate_chars = (MAX_AGGREGATE_CHARS if limits is None
+                           else limits.aggregate_chars)
+    if len(dictionary) > max_entries:
         raise PayloadTooLarge()
     pairs = []
     seen = set()
@@ -227,10 +233,10 @@ def parse_seed(dictionary, tags):
             value.encode("utf-8")
         except UnicodeEncodeError:
             raise InvalidSeed()
-        if len(value) > MAX_ORIGINAL_CHARS:
+        if len(value) > max_original_chars:
             raise PayloadTooLarge()
         total += len(value)
-        if total > MAX_AGGREGATE_CHARS:
+        if total > max_aggregate_chars:
             raise PayloadTooLarge()
         normalized = normalize(value)
         if normalized in seen:
@@ -243,16 +249,19 @@ def parse_seed(dictionary, tags):
 # --------------------------------------------------------------------------- #
 # Localizzazione dei seed noti nel testo
 # --------------------------------------------------------------------------- #
-def _locate_seed_spans(text, seed, placeholder_spans, check_deadline):
+def _locate_seed_spans(text, pairs, placeholder_spans, check_deadline):
     """Match delle PII note sugli offset originali, piu' lungo vince.
 
-    Ritorna [(start, end, placeholder), ...] ordinati per start. Il confronto e' sul
-    testo normalizzato, ma gli offset restituiti sono quelli del testo originale. I
-    placeholder canonici sono occupati da subito: un match del seed non li sovrascrive
-    e non li spezza. A parita' di lunghezza decide il placeholder (ordine lessicale),
-    quindi il risultato non dipende dall'ordine del dizionario.
+    `pairs` e' una sequenza di (placeholder, label, index, originale): le chiavi
+    del seed nel percorso a testo singolo, seed + allocazioni gia' fatte nel
+    percorso batch. Ritorna [(start, end, placeholder), ...] ordinati per start.
+    Il confronto e' sul testo normalizzato, ma gli offset restituiti sono quelli
+    del testo originale. I placeholder canonici sono occupati da subito: un match
+    noto non li sovrascrive e non li spezza. A parita' di lunghezza decide il
+    placeholder (ordine lessicale), quindi il risultato non dipende dall'ordine
+    del dizionario.
     """
-    if not seed.pairs or not text:
+    if not pairs or not text:
         return []
     normalized_text, ranges, starts, ends = _normalize_with_map(text, check_deadline)
     if not normalized_text:
@@ -300,7 +309,7 @@ def _locate_seed_spans(text, seed, placeholder_spans, check_deadline):
         return index < len(placeholder_spans) and placeholder_starts[index] < end
 
     needles = []
-    for placeholder, _label, _index, original in seed.pairs:
+    for placeholder, _label, _index, original in pairs:
         check_deadline()
         needle = normalize(original)
         if needle:
@@ -471,49 +480,101 @@ def _resolve_detected_overlaps(protected, detected, text_length, check_deadline=
     return kept
 
 
-def anonymize(text, seed, tags, detect=None, check_deadline=None):
-    """Anonimizza `text` con il seed e il rilevatore iniettato.
+class _WorkingMap:
+    """Mappa di lavoro request-local: seed immutabile + coppie allocate.
 
-    Ritorna {"anonymized_text", "dictionary_delta", "placeholder_count"}.
-    Il seed non viene modificato; nessuno stato sopravvive alla chiamata.
+    L'identita' di una coppia e' l'originale normalizzato. La prima associazione
+    placeholder resta vincolante anche quando un rilevamento successivo usa un'altra
+    label. `categories` filtra le coppie note localizzabili, non quelle riservate.
     """
-    check = check_deadline if check_deadline is not None else (lambda: None)
-    if not isinstance(text, str):
-        raise TypeError("text deve essere una stringa")
-    if len(text) > MAX_TEXT_CHARS:
-        raise PayloadTooLarge()
+
+    __slots__ = ("_by_normalized", "_next_ids", "_delta", "_pairs")
+
+    def __init__(self, seed, reserved, categories=None):
+        if categories is None:
+            known = list(seed.pairs)
+        else:
+            active = set(categories)
+            known = [pair for pair in seed.pairs if pair[1] in active]
+        self._by_normalized = {
+            normalize(original): placeholder
+            for placeholder, _label, _index, original in seed.pairs
+        }
+        self._next_ids = dict(reserved)
+        self._delta = {}
+        self._pairs = known
+
+    @property
+    def pairs(self):
+        """Coppie note localizzabili (seed attivo + allocazioni precedenti)."""
+        return self._pairs
+
+    @property
+    def delta(self):
+        """Coppie nuove dell'intera richiesta, in ordine di allocazione."""
+        return self._delta
+
+    def lookup(self, normalized):
+        """Placeholder gia' associato all'identita' normalizzata, se presente."""
+        return self._by_normalized.get(normalized)
+
+    def allocate(self, label, normalized, value):
+        """Riusa il primo binding o alloca il prossimo ID libero per la label."""
+        placeholder = self._by_normalized.get(normalized)
+        if placeholder is not None:
+            return placeholder
+        index = self._next_ids.get(label, 0) + 1
+        if index > MAX_PLACEHOLDER_INDEX:
+            raise AllocationExhausted()
+        self._next_ids[label] = index
+        placeholder = "[%s_%d]" % (label, index)
+        self._by_normalized[normalized] = placeholder
+        self._delta[placeholder] = value
+        self._pairs.append((placeholder, label, index, value))
+        return placeholder
+
+
+def _reserved_ids(seed, texts, labels, check):
+    """ID occupati per categoria: chiavi del seed + placeholder di TUTTI gli input."""
+    reserved = seed.reserved_ids()
+    spans_by_input = []
+    for text in texts:
+        spans = find_placeholders(text, labels)
+        for span_index, (_start, _end, label, index) in enumerate(spans):
+            if span_index % 256 == 0:
+                check()
+            if index > reserved.get(label, 0):
+                reserved[label] = index
+        spans_by_input.append(spans)
+        check()
+    return reserved, spans_by_input
+
+
+def _anonymize_one(text, state, all_labels, active_labels, detect, check,
+                   placeholder_spans):
+    """Anonimizza un input con la mappa di lavoro condivisa della richiesta.
+
+    `all_labels` e' l'intero catalogo (placeholder gia' presenti: scansione,
+    protezione e conteggio), `active_labels` la whitelist della richiesta
+    (filtro delle entita' rilevate). Senza whitelist i due insiemi coincidono.
+    """
+    seed_spans = _locate_seed_spans(text, state.pairs, placeholder_spans, check)
     check()
 
-    labels = set(tags)
-    placeholder_spans = find_placeholders(text, labels)
-    check()
-    seed_spans = _locate_seed_spans(text, seed, placeholder_spans, check)
-    check()
-
-    # Intervalli protetti: placeholder canonici (vincolanti) + match del seed.
+    # Intervalli protetti: placeholder canonici (vincolanti) + match delle coppie note
+    # (seed e allocazioni degli input precedenti).
     protected = [(start, end, "placeholder", text[start:end])
                  for start, end, _label, _index in placeholder_spans]
-    protected += [(start, end, "seed", placeholder)
+    protected += [(start, end, "known", placeholder)
                   for start, end, placeholder in seed_spans]
     protected.sort(key=lambda interval: interval[0])
 
     detected = []
     if detect is not None:
-        detected = _collect_detected(text, detect, protected, labels, check)
+        detected = _collect_detected(text, detect, protected, active_labels, check)
         detected = _resolve_detected_overlaps(protected, detected, len(text), check)
     check()
 
-    # ID occupati: chiavi del seed + placeholder presenti nel testo.
-    reserved = seed.reserved_ids()
-    for span_index, (_start, _end, label, index) in enumerate(placeholder_spans):
-        if span_index % 256 == 0:
-            check()
-        if index > reserved.get(label, 0):
-            reserved[label] = index
-
-    allocated = {}     # (label, normalizzato) -> placeholder
-    next_ids = {}      # label -> ultimo ID assegnato in questa richiesta
-    delta = {}
     pieces = []
     position = 0
     intervals = protected + [(start, end, "detected", label)
@@ -530,24 +591,16 @@ def anonymize(text, seed, tags, detect=None, check_deadline=None):
             pieces.append(text[position:start])
         if kind == "detected":
             value = text[start:end]
-            placeholder = seed.lookup(payload, normalize(value))
-            if placeholder is None:
-                key = (payload, normalize(value))
-                placeholder = allocated.get(key)
+            normalized = normalize(value)
+            if not normalized:
+                pieces.append(value)
+            else:
+                placeholder = state.lookup(normalized)
                 if placeholder is None:
-                    current = next_ids.get(payload)
-                    if current is None:
-                        current = reserved.get(payload, 0)
-                    index = current + 1
-                    if index > MAX_PLACEHOLDER_INDEX:
-                        raise AllocationExhausted()
-                    next_ids[payload] = index
-                    placeholder = "[%s_%d]" % (payload, index)
-                    allocated[key] = placeholder
-                    delta[placeholder] = value
-            pieces.append(placeholder)
+                    placeholder = state.allocate(payload, normalized, value)
+                pieces.append(placeholder)
         else:
-            pieces.append(payload)                     # placeholder: seed o gia' presente
+            pieces.append(payload)                     # placeholder: seed o gia' nota
         position = end
     pieces.append(text[position:])
     check()
@@ -555,6 +608,98 @@ def anonymize(text, seed, tags, detect=None, check_deadline=None):
     anonymized = "".join(pieces)
     return {
         "anonymized_text": anonymized,
-        "dictionary_delta": delta,
-        "placeholder_count": count_placeholders(anonymized, labels),
+        "placeholder_count": count_placeholders(anonymized, all_labels),
     }
+
+
+def _check_effective_limits(seed, delta, limits, check):
+    if limits is None:
+        return
+    if len(seed.pairs) + len(delta) > limits.seed_entries:
+        raise PayloadTooLarge()
+    total = 0
+    values = [pair[3] for pair in seed.pairs]
+    values.extend(delta.values())
+    for index, value in enumerate(values):
+        if index % 256 == 0:
+            check()
+        if len(value) > limits.original_chars:
+            raise PayloadTooLarge()
+        total += len(value)
+        if total > limits.aggregate_chars:
+            raise PayloadTooLarge()
+
+
+def anonymize(text, seed, tags, detect=None, check_deadline=None, *,
+              categories=None, limits=None):
+    """Anonimizza `text` con il seed e il rilevatore iniettato.
+
+    Ritorna {"anonymized_text", "dictionary_delta", "placeholder_count"}.
+    Il seed non viene modificato; nessuno stato sopravvive alla chiamata.
+    `categories=None` = catalogo intero; altrimenti solo le categorie elencate
+    governano i match noti, il filtro delle entita' e le allocazioni.
+    """
+    check = check_deadline if check_deadline is not None else (lambda: None)
+    if not isinstance(text, str):
+        raise TypeError("text deve essere una stringa")
+    if len(text) > MAX_TEXT_CHARS:
+        raise PayloadTooLarge()
+    check()
+
+    labels = set(tags)
+    active_labels = labels if categories is None else set(categories)
+    placeholder_spans = find_placeholders(text, labels)
+    check()
+    reserved, _spans_by_input = _reserved_ids(seed, [text], labels, check)
+    state = _WorkingMap(seed, reserved, categories)
+    result = _anonymize_one(text, state, labels, active_labels, detect, check,
+                            placeholder_spans)
+    _check_effective_limits(seed, state.delta, limits, check)
+    return {
+        "anonymized_text": result["anonymized_text"],
+        "dictionary_delta": state.delta,
+        "placeholder_count": result["placeholder_count"],
+    }
+
+
+def anonymize_batch(inputs, seed, tags, detect=None, check_deadline=None, *,
+                    categories=None, limits=None):
+    """Anonimizza piu' input con un'unica mappa di lavoro request-local.
+
+    `inputs` e' una sequenza di (input_id, testo). Tutti gli input vengono
+    preparati prima di qualunque inferenza: i placeholder canonici presenti in
+    OGNI input vengono riservati insieme alle chiavi del seed, cosi' un ID
+    allocato presto non collide con un placeholder che compare piu' avanti.
+    Gli input sono poi processati in ordine con lo stesso allocatore: una coppia
+    allocata in un input diventa un match noto (letterale) negli input successivi
+    anche quando il rilevatore non la vede.
+
+    Ritorna (risultati, delta): risultati = [(input_id, {"anonymized_text",
+    "placeholder_count"})] nello stesso ordine di `inputs`, delta = coppie nuove
+    dell'intera richiesta. Il seed non viene mai modificato; in caso di errore
+    non esiste alcun risultato parziale.
+    """
+    check = check_deadline if check_deadline is not None else (lambda: None)
+    labels = set(tags)
+    active_labels = labels if categories is None else set(categories)
+    total = 0
+    texts = []
+    prepared = []
+    for input_id, text in inputs:
+        if not isinstance(text, str):
+            raise TypeError("text deve essere una stringa")
+        total += len(text)
+        if total > MAX_TEXT_CHARS:
+            raise PayloadTooLarge()
+        prepared.append(input_id)
+        texts.append(text)
+    reserved, spans_by_input = _reserved_ids(seed, texts, labels, check)
+
+    state = _WorkingMap(seed, reserved, categories)
+    results = []
+    for position, (input_id, text) in enumerate(zip(prepared, texts)):
+        result = _anonymize_one(text, state, labels, active_labels, detect, check,
+                                spans_by_input[position])
+        results.append((input_id, result))
+    _check_effective_limits(seed, state.delta, limits, check)
+    return results, state.delta

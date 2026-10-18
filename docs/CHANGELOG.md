@@ -5,6 +5,200 @@ Le voci più recenti in alto. (Codice: `src/training/train_pii.py` salvo diverso
 
 ---
 
+## 2026-10-17 - Guardrail API: limiti bounded e identità globale del dizionario
+
+La capacità del dizionario seed e del body JSON è ora configurabile lato server, con default
+maggiori di 256 voci e hard ceiling per ogni dimensione. L'HTTP boundary verifica anche lo stato
+completo seed più delta prima di restituire risultati.
+
+- default: 10000 voci, 4096 code point per originale, 1048576 code point aggregati e 8388608
+  byte per il body JSON; hard ceiling: 20000, 65536, 2097152 e 16777216;
+- variabili server-side `PII_MAX_SEED_ENTRIES`, `PII_MAX_ORIGINAL_CHARS`,
+  `PII_MAX_AGGREGATE_CHARS` e `PII_MAX_JSON_BODY_BYTES`, risolte una volta per richiesta;
+  valori invalidi o non positivi usano il default e valori oltre il tetto vengono clampati;
+- il body multipart resta 20 MiB con massimo framework 50 MiB, i file restano limitati a 5 MiB
+  ciascuno e la parte form `dictionary` usa lo stesso cap JSON; i campi `text` e `categories`
+  restano limitati a 1 MiB. Il budget aggregato dei testi resta 100000 code point;
+- i limiti configurati valgono anche sul dizionario effettivo dopo aver unito seed e delta. Un
+  overflow risponde `413 payload_too_large` senza risultati, delta o originali nella risposta;
+- l'identità è il valore normalizzato globalmente, non la coppia categoria-valore: prevale il
+  primo placeholder, anche se una rilevazione successiva assegna un'altra categoria. I seed
+  duplicati normalizzati restano conflitti; un seed inattivo non fa match letterale, ma un
+  rilevamento attivo dello stesso valore riusa il binding esistente. Entità che normalizzano a
+  vuoto non emettono placeholder o delta.
+
+La tassonomia e il formato `[LABEL_N]` non cambiano. I test usano valori sintetici e non chiamano
+modelli.
+
+---
+
+## 2026-10-08 - Guardrail API: selezione delle categorie per richiesta (schema 0.3.0)
+
+Su richiesta esplicita, la guardrail API v1 non maschera piu' sempre tutte le 24 categorie: il
+chiamante puo' restringere l'anonimizzazione a un sottoinsieme di etichette canoniche con il
+nuovo campo **solo-richiesta `categories`**. La modifica sostituisce il comportamento "tutte le
+categorie, nessun opt-out" della v1 descritto nelle voci precedenti, che restano come traccia
+storica.
+
+- campo opzionale in entrambi i rami: nello JSON e' un array di nomi canonici di `TAG_NAMES`
+  (per esempio `["FULLNAME","EMAIL"]`); assente, `null`, `[]`, stringa vuota o di soli spazi
+  selezionano **tutte le 24 categorie** (default storico);
+- validazione severa: una stringa non vuota, un oggetto, un booleano, un numero, una voce non
+  stringa, una voce vuota o un nome sconosciuto, in minuscolo o con spazi ai bordi rispondono
+  `400 invalid_request`; massimo 24 voci grezze, duplicati ammessi e deduplicati, e oltre il
+  tetto risponde `400 invalid_request`;
+- nel multipart `categories` e' un singolo campo valore (mai un file) con JSON severo: assente
+  o vuoto seleziona tutte, `null` e `[]` decodificati valgono come vuoto, altrimenti vale la
+  stessa policy dello JSON; JSON malformato, UTF-8 non valido, parte duplicata o `categories`
+  inviato come file rispondono `400 invalid_request`. In Postman va inserito come campo Text con
+  valore `["FULLNAME","EMAIL"]`, non come File e non come CSV (`FULLNAME,EMAIL` non e' JSON
+  valido);
+- il contratto multipart passa a quattro campi ammessi (`files`, `text`, `dictionary`,
+  `categories`) e a **13 parti** (10 file piu' i tre campi valore); tutti gli altri tetti restano
+  invariati (file 5 MiB, body 20 MiB, 100000 caratteri aggregati, 200 pagine per PDF, 1 MiB per
+  campo valore) e la regola almeno un input non cambia: una richiesta di sola selezione o di
+  solo dizionario, senza file ne' `text` non vuoto, resta `400 invalid_request`;
+- la selezione filtra modello e rete regex **prima del merge** delle sovrapposizioni e vale su
+  ogni file e sul `text` opzionale; le categorie non selezionate restano **in chiaro per scelta
+  esplicita del chiamante**, quindi un sottoinsieme non e' una garanzia di anonimizzazione
+  completa. La richiesta puo' solo restringere il default, non allargarlo ne' riattivare le
+  esclusioni legacy, e non e' un override di policy server: `prefs.json`, le variabili
+  d'ambiente e i controlli CLI restano fuori dal contratto v1, e `include_tags`/`exclude_tags`
+  non esistono come alias di `categories` (`exclude_tags` resta un campo sconosciuto);
+- il seed resta validato, copiato e immutabile su **tutte le 24 categorie**, anche quando la
+  categoria e' inattiva, con gli stessi conflitti e tetti; le voci di seed inattive non fanno
+  match, non sostituiscono e non entrano nel delta, ma i loro ID restano riservati, la
+  protezione dei placeholder canonici e la prenotazione degli ID coprono tutti gli input e
+  tutte le categorie, e i token gia' presenti restano preservati e contati;
+- `dictionary_delta` contiene solo le coppie nuove delle categorie selezionate;
+  `statistics.placeholder_count` continua a contare **tutti** i token placeholder canonici
+  dell'output, inclusi quelli di categorie inattive, non solo i nuovi. Nessun campo di risposta
+  nuovo e nessun seed riecheggiato;
+- resto invariato: autenticazione, readiness, capability PDF nativa e relativi 503, cache
+  `Cache-Control: no-store`, lock, deadline cooperativa da `PII_ANALYSIS_TIMEOUT_SECONDS`
+  (default 60) con l'avvertenza sul timeout hard di worker/proxy, limiti fissi, ownership del
+  ripristino e nessuna modifica ad AAAS, UI o training;
+- lo schema OpenAPI passa a **0.3.0**: il campo opzionale `categories` e' l'unica aggiunta al
+  contratto; con il campo assente restano il default storico, la forma della risposta di
+  successo e tutti i tetti fissi, tranne il numero di parti. `docs/GUARDRAIL_API.md` e
+  `docs/guardrail-openapi.yaml` sono allineati;
+- nuova copertura dedicata in `tests/test_guardrail_categories.py`: validazione della whitelist
+  su entrambi i rami, filtro prima del merge, interazione con seed, delta, placeholder e tetti.
+  Le verifiche di qualita' e la security review finale non sono dichiarate qui, e nessuna
+  chiusura ENVAS-23 o AAAS e' rivendicata.
+
+Documentazione aggiornata: `README.md`, `CLAUDE.md`, `docs/GUARDRAIL_API.md`,
+`docs/guardrail-openapi.yaml`, `docs/TASSONOMIA_TAG.md` e questo changelog. Gli esempi nuovi
+usano solo valori sintetici.
+
+---
+
+## 2026-10-08 - Guardrail API: budget di analisi configurabile, default da 30 a 60 secondi
+
+Su richiesta esplicita, il budget di elaborazione cooperativo della guardrail API v1 non e' piu'
+una costante fissa di 30 secondi.
+
+- nuova variabile d'ambiente server-side **non segreta** `PII_ANALYSIS_TIMEOUT_SECONDS`: float
+  positivo e finito in secondi, letto una volta per richiesta prima dello snapshot della deadline,
+  non e' un campo della richiesta e il client non puo' imporlo; default 60 secondi con variabile
+  assente o vuota, fallback sicuro a 60 per testo non numerico, zero, negativo, NaN, infinito o
+  overflow;
+- budget cooperativo interno, globale su entrambi i rami JSON e multipart, avviato dopo la
+  lettura bounded del body: copre parsing, estrazione, tutti gli input e l'allocazione; non
+  interrompe un'operazione PDF nativa o una model call in corso;
+- i timeout di worker o proxy esterni vanno tenuti **piu' lunghi** del budget configurato piu' il
+  margine per upload e lavoro nativo; aumentare il timeout del client (per esempio in Postman)
+  non cambia il budget server;
+- nessun campo API nuovo e nessun bump dello schema: i wire type restano alla versione 0.2.0,
+  mentre schema JSON 0.1, forma della risposta di successo e tetti di dimensione restano
+  compatibili; autenticazione, readiness, lock non bloccante, tetti del body, privacy nativa,
+  divieti di log, restrizioni del seed, limiti, stato, envelope e perimetro AAAS restano
+  invariati;
+- lato multipart `files`, `text` e `dictionary` sono facoltativi singolarmente, ma serve almeno
+  un file o un `text` non vuoto: `dictionary` da solo, body vuoto e `text` blank senza file
+  rispondono 400 `invalid_request`; un upload presente ma vuoto o malformato fallisce comunque
+  all-or-nothing. Il campo si chiama `files`, mai `files[]`, e una richiesta solo-testo senza
+  file e' valida; le chiavi del seed sono placeholder canonici come `[ORG_6]`, mai arbitrarie, e
+  i valori degli esempi restano sintetici;
+- configurazione documentata: `PII_ANALYSIS_TIMEOUT_SECONDS=120` nell'ambiente del server di
+  sviluppo (non segreto) e `-e PII_ANALYSIS_TIMEOUT_SECONDS=120` nel container, con la stessa
+  opzione per Docker; il valore e' indipendente dal segreto `PII_API_TOKEN`;
+- copertura di regressione in `tests/test_guardrail_timeout.py`: default e fallback a 60
+  secondi con variabile assente, vuota, non numerica, zero, negativa, NaN, infinito o overflow,
+  e valori positivi interi e decimali accettati; budget congelato una volta per richiesta, con
+  variabile e resolver letti prima dello snapshot, modifiche a meta' richiesta che non lo
+  estendono, avvio dopo la lettura bounded del body e tempo di lettura non addebitato; confini
+  sugli arm JSON e multipart, con 60 esatto al confine che passa, 61 con il default che produce
+  504, env 5 e 120 usate come tali con i rispettivi confini, budget condiviso tra input multipli
+  incluso il tempo di estrazione, risposta 504 sanificata senza output parziali o segreti e lock
+  rilasciato; regressione dei file opzionali, con richiesta solo-testo con o senza seed senza
+  extractor, dizionario da solo e `text` blank che restano 400, e un file presente vuoto o
+  malformato che resta 422.
+
+Motivazione (utente): 30 secondi sono troppo pochi per i documenti reali; il nuovo default e' un
+minuto e il valore resta configurabile senza ricompilare. Il cambio di default e' intenzionale e
+approvato. I documenti `README.md`, `CLAUDE.md`, `docs/GUARDRAIL_API.md` e
+`docs/guardrail-openapi.yaml` sono aggiornati di conseguenza. Le verifiche di qualita' e la
+security review finale non sono dichiarate qui, e nessuna chiusura ENVAS-23 o AAAS e' rivendicata.
+
+---
+
+## 2026-10-07 - Guardrail API: estensione multifile (schema 0.2.0) implementata
+
+L'estensione multifile della guardrail API v1 e' ora **implementata** e coperta da test dedicati.
+La variante a un solo testo JSON resta invariata: stesso oggetto, stessi limiti, stessa risposta a
+un solo risultato `input_id: "text"`, stessi codici e messaggi. Il ramo `multipart/form-data`
+arriva sulla stessa route `POST /api/v1/analyses` e serve a ridurre le chiamate quando il
+chiamante ha piu' documenti che condividono seed e placeholder: una sola richiesta, un solo delta
+aggregato, la stessa allocazione condivisa.
+
+- intake con il `MultipartDecoder` nativo di Werkzeug alimentato in RAM (mai `request.files`,
+  niente spool su disco o file temporanei); estensioni accettate `.pdf`/`.txt`/`.text`/`.md`/
+  `.markdown` (case-insensitive) con whitelist applicata prima del contenuto, quindi un `.jpg` con
+  magic `%PDF-` resta 415 e un `%PDF-` su nome `.txt`/`.md` segue il percorso PDF strict e
+  bounded;
+- mappa di lavoro **richiesta-locale** condivisa: ID di seed e placeholder di TUTTI gli input
+  riservati prima di allocare, riuso della coppia (categoria, originale normalizzato) tra input
+  successivi anche quando il modello non rivede l'occorrenza, delta aggregato con la prima forma
+  superficiale osservata; il seed in ingresso resta immutabile e i limiti 256/4096/65536 valgono
+  solo per il seed, non per le nuove coppie;
+- limiti fissi del contratto: body multipart 20 MiB, singolo file 5 MiB, massimo 10 file, massimo
+  12 parti, campo valore 1 MiB, aggregato dei testi estratti 100000 caratteri, 200 pagine per PDF;
+  superamenti 413 `payload_too_large`, errori file `unsupported_file_type` (415), `empty_file`,
+  `unreadable_file`, `no_extractable_text` (422), sempre con corpo `{error, code}` e senza
+  filename, contenuti o valori del seed;
+- abort coerente: stessa deadline cooperativa di 30 s, avviata dopo la lettura bounded del body;
+  parsing, validazione del seed ed estrazione di tutti i file precedono qualunque inferenza, quindi
+  una richiesta respinta non produce risultati parziali ne' chiamate al modello; l'errore
+  originale (413/504/422) resta quello del caso che lo ha prodotto;
+- **diagnostiche native sicure (B1)**: all'avvio, una volta per processo, errori e warning di
+  MuPDF vengono spenti con verifica delle flag e reset del buffer; il buffer nativo viene svuotato
+  dopo ogni tentativo di estrazione PDF della guardrail che arriva al parser nativo, su successo e
+  su errore. Se i controlli nativi
+  mancano, sollevano o non lasciano le flag spente, solo il ramo PDF della guardrail risponde 503
+  prima di aprire il documento; JSON, `.txt` e `.md` continuano a funzionare e `/health` resta
+  invariato. Un reset fallito disabilita i PDF della guardrail fino al riavvio del processo.
+  Nessuna nuova dipendenza (restano stdlib, Werkzeug e PyMuPDF gia' presenti) e nessun toggle
+  per-richiesta o redirect di `sys.stderr`. Non e' una promessa di zeroizzazione: ferma la stampa
+  e la ritenzione delle stringhe diagnostiche native;
+- compatibilita' JSON invariata: schema, formato di successo, limiti e messaggi del ramo a testo
+  singolo restano quelli della 0.1.0; cambia solo la precedenza pre-body (token, credenziali,
+  readiness e lock prima della lettura, poi media type/charset e tetto del body scelti prima della
+  lettura bounded), quindi una richiesta con piu' problemi invalid puo' ricevere un esito diverso
+  dal passato;
+- nuovi test dedicati: `tests/test_guardrail_multifiles.py` (parser nativo, endpoint, cablaggio
+  Flask e cablaggio `app.py` con PyMuPDF vero e modello finto), `tests/test_guardrail_pdf_privacy.py`
+  (privacy delle diagnostiche native, con prova a livello di file descriptor in processo figlio),
+  `tests/test_pdf_text_limits.py` (collector strict/bounded); il ramo JSON resta coperto da
+  `tests/test_guardrail_api.py` e `tests/test_pii_dictionary.py`.
+
+Documentazione aggiornata: `docs/GUARDRAIL_API.md`, `docs/guardrail-openapi.yaml`, `README.md`,
+`CLAUDE.md` e questo changelog, senza modifiche di requisiti rispetto al contratto 0.2.0 gia'
+scritto. Le verifiche di qualita' e la security review finale non sono dichiarate qui, e nessuna
+chiusura ENVAS-23 o AAAS e' rivendicata.
+
+---
+
 ## 2026-10-06 - Ritiro della web UI: il servizio resta solo API
 
 Su richiesta esplicita ("la UI web non ci serve, usiamo solo gli endpoint"), il fork ritira la

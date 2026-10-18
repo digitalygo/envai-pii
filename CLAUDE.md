@@ -104,12 +104,57 @@ modelli in `models/<versione>/`, artefatti dei run in `experiments/<run>/`, doc 
   `GET /doc/<id>/file.pdf`, `GET/POST /settings` (alias storico `/tags`), `GET/POST /config`,
   `GET /port-check`, `POST /api/v1/analyses` (guardrail v1, vedi sotto); CLI
   `--host`/`--port`/`--exclude-tags`/`--no-mapping`.
-- `pii_dictionary.py` + `guardrail_api.py`: **guardrail API v1** (ENVAS-23, prima slice): endpoint
-  additivo `POST /api/v1/analyses` (un testo JSON + dizionario seed opzionale, niente batch o
-  upload), Bearer `PII_API_TOKEN` configurato nell'ambiente del server. Motore senza dipendenze in
-  `pii_dictionary.py`, guscio HTTP in `guardrail_api.py`, adapter registrato da `app.py`; stateless,
-  non legge `prefs.json`, tutte le categorie di `TAG_NAMES` attive. Contratto: `docs/GUARDRAIL_API.md`
-  + `docs/guardrail-openapi.yaml`; test: `tests/test_guardrail_api.py`, `tests/test_pii_dictionary.py`.
+- `pii_dictionary.py` + `guardrail_api.py` + `guardrail_inputs.py`: **guardrail API v1**
+  (ENVAS-23): endpoint additivo `POST /api/v1/analyses` con due arm implementati. Il ramo a
+  **un solo testo JSON** mantiene il contratto 0.1.0 e accetta in piu' il campo opzionale
+  `categories` (schema 0.3.0). Il ramo
+  **multifile** (schema 0.2.0, esteso a 0.3.0 dal campo `categories`) e' implementato: stessa
+  route, media type `multipart/form-data`
+  con fino a 10 file opzionali (`.pdf`/`.txt`/`.text`/`.md`/`.markdown`, estensione
+  case-insensitive e whitelist controllata prima del contenuto), `text` singolo opzionale,
+  `dictionary` come stringa form con JSON severo (chiavi placeholder canoniche come `[ORG_6]`,
+  mai arbitrarie), `categories` come stringa form con JSON severo e un solo `dictionary_delta`
+  aggregato, per un massimo di 13 parti (10 file piu' i campi valore `text`, `dictionary` e
+  `categories`); `files`, `text`, `dictionary` e `categories` sono
+  facoltativi singolarmente ma serve almeno un file o un `text` non vuoto (il campo
+  `categories` seleziona soltanto e non conta come input), quindi una richiesta
+  solo-testo senza file e' valida e il campo si chiama `files`, mai `files[]`. L'intake usa il
+  `MultipartDecoder` nativo di Werkzeug alimentato in RAM (mai `request.files`, niente spool o
+  file temporanei); il testo mantiene la policy di codifica legacy e un contenuto `%PDF-` su nome
+  `.txt`/`.md` segue lo stesso percorso PDF strict e bounded dei `.pdf` (200 pagine, budget
+  aggregato 100000 caratteri, annots/widgets/TOC strict, deadline cooperativa server-side).
+  Niente OCR, redazione raster, PDF binario/ZIP, array JSON, UI, training o modifiche AAAS.
+  Bearer `PII_API_TOKEN` configurato nell'ambiente del server. La deadline e' un budget
+  cooperativo interno, globale su entrambi i rami, letto una volta per richiesta da
+  `PII_ANALYSIS_TIMEOUT_SECONDS` (float positivo e finito; assente, vuoto o invalido: fallback
+  sicuro a 60 s), non e' un campo della richiesta e non interrompe PDF nativo o model call; il
+  timeout di worker/proxy esterno va tenuto piu' lungo del budget piu' margine per upload e
+  lavoro nativo. La variabile e' non-segreta e indipendente dal segreto `PII_API_TOKEN`.
+  Motore senza dipendenze in `pii_dictionary.py`, guscio HTTP in
+  `guardrail_api.py`, intake multipart in `guardrail_inputs.py`, adapter registrato da `app.py`;
+  stateless, non legge `prefs.json` e non ha fallback da env/CLI/impostazioni. Il campo
+  **solo-richiesta `categories`** e' la whitelist delle etichette da anonimizzare: nello JSON un
+  array di nomi canonici (`["FULLNAME","EMAIL"]`), nel multipart un singolo campo valore con
+  JSON severo; assente, `null`, `[]`, stringa vuota o di soli spazi = tutte le 24 categorie
+  (default storico), valori o voci non validi = `400 invalid_request`, massimo 24 voci grezze
+  (oltre il tetto -> `400 invalid_request`) con duplicati deduplicati. La selezione filtra
+  modello e regex prima del merge e vale su ogni file e sul `text`: le categorie non selezionate
+  restano in chiaro per scelta esplicita del
+  chiamante, quindi un sottoinsieme non e' una garanzia di anonimizzazione completa. Il seed
+  resta validato e copiato su tutte le 24 categorie anche inattive (stessi conflitti e tetti,
+  ID riservati, nessun match ne' delta per le inattive), `dictionary_delta` contiene solo le
+  coppie nuove selezionate e `statistics.placeholder_count` conta tutti i token canonici.
+  **Capability PDF
+  nativa**: all'avvio, una volta per processo, le diagnostiche di MuPDF (errori/warning) vengono
+  spente con readback delle flag e reset del buffer verificati; il buffer viene svuotato dopo
+  ogni tentativo di estrazione PDF della guardrail che arriva al parser nativo e, se il controllo
+  nativo manca o si rompe, solo il ramo PDF risponde 503 (JSON e testo continuano a funzionare)
+  fino al riavvio del processo. Contratto:
+  `docs/GUARDRAIL_API.md` + `docs/guardrail-openapi.yaml`; test: `tests/test_guardrail_api.py`,
+  `tests/test_pii_dictionary.py` (JSON), `tests/test_guardrail_multifiles.py` (multipart e
+  cablaggio), `tests/test_guardrail_pdf_privacy.py` (privacy nativa), `tests/test_pdf_text_limits.py`
+  (collector strict/bounded), `tests/test_guardrail_timeout.py` (budget e file opzionali),
+  `tests/test_guardrail_categories.py` (selezione delle categorie su entrambi gli arm).
 - **Anteprima e download del PDF via API**: `POST /preview` tiene il PDF in memoria e ritorna
   testo + numero di pagine; `GET /doc/<id>/page/<n>.png` rende le pagine **server-side con
   PyMuPDF** (`page.get_pixmap` → PNG per pagina), per una resa coerente senza dipendere da pdf.js

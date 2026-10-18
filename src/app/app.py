@@ -1,23 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-App locale per l'anonimizzazione reversibile di documenti con il modello PII.
+Server HTTP locale per l'anonimizzazione reversibile di documenti con il modello PII.
 
-Flusso d'uso:
-  1) ANONIMIZZA  - incolli testo o carichi un PDF; il modello + una rete regex/checksum
+Flusso d'uso (solo API: nessuna pagina, nessun asset statico):
+  1) ANONIMIZZA  - POST /analyze con testo o file; il modello + una rete regex/checksum
      trovano le PII. Ogni entita' riceve un ID univoco e reversibile: [FULLNAME_1],
      [IBAN_1], ... (valori uguali condividono lo stesso ID).
-  2) COPIA       - copi il testo anonimizzato e lo incolli in ChatGPT/altro LLM.
-  3) RIPRISTINA  - incolli la risposta dell'LLM (che contiene i placeholder) e l'app
-     rimette i valori veri usando il dizionario locale.
+  2) COPIA       - il chiamante copia il testo anonimizzato e lo incolla in ChatGPT/altro LLM.
+  3) RIPRISTINA  - il ripristino e' del chiamante: usa il dizionario
+     {placeholder -> valore} restituito dalla risposta.
 
-Tutto in locale: il testo e il dizionario {placeholder -> valore} non lasciano la macchina.
+L'inferenza gira in locale sul modello, senza chiamate a provider LLM esterni: il testo,
+il dizionario e il PDF anonimizzato tornano via HTTP al chiamante autorizzato che li ha
+richiesti.
 
 Il modello e' affiancato da una rete REGEX + CHECKSUM (EMAIL, TELEFONO, IBAN, CF, PIVA,
 carta di credito, importi, targhe, URL, IP). Le entita' validate matematicamente (IBAN/CF/
 PIVA/carta) hanno priorita' sul modello in caso di sovrapposizione.
 
-Il dizionario di ripristino si puo' DISATTIVARE (switch nell'UI, --no-mapping, PII_MAPPING=0):
-l'anonimizzazione diventa definitiva, nessuna chiave placeholder->valore viene costruita.
+Il dizionario di ripristino si puo' DISATTIVARE (--no-mapping, PII_MAPPING=0, campo
+include_mapping): l'anonimizzazione diventa definitiva, nessuna chiave
+placeholder->valore viene costruita.
 
 Endpoint HTTP:
   GET  /health    liveness/readiness senza inference (200 = modello caricato, 503 = no)
@@ -31,10 +34,12 @@ Endpoint HTTP:
                   il PDF anonimizzato resta in memoria e si guarda pagina per pagina
   GET  /doc/<id>/page/<n>.png   pagina renderizzata (anteprima a video)
   GET  /doc/<id>/file.pdf       download del documento tenuto in memoria
-  GET  /settings  legenda dei 23 tag, tag esclusi, stato del dizionario reversibile
+  GET  /settings  legenda dei 24 tag, tag esclusi, stato del dizionario reversibile
   POST /settings  {"excluded_tags": [...], "mapping_enabled": bool} -> salva in prefs.json
                   (/tags e' un alias storico degli stessi due endpoint)
   GET  /config, POST /config, GET /port-check   host/porta del server
+  POST /api/v1/analyses   guardrail v1 (Bearer PII_API_TOKEN): un solo testo JSON con
+                  seed opzionale -> testo anonimizzato + delta del dizionario
 
 Avvio:  python app.py   ->   http://127.0.0.1:5005
 Configurazione host/porta (precedenza): CLI --host/--port > env PII_HOST/PII_PORT >
@@ -44,21 +49,26 @@ Preferenze di anonimizzazione (precedenza): campo nella richiesta > CLI --exclud
 """
 
 import bisect
+import json
 import os
 import re
 import secrets
 import sys
 import threading
 from collections import OrderedDict
+from http import HTTPStatus
 from pathlib import Path
 
 import fitz  # PyMuPDF
 import torch
-from flask import (Flask, jsonify, render_template_string, request,
-                   send_from_directory)
+from flask import Flask, jsonify, request
+from werkzeug.exceptions import HTTPException
 
+import guardrail_api
+import guardrail_inputs
 import pdf_export
 import pdf_text
+import pii_dictionary
 import server_config
 # Rete REGEX + CHECKSUM: modulo a parte, senza dipendenze dal modello. I nomi
 # restano importabili da qui (`app.detect_regex`) per non rompere chi li usa.
@@ -68,8 +78,92 @@ from detectors import (DETECTORS, SOFT_REGEX_LABELS, cf_ok,  # noqa: F401
 from transformers import pipeline
 
 
+# --------------------------------------------------------------------------- #
+# Privacy: diagnostiche native di MuPDF spente una volta per processo
+#
+# Errori e warning di MuPDF sono scritti DAL C su stdout (verificato: un content
+# stream PDF malformato con un token lo fa comparire in chiaro) e accumulati in
+# un buffer process-wide. Qui si spegne la sola STAMPA, una volta e prima di
+# qualunque richiesta; il buffer viene poi svuotato a fine di ogni estrazione PDF
+# della guardrail. Nessun re-enable a fine richiesta, nessun toggle per-richiesta
+# (le richieste legacy non lo toccano) e nessun redirect di sys.stdout/stderr.
+# --------------------------------------------------------------------------- #
+def _mupdf_tool(name):
+    """Funzione nativa di MuPDF col nome dato, se esposta da TOOLS o dal modulo."""
+    try:
+        tool = getattr(getattr(fitz, "TOOLS", None), name, None)
+    except Exception:
+        tool = None
+    if callable(tool):
+        return tool
+    try:
+        tool = getattr(fitz, name, None)
+    except Exception:
+        return None
+    return tool if callable(tool) else None
+
+
+def _silence_native_mupdf_diagnostics():
+    """Verifica il controllo privacy nativo di MuPDF una volta all'avvio.
+
+    Ogni API e' necessaria: i setter devono accettare False, i getter devono
+    confermare entrambe le flag spente e il reset del buffer deve riuscire. I
+    valori diagnostici restituiti dal reset sono scartati. Non si sollevano
+    errori, cosi' gli altri tipi di input e il servizio restano disponibili.
+    """
+    names = ("mupdf_display_errors", "mupdf_display_warnings", "mupdf_warnings")
+    tools = [_mupdf_tool(name) for name in names]
+    ok = all(callable(tool) for tool in tools)
+
+    for setter in tools[:2]:
+        if not callable(setter):
+            continue
+        try:
+            setter(False)
+        except Exception:
+            ok = False
+
+    for getter in tools[:2]:
+        if not callable(getter):
+            continue
+        try:
+            status = getter()
+            if type(status) not in (bool, int) or status != 0:
+                ok = False
+        except Exception:
+            ok = False
+
+    reset = tools[2]
+    if callable(reset):
+        try:
+            reset(reset=True)  # scartare il buffer: potrebbe contenere testo PDF
+        except Exception:
+            ok = False
+    return ok
+
+
+def _reset_native_mupdf_warnings():
+    """Svuota il buffer nativo e segnala se la privacy resta verificata."""
+    global MUPDF_PRIVACY_OK
+    reset = _mupdf_tool("mupdf_warnings")
+    if reset is None:
+        MUPDF_PRIVACY_OK = False
+        return False
+    try:
+        reset(reset=True)  # il valore puo' contenere testo PDF: non conservarlo
+    except Exception:
+        MUPDF_PRIVACY_OK = False
+        return False
+    return True
+
+
+# Le diagnostiche native possono contenere parti dei documenti. Il controllo e'
+# process-wide e non viene mai ritentato o riattivato durante le richieste.
+MUPDF_PRIVACY_OK = _silence_native_mupdf_diagnostics()
+
+
 def _resource_path(rel):
-    """Percorso risorsa valido sia in sviluppo sia dentro l'exe PyInstaller."""
+    """Percorso risorsa accettato anche da un bundle PyInstaller (sys._MEIPASS)."""
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, rel)
 
@@ -81,7 +175,7 @@ def _resource_path(rel):
 # Metti None per usare AUTOMATICAMENTE l'ultima versione `-v*` disponibile.
 APP_MODEL_VERSION = "1.5.0"
 
-# Dentro l'exe il modello e' impacchettato come "pii_model" (vedi build.spec).
+# In un bundle PyInstaller il modello e' impacchettato come "pii_model".
 # In sviluppo: pin sopra -> auto-ultima versione -> vecchio non versionato -> legacy.
 # Override puntuale a runtime: env PII_MODEL_DIR.
 if getattr(sys, "_MEIPASS", None):
@@ -121,8 +215,7 @@ if not getattr(sys, "_MEIPASS", None) and not os.path.isdir(MODEL_DIR):
           file=sys.stderr)
     sys.exit(2)
 
-ASSETS_DIR = _resource_path("assets")   # mascotte / icone (servite su /assets/<file>)
-APP_VERSION = "2.0.0"                    # versione mostrata nell'UI (allineata a tauri.conf.json)
+APP_VERSION = "2.0.0"                    # versione applicativa riportata da /health
 MAX_WORDS = 120      # parole per chunk (~180 subword, sotto i 512 del training)
 OVERLAP = 20         # parole di sovrapposizione tra chunk consecutivi
 
@@ -140,18 +233,19 @@ nlp = pipeline(
 )
 print("Modello pronto.")
 
-app = Flask(__name__)
+# API-only: nessuna pagina e nessun asset statico. static_folder=None toglie anche
+# la route /static/<path> che Flask creerebbe da solo.
+app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
 
 # Estensioni accettate dall'upload (il PDF passa da PyMuPDF, il resto e' testo puro).
 TEXT_EXTS = {".md", ".markdown", ".txt", ".text"}
 
 # --------------------------------------------------------------------------- #
-# Anteprima a video dei PDF (documento caricato a sinistra, anonimizzato a destra)
+# Anteprima dei PDF (documento caricato e documento anonimizzato)
 #
-# I PDF vengono renderizzati QUI, con PyMuPDF, e serviti come PNG per pagina: non
-# serve un viewer PDF nel browser (WebView2/WKWebView dentro Tauri non lo hanno in
-# modo affidabile) ne' una libreria JS esterna (l'app e' offline, niente CDN).
+# I PDF vengono renderizzati QUI, con PyMuPDF, e serviti come PNG per pagina: il
+# chiamante non ha bisogno di un viewer PDF ne' di una libreria esterna.
 #
 # I documenti restano in memoria (mai su disco: valgono quanto il documento stesso)
 # in una LRU piccola, e muoiono con il processo. Il render di una pagina e' pigro e
@@ -459,40 +553,187 @@ def analyze(text, excluded=None, mapping_enabled=True):
 
 
 # --------------------------------------------------------------------------- #
+# Guardrail API v1 (ENVAS-23, prima slice): endpoint additivo sotto /api/v1.
+# Il contratto e' docs/GUARDRAIL_API.md + docs/guardrail-openapi.yaml; le route
+# legacy qui sopra non cambiano. Il motore del seed sta in pii_dictionary.py, il
+# guscio HTTP in guardrail_api.py. Qui c'e' solo l'adapter verso la pipeline
+# esistente: detect_model/completa-confini/regex/_merge, senza riscriverli.
+# --------------------------------------------------------------------------- #
+def _guardrail_detect(text, check_deadline, categories=None):
+    """Rilevamento su un tratto NON protetto per la guardrail API.
+
+    Differenza voluta da detect_model(): l'inferenza gira un chunk per volta, cosi'
+    il callback di deadline viene controllato tra un chunk e l'altro. Una singola
+    chiamata a nlp() non e' interrompibile; il contratto lo dice esplicitamente
+    (docs/GUARDRAIL_API.md, sezione Deadline): la deadline e' cooperativa.
+    `categories` opzionale restringe modello E rete regex PRIMA di _merge
+    (None = tutte): una regex di una categoria inattiva non deve sopprimere un
+    candidato attivo del modello nella fusione.
+    """
+    if nlp is None:
+        raise guardrail_api.ModelUnavailable()
+    ents = []
+    for chunk, offset in chunk_text(text):
+        check_deadline()
+        results = nlp([chunk])                 # stessa forma batch, un chunk per call
+        check_deadline()
+        if isinstance(results, dict):
+            results = [results]
+        res = (results[0] if len(results) == 1 and isinstance(results[0], (list, tuple))
+               else results)
+        for e in res:
+            ents.append({
+                "label": e["entity_group"],
+                "start": int(e["start"]) + offset,
+                "end": int(e["end"]) + offset,
+                "score": float(e["score"]),
+                "validated": False,
+                "source": "modello",
+            })
+    complete_time(ents, text)
+    check_deadline()
+    regex_ents = detect_regex(text)
+    check_deadline()
+    cands = ents + regex_ents
+    if categories is not None:
+        # La selezione della richiesta vale PRIMA della fusione: una regex di una
+        # categoria inattiva non deve sopprimere un candidato attivo del modello.
+        cands = [candidate for candidate in cands if candidate["label"] in categories]
+    check_deadline()
+    return _merge(cands, text)
+
+
+def _guardrail_detect_for_categories(categories):
+    """Binder request-local: closure immutabile per la whitelist attiva.
+
+    Ritorna un rilevatore con la stessa firma a due argomenti di _guardrail_detect
+    ma con la selezione gia' fissata: il core resta generico e il percorso senza
+    selezione non costruisce nessuna closure.
+    """
+    active = frozenset(categories)
+
+    def detect_active(text, check_deadline):
+        return _guardrail_detect(text, check_deadline, categories=active)
+
+    return detect_active
+
+
+def _guardrail_extract(name, data, remaining_chars, check_deadline):
+    """Testo di un file della guardrail v1 (multipart): nome -> estrattore.
+
+    L'estensione accettata sceglie la famiglia di input; il contenuto PDF viene
+    comunque instradato nel percorso strict e bounded anche quando il file e'
+    chiamato .txt/.md. PDF -> PyMuPDF solo con controllo nativo privacy
+    verificato, altrimenti 503 senza aprire il documento; testo -> la policy di
+    codifica legacy di `_text_from_bytes`, poi char bound e blank check. Gli
+    errori sono tipizzati con status/codice del contratto e non contengono mai
+    il nome file. Deadline e limite caratteri restano 504/413. Un reset nativo
+    fallito disabilita i PDF fino al riavvio, senza sostituire errori originali.
+    """
+    ext = os.path.splitext((name or "").lower())[1]
+    if ext not in guardrail_inputs.ACCEPTED_EXTS:
+        raise guardrail_inputs.InputError(415, "unsupported_file_type")
+
+    if _is_pdf(name, data):
+        if not MUPDF_PRIVACY_OK:
+            raise guardrail_inputs.InputError(503, "unavailable")
+        try:
+            try:
+                document = fitz.open(stream=data, filetype="pdf")
+                try:
+                    check_deadline()   # fitz.open e' nativo e non interrompibile
+                except BaseException:
+                    close = getattr(document, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception:
+                            pass
+                    raise
+                with document as doc:
+                    if not bool(getattr(doc, "is_pdf", False)):
+                        raise guardrail_inputs.InputError(422, "unreadable_file")
+                    if (bool(getattr(doc, "needs_pass", False))
+                            or bool(getattr(doc, "is_encrypted", False))):
+                        raise guardrail_inputs.InputError(422, "unreadable_file")
+                    page_count = int(doc.page_count)
+                    check_deadline()
+                    if page_count > guardrail_inputs.MAX_PDF_PAGES:
+                        raise guardrail_inputs.InputError(413, "payload_too_large")
+                    text = pdf_text.collect_readable_text(
+                        doc, max_chars=remaining_chars,
+                        check_deadline=check_deadline, strict=True)
+            except guardrail_inputs.InputError:
+                raise
+            except pii_dictionary.DeadlineExceeded:
+                raise                      # la deadline resta 504, mai un 422
+            except pdf_text.PdfTextTooLarge:
+                raise guardrail_inputs.InputError(413, "payload_too_large")
+            except Exception:
+                raise guardrail_inputs.InputError(422, "unreadable_file")
+        except BaseException:
+            # Il cleanup non deve rimpiazzare 413/504 o un altro errore originale.
+            _reset_native_mupdf_warnings()
+            raise
+        if not _reset_native_mupdf_warnings():
+            raise guardrail_inputs.InputError(503, "unavailable")
+        if not text.strip():
+            raise guardrail_inputs.InputError(422, "no_extractable_text")
+        return text
+
+    try:
+        text = _text_from_bytes(name, data)
+    except Exception:
+        raise guardrail_inputs.InputError(422, "unreadable_file")
+    if len(text) > remaining_chars:
+        raise guardrail_inputs.InputError(413, "payload_too_large")
+    if not text.strip():
+        raise guardrail_inputs.InputError(422, "empty_file")
+    return text
+
+
+guardrail_api.register_app(app, tags=TAG_NAMES, detect=_guardrail_detect,
+                           detect_for_categories=_guardrail_detect_for_categories,
+                           extract=_guardrail_extract,
+                           readiness=lambda: nlp is not None)
+
+
+# --------------------------------------------------------------------------- #
+# Errori HTTP generati dal framework (404, 405, 413, 500, ...) -> JSON
+#
+# Questa e' l'UNICA gestione globale: intercetta solo le HTTPException sollevate
+# dal framework (route inesistente, metodo sbagliato, body oltre
+# MAX_CONTENT_LENGTH, eccezione non gestita). Gli errori "di merito" che le route
+# restituiscono restano i loro JSON {"error": ...}, e i successi binari restano
+# binari. Nessuna descrizione, URL o valore della richiesta finisce nel corpo:
+# solo la frase standard del codice. Si riusa la risposta del framework per
+# conservarne gli header di protocollo (Allow, WWW-Authenticate, Retry-After).
+# --------------------------------------------------------------------------- #
+@app.errorhandler(HTTPException)
+def _http_error(e):
+    resp = e.get_response()
+    if resp.status_code < 400:               # HTTPException senza codice -> 500
+        resp.status_code = 500
+    status = resp.status_code
+    try:
+        info = HTTPStatus(status)
+    except ValueError:                       # codice non standard: fallback neutro
+        error_text, code = "HTTP error.", f"http_{status}"
+    else:
+        error_text, code = info.phrase + ".", info.name.lower()
+    resp.set_data(json.dumps({"error": error_text, "code": code}))
+    resp.mimetype = "application/json"
+    resp.headers["Cache-Control"] = "no-store"   # gli errori non si mettono in cache
+    return resp
+
+
+# --------------------------------------------------------------------------- #
 # Endpoints
 # --------------------------------------------------------------------------- #
-def _page():
-    return PAGE.replace("__VERSION__", APP_VERSION)
-
-
-@app.route("/")
-def index():
-    return _page()
-
-
-@app.route("/assets/<path:fn>")
-def assets(fn):
-    if os.path.isfile(os.path.join(ASSETS_DIR, fn)):
-        return send_from_directory(ASSETS_DIR, fn)
-    return ("", 404)
-
-
-@app.route("/favicon.ico")
-def favicon():
-    if os.path.isfile(os.path.join(ASSETS_DIR, "mascot_shield.png")):
-        return send_from_directory(ASSETS_DIR, "mascot_shield.png")
-    return ("", 204)
-
-
-@app.errorhandler(404)
-def not_found(_e):
-    return _page()
-
-
 @app.route("/health")
 @app.route("/healthz")
 def health():
-    """Liveness/readiness SENZA inference: sonda economica per orchestratori e sidecar.
+    """Liveness/readiness SENZA inference: sonda economica per orchestratori e process manager.
     200 = modello caricato e pronto; 503 = server su ma modello non disponibile."""
     ready = nlp is not None
     excl, mapping = _get_prefs()
@@ -558,8 +799,8 @@ def _extract_upload(fs):
 
 
 def _uploaded_file():
-    """Il file dell'upload, se c'e'. "pdf" e' il nome storico del campo (l'UI lo
-    usa ancora), "file" e' l'alias nuovo."""
+    """Il file dell'upload, se c'e'. "pdf" e' il nome storico del campo, "file" e'
+    l'alias nuovo."""
     return next((request.files[k] for k in ("pdf", "file")
                  if k in request.files and request.files[k].filename), None)
 
@@ -594,8 +835,8 @@ def analyze_route():
     keep_map = (server_config.parse_bool(raw_map, default_map)
                 if raw_map is not None else default_map)
     out = analyze(text, excl, keep_map)
-    # Il testo originale torna solo col dizionario attivo (l'UI lo rimette nella casella
-    # dopo un upload). In modalita' definitiva la risposta non deve contenere nessun
+    # Il testo originale torna solo col dizionario attivo (il chiamante lo usa per
+    # il ripristino). In modalita' definitiva la risposta non deve contenere nessun
     # valore in chiaro: la chiave manca del tutto, come il valore nei segmenti (#118).
     if keep_map:
         out["source_text"] = text
@@ -607,8 +848,8 @@ def analyze_route():
 # --------------------------------------------------------------------------- #
 def _pdf_response(data, report, redactions, filename="documento_anonimizzato.pdf"):
     """Risposta binaria + intestazioni diagnostiche. X-PII-Residual e
-    X-PII-Skipped sono le due che l'UI trasforma in AVVISO: valori del documento
-    che, per motivi diversi, sono rimasti in chiaro."""
+    X-PII-Skipped sono le due da tradurre in un avviso al chiamante: valori del
+    documento che, per motivi diversi, sono rimasti in chiaro."""
     resp = app.response_class(data, mimetype="application/pdf")
     resp.headers["Content-Disposition"] = f"attachment; filename={filename}"
     resp.headers["X-PII-Redactions"] = str(redactions)
@@ -711,7 +952,7 @@ def pdf_preview_route():
     e' il descrittore del documento ({doc_id, n_pages, ...}), le pagine si prendono
     poi da /doc/<id>/page/<n>.png e il file da /doc/<id>/file.pdf.
 
-    Serve a non anonimizzare due volte: l'anteprima a destra e il download del PDF
+    Serve a non anonimizzare due volte: l'anteprima via API e il download del PDF
     usano lo STESSO documento, generato una volta sola."""
     try:
         out, report, redactions, name = _build_anonymized_pdf()
@@ -734,9 +975,8 @@ def pdf_preview_route():
 # --------------------------------------------------------------------------- #
 @app.route("/preview", methods=["POST"])
 def preview_route():
-    """Tiene in memoria il PDF appena caricato per mostrarlo a sinistra e ne
-    ritorna anche il testo estratto (cosi' l'UI puo' offrire "PDF" o "Testo"
-    senza una seconda estrazione)."""
+    """Tiene in memoria il PDF appena caricato per l'anteprima e ne ritorna anche
+    il testo estratto (cosi' il chiamante non deve fare una seconda estrazione)."""
     up = _uploaded_file()
     if up is None:
         return jsonify({"error": "Nessun file caricato."}), 400
@@ -755,7 +995,7 @@ def preview_route():
 @app.route("/doc/<doc_id>/page/<int:n>.png")
 def doc_page(doc_id, n):
     """Pagina n (0-based) renderizzata in PNG. 404 se il documento e' scaduto
-    dalla LRU: l'UI in quel caso rifa' l'upload."""
+    dalla LRU: in quel caso il chiamante rifa' l'upload."""
     d = _get_doc(doc_id)
     if d is None:
         return ("", 404)
@@ -854,1149 +1094,6 @@ def port_check():
         return jsonify({"available": False})
     return jsonify({"available": server_config.port_available(host, port)})
 
-
-# --------------------------------------------------------------------------- #
-# UI (single page)
-# --------------------------------------------------------------------------- #
-PAGE = r"""
-<!doctype html>
-<html lang="it">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="icon" href="/assets/mascot_shield.png">
-<title>Rizzo PII · locale</title>
-<style>
-  :root{
-    --bg:#f5f4f8; --card:#ffffff; --ink:#211f29; --muted:#6c6677; --soft:#9d97a9;
-    --line:#e9e6f1; --line2:#f2f0f7; --brand:#7c3a9e; --brand-dk:#643183;
-    --ok:#1d8a4e; --shadow:0 1px 2px rgba(33,26,48,.05),0 10px 28px rgba(33,26,48,.05);
-    --r:14px;
-  }
-  *{box-sizing:border-box}
-  html,body{height:100%}
-  body{margin:0;background:var(--bg);color:var(--ink);overflow-x:hidden;overflow-y:auto;
-       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-       font-size:15px;line-height:1.55;-webkit-font-smoothing:antialiased}
-  /* desktop: altezza = viewport, lo scroll avviene DENTRO i componenti (no effetto zoom-out);
-     su schermi stretti (media query sotto) si sblocca e la pagina scrolla, colonne impilate */
-  .app{max-width:1240px;margin:0 auto;padding:14px 22px 10px;height:100vh;
-       display:flex;flex-direction:column;overflow:hidden}
-
-  /* header */
-  header{display:flex;align-items:center;gap:14px;margin-bottom:14px;flex-wrap:wrap;flex:none}
-  .logo{width:46px;height:46px;display:grid;place-items:center;font-size:24px}
-  .logo img{width:100%;height:100%;object-fit:contain;
-            filter:drop-shadow(0 2px 4px rgba(20,28,46,.18))}
-  .empty img{width:128px;height:auto;opacity:.96;margin-bottom:2px}
-  header h1{font-size:19px;margin:0;font-weight:700;letter-spacing:-.01em}
-  header h1 .ver{font-size:11.5px;font-weight:600;color:var(--soft);vertical-align:middle;margin-left:4px}
-  header .tag{font-size:12.5px;color:var(--muted)}
-  .badge{margin-left:auto;display:inline-flex;align-items:center;gap:7px;background:#eaf7ef;
-         color:var(--ok);border:1px solid #cde8d8;border-radius:999px;padding:6px 13px;
-         font-size:12.5px;font-weight:600}
-  .badge .dot{width:7px;height:7px;border-radius:50%;background:var(--ok)}
-  .lang{margin-left:8px;background:#fff;border:1px solid var(--line);border-radius:10px;
-        padding:6px 10px;font:inherit;font-size:12.5px;font-weight:600;color:var(--ink);cursor:pointer}
-  .lang:hover{border-color:#cfd5e0}
-
-  /* stepper / tabs */
-  .tabs{display:flex;gap:8px;margin-bottom:14px;flex:none}
-  .tab{flex:0 0 auto;display:flex;align-items:center;gap:10px;background:var(--card);
-       border:1px solid var(--line);border-radius:12px;padding:11px 16px;cursor:pointer;
-       color:var(--muted);font-weight:600;font-size:14px;transition:.15s;user-select:none}
-  .tab:hover{border-color:#d4d9e4}
-  .tab.on{color:var(--ink);border-color:var(--brand);box-shadow:0 0 0 3px rgba(124,58,158,.13)}
-  .tab .num{width:22px;height:22px;border-radius:50%;display:grid;place-items:center;
-            background:var(--line);color:var(--muted);font-size:12.5px;font-weight:700}
-  .tab.on .num{background:var(--brand);color:#fff}
-  .tab .arrow{color:var(--soft)}
-
-  /* grid (pane "Ripristina") + workspace (pane "Anonimizza") */
-  .grid{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr;gap:16px;flex:1;min-height:0}
-  .workspace{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr;gap:16px;
-             align-items:stretch;flex:1;min-height:0}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);
-        box-shadow:var(--shadow);display:flex;flex-direction:column;overflow:hidden;min-height:0}
-  .card .hd{padding:13px 16px;border-bottom:1px solid var(--line2);display:flex;
-            align-items:center;gap:10px}
-  .card .hd h2{font-size:13px;margin:0;text-transform:uppercase;letter-spacing:.04em;
-               color:var(--muted);font-weight:700}
-  .card .hd .right{margin-left:auto;display:flex;gap:8px;align-items:center}
-  .card .bd{padding:14px 16px;flex:1;min-height:0;display:flex;flex-direction:column}
-
-  textarea{width:100%;flex:1;min-height:0;resize:none;border:1px solid var(--line);
-           border-radius:10px;padding:13px 14px;font-size:14.5px;line-height:1.6;color:var(--ink);
-           background:#fcfcfe;font-family:inherit}
-  textarea:focus{outline:none;border-color:var(--brand);box-shadow:0 0 0 3px rgba(124,58,158,.13)}
-  textarea.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13.5px}
-
-  /* dropzone */
-  .drop{border:1.5px dashed var(--line);border-radius:10px;padding:11px 14px;margin-top:11px;
-        display:flex;align-items:center;gap:11px;color:var(--muted);font-size:13.5px;cursor:pointer;
-        transition:.15s;background:#fcfcfe}
-  .drop:hover,.drop.hot{border-color:var(--brand);background:#f8f4fc;color:var(--ink)}
-  .drop .ic{font-size:18px}
-  .drop b{color:var(--ink)}
-
-  /* buttons */
-  .row{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-top:12px}
-  button{font:inherit;border:0;border-radius:10px;padding:10px 17px;font-weight:600;font-size:14px;
-         cursor:pointer;display:inline-flex;align-items:center;gap:8px;transition:.15s}
-  .btn{background:var(--brand);color:#fff;box-shadow:0 1px 2px rgba(124,58,158,.22)}
-  .btn:hover{background:var(--brand-dk)}
-  .btn.lg{padding:12px 22px;font-size:15px}
-  .ghost{background:#fff;color:var(--ink);border:1px solid var(--line)}
-  .ghost:hover{border-color:#cfd5e0;background:#fafbfd}
-  button:disabled{opacity:.55;cursor:default}
-  .spin{width:15px;height:15px;border:2px solid rgba(255,255,255,.45);border-top-color:#fff;
-        border-radius:50%;animation:sp .7s linear infinite}
-  .ghost .spin{border-color:rgba(124,58,158,.25);border-top-color:var(--brand)}
-  @keyframes sp{to{transform:rotate(360deg)}}
-  .hint{color:var(--soft);font-size:12.5px;margin-left:auto}
-
-  /* preview */
-  .seg-tabs{display:inline-flex;background:var(--line2);border-radius:9px;padding:3px}
-  .seg-tabs button{background:transparent;color:var(--muted);padding:5px 12px;font-size:13px;
-                   border-radius:7px;box-shadow:none}
-  .seg-tabs button.on{background:#fff;color:var(--ink);box-shadow:var(--shadow)}
-  .view{flex:1;overflow:auto;border:1px solid var(--line);border-radius:10px;
-        padding:14px;background:#fcfcfe;min-height:0}
-  /* editor (sx) e anteprima/testo (dx): riempiono la card -> stessa altezza, scroll sincronizzato */
-  #src,#anon{flex:1;min-height:0}
-  #pane2 textarea{flex:1;min-height:0}
-
-  /* CON RISULTATO: la pagina scrolla e i componenti hanno altezza fissa generosa (no schiacciamento).
-     Il dizionario va sotto e si raggiunge scrollando la pagina; editor/anteprima scrollano internamente. */
-  .app.has-result{height:auto;overflow:visible}
-  .app.has-result .workspace{flex:none}
-  .app.has-result #src,.app.has-result #anon,.app.has-result .view{flex:none;height:60vh}
-  /* pane "Ripristina": non deve collassare quando l'app e' in modalita' scroll-pagina */
-  #pane2 textarea,#pane2 .view{min-height:60vh}
-
-  /* schermi stretti: la pagina scrolla, una colonna, card impilate con altezze fisse leggibili.
-     DEVE stare dopo le regole flex:1 qui sopra per vincere a parita' di specificita'. */
-  @media(max-width:920px){
-    .grid{grid-template-columns:1fr}
-    .app{height:auto;overflow:visible}
-    .workspace{grid-template-columns:1fr;grid-template-rows:none;flex:none;min-height:auto}
-    #src,#anon,.view,#pane2 textarea{flex:none;height:60vh}
-  }
-  /* render del PDF (pagine PNG servite da /doc/<id>/page/<n>.png).
-     Sfondo scuro come un lettore PDF: le pagine bianche si staccano. */
-  .pdfview{padding:12px;background:#e8e6ef}
-  .pdfview .pg{position:relative;width:100%;margin:0 0 12px;background:#fff;border-radius:4px;
-               overflow:hidden;box-shadow:0 1px 3px rgba(33,26,48,.18),0 6px 18px rgba(33,26,48,.10)}
-  .pdfview .pg:last-child{margin-bottom:0}
-  .pdfview .pg img{display:block;width:100%;height:auto;min-height:24px}
-  .pdfview .pgn{position:absolute;right:7px;bottom:7px;background:rgba(28,35,48,.6);color:#fff;
-                font-size:11px;font-weight:700;border-radius:6px;padding:2px 7px;letter-spacing:.02em}
-  .pdfbusy{display:flex;align-items:center;justify-content:center;gap:10px;height:100%;
-           color:var(--muted);font-size:13.5px;font-weight:600}
-  .pdfbusy .spin{border-color:rgba(124,58,158,.25);border-top-color:var(--brand)}
-
-  .preview{white-space:pre-wrap;word-wrap:break-word;font-size:14.5px;line-height:1.7}
-  .ph{border-radius:6px;padding:1px 7px 2px;font-weight:600;font-size:12.5px;cursor:help;
-      border:1px solid;white-space:nowrap;display:inline-block;line-height:1.4;
-      transition:.12s}
-  .ph .ck{font-size:10px;opacity:.8;margin-left:3px}
-  .ph.dim{opacity:.25;filter:grayscale(.6)}
-  .empty{color:var(--soft);display:flex;flex-direction:column;align-items:center;justify-content:center;
-         height:100%;gap:9px;text-align:center;font-size:14px}
-  .empty .big{font-size:34px;opacity:.6}
-
-  /* legend / stats */
-  .legend{display:flex;gap:7px;flex-wrap:wrap;padding:12px 16px;border-top:1px solid var(--line2)}
-  .chip{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--line);border-radius:999px;
-        padding:4px 11px;font-size:12.5px;font-weight:600;color:var(--ink);cursor:pointer;
-        background:#fff;user-select:none;transition:.12s}
-  .chip:hover{border-color:#cfd5e0}
-  .chip.off{opacity:.4;text-decoration:line-through}
-  .chip .sw{width:10px;height:10px;border-radius:3px}
-  .chip .n{color:var(--muted);font-weight:700}
-  .meta{display:flex;gap:8px;flex-wrap:wrap;padding:0 16px 12px}
-  .stat{background:#f7f8fb;border:1px solid var(--line2);border-radius:9px;padding:6px 11px;
-        font-size:12.5px;color:var(--muted)}
-  .stat b{color:var(--ink);font-weight:700}
-
-  /* mapping table */
-  .tablewrap{max-height:240px;overflow:auto;padding:0 16px 16px}
-  table{width:100%;border-collapse:collapse;font-size:13.5px}
-  th{position:sticky;top:0;background:#fff;text-align:left;color:var(--soft);font-weight:600;
-     font-size:11.5px;text-transform:uppercase;letter-spacing:.04em;padding:8px 8px;border-bottom:1px solid var(--line)}
-  td{padding:8px 8px;border-bottom:1px solid var(--line2);vertical-align:top}
-  td.k{font-family:ui-monospace,Consolas,monospace;font-weight:600;white-space:nowrap}
-  td.v{word-break:break-word}
-  tr:hover td{background:#fafbfd}
-
-  /* card "Dizionario": a tutta larghezza sotto le due colonne, scrollabile */
-  .dict{margin-top:16px;flex:none}
-  .dict .bd{padding:0;display:block}
-  .dict .meta{padding:13px 16px 6px}
-  .dict .legend{padding:0 16px 12px;border-top:none}
-  .dict .tablewrap{max-height:300px;overflow:auto;padding:0 16px 16px}
-
-  /* reverse panel */
-  .pane{display:none}
-  .pane.on{display:flex;flex-direction:column;flex:1;min-height:0}
-  .callout{display:flex;gap:11px;background:#fff7ed;border:1px solid #fde6c8;border-radius:11px;
-           padding:12px 14px;font-size:13.5px;color:#7a4d12;margin-bottom:14px;flex:none}
-  .callout b{color:#5c3a0d}
-  .callout .ic{font-size:17px}
-
-  /* angolo alto a destra: la lingua resta in linea col badge; l'icona "galleggia" sotto (no shift) */
-  .topright{position:relative;margin-left:8px;display:flex;align-items:center}
-  .info{position:absolute;top:calc(100% + 6px);right:0;display:grid;place-items:center;
-        width:25px;height:25px;border-radius:8px;background:#fff7ed;border:1px solid #fde6c8;
-        font-size:13px;line-height:1;cursor:pointer;user-select:none;transition:.12s}
-  .info:hover{border-color:#f3c98b}
-  .info.open{border-color:#f3c98b;background:#ffedd5}
-  .info .tip{position:absolute;top:calc(100% + 8px);right:0;width:300px;
-             background:#fff;border:1px solid var(--line);border-radius:11px;box-shadow:var(--shadow);
-             padding:12px 14px;font-size:12.5px;font-weight:400;color:#5c4326;line-height:1.55;
-             text-align:left;opacity:0;visibility:hidden;transform:translateY(-4px);
-             transition:.15s;z-index:60;pointer-events:none}
-  .info.open .tip{opacity:1;visibility:visible;transform:translateY(0);pointer-events:auto}
-  .info .tip b{color:var(--ink)}
-  .info .tip a{color:var(--brand);font-weight:700;text-decoration:none;word-break:break-word}
-  .info .tip a:hover{text-decoration:underline}
-  .info .tip::before{content:"";position:absolute;top:-5px;right:8px;width:9px;height:9px;background:#fff;
-                     border-left:1px solid var(--line);border-top:1px solid var(--line);transform:rotate(45deg)}
-
-  /* crediti (footer dell'app) */
-  .credits{flex:none;text-align:center;padding:9px 0 2px;font-size:11.5px;color:var(--soft)}
-  .credits b{color:var(--muted);font-weight:700}
-  .credits .u{color:var(--brand);font-weight:600}
-
-  /* toast */
-  #toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);
-         background:#1c2330;color:#fff;padding:11px 18px;border-radius:11px;font-size:13.5px;font-weight:600;
-         box-shadow:0 12px 32px rgba(0,0,0,.22);opacity:0;pointer-events:none;transition:.22s;z-index:50;
-         display:flex;align-items:center;gap:9px}
-  #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
-  #toast.ok::before{content:"✓";color:#6ee7a8}
-  .kbd{font-family:ui-monospace,Consolas,monospace;background:#eef1f6;border:1px solid var(--line);
-       border-radius:5px;padding:1px 6px;font-size:11.5px;color:var(--muted)}
-
-  /* config modal */
-  .cfg-overlay{position:fixed;inset:0;background:rgba(33,26,48,.35);z-index:100;
-               display:flex;align-items:center;justify-content:center;opacity:0;
-               visibility:hidden;transition:.18s}
-  .cfg-overlay.open{opacity:1;visibility:visible}
-  .cfg-card{background:#fff;border-radius:16px;box-shadow:0 16px 48px rgba(33,26,48,.18);
-            padding:26px 28px 22px;width:380px;max-width:92vw}
-  .cfg-card h3{margin:0 0 16px;font-size:16px;font-weight:700;display:flex;align-items:center;gap:9px}
-  .cfg-row{display:flex;flex-direction:column;gap:5px;margin-bottom:14px}
-  .cfg-row label{font-size:12.5px;font-weight:600;color:var(--muted);text-transform:uppercase;
-                 letter-spacing:.04em}
-  .cfg-row input{border:1px solid var(--line);border-radius:9px;padding:9px 12px;font:inherit;
-                 font-size:14px;color:var(--ink);background:#fcfcfe}
-  .cfg-row input:focus{outline:none;border-color:var(--brand);box-shadow:0 0 0 3px rgba(124,58,158,.13)}
-  .cfg-status{font-size:12.5px;font-weight:600;padding:7px 11px;border-radius:8px;margin-bottom:14px;
-              display:none}
-  .cfg-status.ok{display:block;background:#eaf7ef;color:var(--ok)}
-  .cfg-status.fail{display:block;background:#fef2f2;color:#b91c1c}
-  .cfg-btns{display:flex;gap:9px;align-items:center}
-  .cfg-note{font-size:11.5px;color:var(--soft);margin-top:12px}
-  .gear{background:none;border:1px solid var(--line);width:30px;height:30px;border-radius:8px;
-        display:grid;place-items:center;font-size:15px;padding:0;cursor:pointer;transition:.12s;
-        margin-left:6px;flex:none}
-  .gear:hover{border-color:#cfd5e0;background:#fafbfd}
-
-  /* switch "Dizionario reversibile" (sotto la dropzone, nella card di input).
-     OFF non e' uno stato di errore ma una modalita' piu' stretta -> ambra, non grigio. */
-  .mapsw{display:flex;align-items:flex-start;gap:12px;margin-top:11px;padding:11px 13px;
-         border:1px solid var(--line);border-radius:11px;background:#fcfcfe;transition:.15s}
-  .mapsw.off{background:#fff7ed;border-color:#fde6c8}
-  /* .tsw e non .sw: .sw e' gia' il quadratino-colore dei chip nella legenda */
-  .tsw{position:relative;width:42px;height:24px;border-radius:999px;background:var(--brand);
-       border:0;padding:0;flex:none;cursor:pointer;transition:.18s;margin-top:1px}
-  .tsw:focus-visible{outline:2px solid var(--brand);outline-offset:2px}
-  .tsw .knob{position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;
-             background:#fff;transition:.18s;box-shadow:0 1px 3px rgba(0,0,0,.28)}
-  .tsw.off{background:#c2410c}
-  .tsw.off .knob{transform:translateX(18px)}
-  .mapsw .ttl{font-size:13.5px;font-weight:700;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-  .mapsw .st{font-size:11px;font-weight:800;letter-spacing:.05em;border-radius:999px;
-             padding:2px 8px;background:#f1e9f7;color:var(--brand-dk)}
-  .mapsw.off .st{background:#ffedd5;color:#9a3412}
-  .mapsw .sub{font-size:12.5px;color:var(--muted);line-height:1.45;margin-top:2px}
-  .mapsw.off .sub{color:#7a4d12}
-
-  /* modale "Tag da anonimizzare": legenda dei 23 tag con toggle per tipo */
-  .cfg-card.wide{width:600px}
-  .tg-sub{font-size:12.5px;color:var(--muted);margin:-8px 0 14px;line-height:1.5}
-  .tg-bar{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
-  .tg-bar .mini{background:#fff;color:var(--muted);border:1px solid var(--line);
-                border-radius:8px;padding:5px 10px;font-size:12.5px;font-weight:600}
-  .tg-bar .mini:hover{border-color:#cfd5e0;color:var(--ink)}
-  .tg-bar .count{margin-left:auto;font-size:12.5px;color:var(--soft);font-weight:600}
-  .tg-list{max-height:46vh;overflow:auto;border:1px solid var(--line);border-radius:11px;
-           padding:5px;background:#fcfcfe}
-  .tg-row{display:flex;align-items:flex-start;gap:10px;padding:8px 9px;border-radius:9px;
-          cursor:pointer;user-select:none;transition:.12s}
-  .tg-row:hover{background:#f4f2f9}
-  .tg-row input{margin:3px 0 0;accent-color:var(--brand);width:15px;height:15px;flex:none;cursor:pointer}
-  .tg-row .sw{width:10px;height:10px;border-radius:3px;margin-top:5px;flex:none}
-  .tg-row .txt{min-width:0}
-  .tg-row .nm{font-family:ui-monospace,Consolas,monospace;font-size:12.5px;font-weight:700}
-  .tg-row .ds{font-size:12.5px;color:var(--muted);line-height:1.45}
-  .tg-row .ex{font-size:11.5px;color:var(--soft)}
-  .tg-row.off{opacity:.55}
-  .tg-row.off .nm{text-decoration:line-through}
-</style>
-</head>
-<body>
-<div class="app">
-  <header>
-    <div class="logo"><img src="/assets/mascot_shield.png" alt="rizzo-pii"
-         onerror="this.parentNode.textContent='🦔'"></div>
-    <div>
-      <h1>Rizzo PII <span class="ver">v__VERSION__</span></h1>
-      <div class="tag" data-i18n="tagline">modello locale su CPU · GDPR compliant</div>
-    </div>
-    <span class="badge"><span class="dot"></span> <span data-i18n="badge">100% in locale</span></span>
-    <div class="topright">
-      <select id="lang" class="lang" title="Lingua / Language" aria-label="Lingua / Language">
-        <option value="it">🇮🇹 Italiano</option>
-        <option value="en">🇬🇧 English</option>
-      </select>
-      <button class="gear" id="tagsBtn" title="Tag da anonimizzare" aria-label="PII tags" onclick="openTags()">🏷️</button>
-      <button class="gear" id="gearBtn" title="Configurazione server" aria-label="Server config" onclick="openConfig()">⚙️</button>
-      <span class="info" id="infoBtn" tabindex="0" role="button" aria-label="Avviso / info">⚠️<span class="tip" data-i18n="notice"></span></span>
-    </div>
-  </header>
-
-  <div class="tabs">
-    <div class="tab on" id="tab1" onclick="showTab(1)">
-      <span class="num">1</span> <span data-i18n="tab1">Anonimizza</span> <span class="arrow">→</span>
-    </div>
-    <div class="tab" id="tab2" onclick="showTab(2)">
-      <span class="num">2</span> <span data-i18n="tab2">Ripristina la risposta</span>
-    </div>
-  </div>
-
-  <!-- ============ PANE 1: ANONIMIZZA ============ -->
-  <div class="pane on" id="pane1">
-    <div class="workspace">
-      <!-- input -->
-      <div class="card">
-        <div class="hd"><h2 data-i18n="in_title">① Il tuo documento</h2>
-          <div class="right">
-            <span class="hint" id="inHint" data-i18n="in_hint">incolla testo o trascina un PDF / .md</span>
-            <div class="seg-tabs" id="srcTabs" style="display:none">
-              <button class="on" id="sPdf" onclick="setSrcView('pdf')" data-i18n="v_pdf">Anteprima PDF</button>
-              <button id="sText" onclick="setSrcView('text')" data-i18n="v_raw">Testo</button>
-            </div>
-          </div></div>
-        <div class="bd">
-          <div class="view pdfview" id="pdfSrcView" style="display:none"></div>
-          <textarea id="src" data-i18n-ph="src_ph" placeholder="Incolla qui il testo dell'atto, del contratto o della sentenza…&#10;&#10;Oppure trascina un PDF nell'area qui sotto."></textarea>
-          <label class="drop" id="drop">
-            <span class="ic">📄</span>
-            <span id="dropTxt">Trascina un <b>PDF</b> o un <b>.md</b> qui, oppure <b>scegli un file</b></span>
-            <input type="file" id="pdf" accept=".pdf,.md,.markdown,.txt,application/pdf,text/markdown,text/plain" hidden>
-          </label>
-          <div class="mapsw" id="mapSw">
-            <button class="tsw" id="mapToggle" role="switch" aria-checked="true"
-                    aria-labelledby="mapTtl" onclick="toggleMapping()"><span class="knob"></span></button>
-            <div>
-              <div class="ttl" id="mapTtl"><span data-i18n="map_ttl">Dizionario reversibile</span>
-                <span class="st" id="mapState">ATTIVO</span></div>
-              <div class="sub" id="mapSub">Ogni PII riceve un ID: potrai ripristinare i valori veri dalla risposta dell'LLM.</div>
-            </div>
-          </div>
-          <div class="row">
-            <button class="btn lg" id="go">🛡️ <span data-i18n="go">Anonimizza</span></button>
-            <button class="ghost" id="clear" data-i18n="clear">Pulisci</button>
-            <span class="hint"><span class="kbd">Ctrl</span>+<span class="kbd">Enter</span></span>
-          </div>
-        </div>
-      </div>
-
-      <!-- output -->
-      <div class="card out">
-        <div class="hd">
-          <h2 data-i18n="out_title">② Risultato</h2>
-          <div class="right">
-            <div class="seg-tabs">
-              <button class="on" id="vPrev" onclick="setView('prev')" data-i18n="v_prev">Anteprima</button>
-              <button id="vText" onclick="setView('text')" data-i18n="v_text">Testo da copiare</button>
-              <button id="vPdf" onclick="setView('pdf')" data-i18n="v_opdf">PDF censurato</button>
-            </div>
-          </div>
-        </div>
-        <div class="bd">
-          <div class="view" id="viewPrev">
-            <div class="empty" id="emptyPrev">
-              <img src="/assets/mascot_doc.png" alt="" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'big',textContent:'🕵️'}))">
-              <div data-i18n="empty_prev">L'anteprima con le PII evidenziate apparirà qui.</div>
-            </div>
-            <div class="preview" id="prev" style="display:none"></div>
-          </div>
-          <div class="view pdfview" id="pdfOutView" style="display:none"></div>
-          <textarea class="mono" id="anon" style="display:none" readonly
-                    data-i18n-ph="anon_ph" placeholder="Il testo anonimizzato apparirà qui."></textarea>
-          <div class="row">
-            <button class="btn" id="copy">📋 <span data-i18n="copy">Copia per ChatGPT</span></button>
-            <button class="ghost" id="dlpdf">📄 <span data-i18n="dlpdf">Scarica PDF anonimizzato</span></button>
-            <button class="ghost" id="dl">⬇️ <span data-i18n="dl">Scarica dizionario</span></button>
-            <span class="hint" id="ulock"></span>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- dizionario: staccato, a tutta larghezza sotto le due colonne, scrollabile -->
-    <div class="card dict" id="dictCard" style="display:none">
-      <div class="hd">
-        <h2 data-i18n="dict_title">Dizionario reversibile</h2>
-        <div class="right hint" id="dictHint" data-i18n="dict_hint">resta solo qui, in locale</div>
-      </div>
-      <div class="bd">
-        <div class="meta" id="meta"></div>
-        <div class="legend" id="legend"></div>
-        <div class="callout" id="dictNone" style="display:none;margin:0 16px 14px">
-          <span class="ic">🔒</span><div data-i18n="dict_off">Nessun dizionario: l'anonimizzazione di questo testo è <b>definitiva</b>.</div>
-        </div>
-        <div class="tablewrap" id="tablewrap">
-          <table><thead><tr><th data-i18n="th_id">ID</th><th data-i18n="th_val">Valore originale</th><th data-i18n="th_type">Tipo</th></tr></thead>
-          <tbody id="maprows"></tbody></table>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- ============ PANE 2: RIPRISTINA ============ -->
-  <div class="pane" id="pane2">
-    <div class="callout" id="rOff" style="display:none">
-      <span class="ic">🔒</span>
-      <div data-i18n="r_off">Lo switch <b>Dizionario reversibile</b> è su DISATTIVO: le nuove
-      anonimizzazioni non producono chiavi. Qui puoi comunque ripristinare con un dizionario
-      <b>.json salvato in precedenza</b>.</div>
-    </div>
-    <div class="callout">
-      <span class="ic">💡</span>
-      <div data-i18n="callout">Incolla qui la <b>risposta dell'LLM</b> (che contiene i placeholder come
-      <span class="kbd">[FULLNAME_1]</span>): l'app rimette i valori veri usando il dizionario
-      di questa sessione. Se hai chiuso e riaperto l'app, <b>carica il dizionario .json</b> che
-      avevi salvato.</div>
-    </div>
-    <div class="grid">
-      <div class="card">
-        <div class="hd"><h2 data-i18n="r_title1">Risposta con i placeholder</h2>
-          <div class="right">
-            <label class="chip" style="cursor:pointer"><span data-i18n="loaddict">📁 Carica dizionario</span>
-              <input type="file" id="dictFile" accept="application/json" hidden></label>
-          </div></div>
-        <div class="bd">
-          <textarea id="rin" data-i18n-ph="rin_ph" placeholder="Incolla qui la risposta di ChatGPT…"></textarea>
-          <div class="row">
-            <button class="btn lg" id="rev">🔓 <span data-i18n="rev">Ripristina valori</span></button>
-            <button class="ghost" id="rclear" data-i18n="clear">Pulisci</button>
-            <span class="hint" id="dictInfo"></span>
-          </div>
-        </div>
-      </div>
-      <div class="card">
-        <div class="hd"><h2 data-i18n="r_title2">Testo ripristinato</h2></div>
-        <div class="bd">
-          <div class="view"><div class="preview" id="rout">
-            <div class="empty"><img src="/assets/mascot_doc.png" alt="" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'big',textContent:'🔓'}))">
-            <div data-i18n="empty_rout">Il testo con i valori reali apparirà qui.</div></div>
-          </div></div>
-          <div class="row"><button class="btn" id="rcopy">📋 <span data-i18n="rcopy">Copia testo ripristinato</span></button></div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="credits">Realizzato da <b>Simone Rizzo</b> · sponsorizzato da <b>Rizzo AI Academy</b> · <span class="u">www.rizzoaiacademy.com</span></div>
-</div>
-
-<div id="toast"></div>
-
-<!-- config modal -->
-<div class="cfg-overlay" id="cfgOverlay">
-  <div class="cfg-card">
-    <h3>⚙️ <span data-i18n="cfg_title">Configurazione server</span></h3>
-    <div class="cfg-row">
-      <label data-i18n="cfg_host">Indirizzo</label>
-      <input id="cfgHost" type="text" value="127.0.0.1" spellcheck="false">
-    </div>
-    <div class="cfg-row">
-      <label data-i18n="cfg_port">Porta</label>
-      <input id="cfgPort" type="number" min="1024" max="65535" value="5005">
-    </div>
-    <div class="cfg-status" id="cfgStatus"></div>
-    <div class="cfg-btns">
-      <button class="btn" id="cfgSave" onclick="saveConfig()">💾 <span data-i18n="cfg_save">Salva</span></button>
-      <button class="ghost" id="cfgCheck" onclick="checkPort()"><span data-i18n="cfg_check">Verifica porta</span></button>
-      <button class="ghost" onclick="closeConfig()" data-i18n="cfg_cancel">Annulla</button>
-    </div>
-    <div class="cfg-note" data-i18n="cfg_restart_note">Le modifiche avranno effetto al prossimo avvio.</div>
-  </div>
-</div>
-
-<!-- tags modal: legenda + selezione dei tag da anonimizzare -->
-<div class="cfg-overlay" id="tagsOverlay">
-  <div class="cfg-card wide">
-    <h3>🏷️ <span data-i18n="tg_title">Tag da anonimizzare</span></h3>
-    <div class="tg-sub" data-i18n="tg_sub">Deseleziona i tipi che vuoi <b>lasciare in chiaro</b>: verranno comunque rilevati, ma non sostituiti da un placeholder.</div>
-    <div class="tg-bar">
-      <button class="mini" onclick="setAllTags(true)" data-i18n="tg_all">Seleziona tutti</button>
-      <button class="mini" onclick="setAllTags(false)" data-i18n="tg_none">Nessuno</button>
-      <span class="count" id="tgCount"></span>
-    </div>
-    <div class="tg-list" id="tgList"></div>
-    <div class="cfg-status" id="tgStatus"></div>
-    <div class="cfg-btns" style="margin-top:14px">
-      <button class="btn" onclick="saveTags()">💾 <span data-i18n="cfg_save">Salva</span></button>
-      <button class="ghost" onclick="closeTags()" data-i18n="cfg_cancel">Annulla</button>
-    </div>
-    <div class="cfg-note" id="tgNote"></div>
-  </div>
-</div>
-
-<script>
-const $ = id => document.getElementById(id);
-let DATA = null;            // ultimo risultato analyze
-let MAP = {};              // {placeholder -> valore} sessione corrente
-const off = new Set();     // label nascoste nella preview
-let L = 'it';              // lingua UI corrente
-let TAGS = [];             // legenda dei tag servita da /settings
-let EXCL = new Set();      // tag da NON anonimizzare (scelta corrente)
-let TAGS_LOADED = false;   // /settings ha risposto -> possiamo mandare gli override
-let MAPPING = true;        // dizionario reversibile on/off (switch nella card di input)
-let SRC_DOC = null;        // PDF caricato, renderizzato dal server (colonna sinistra)
-let OUT_DOC = null;        // PDF anonimizzato (colonna destra), generato pigramente
-let VIEW = 'prev';         // vista attiva a destra: prev | text | pdf
-
-/* ---- i18n (IT default, EN opzionale) ---- */
-const T = {
- it:{
-  tagline:"modello locale su CPU · GDPR compliant", badge:"100% in locale",
-  notice:"<b>Versione in sviluppo.</b> Il modello AI non è perfetto e può commettere errori: verifica sempre il risultato prima di usarlo. Queste sono le prime versioni e il progetto è completamente <b>open source</b>. Se ti è utile, <b>lascia una ⭐ alla repo</b> e contribuisci a migliorarlo: <a href=\"https://github.com/Rizzo-AI-Academy/rizzo-pii\" target=\"_blank\" rel=\"noopener\">apri la repo su GitHub ↗</a>",
-  tab1:"Anonimizza", tab2:"Ripristina la risposta",
-  in_title:"① Il tuo documento", in_hint:"incolla testo o trascina un PDF / .md",
-  src_ph:"Incolla qui il testo dell'atto, del contratto o della sentenza…\n\nOppure trascina un PDF o un file .md nell'area qui sotto.",
-  drop:"Trascina un <b>PDF</b> o un <b>.md</b> qui, oppure <b>scegli un file</b>",
-  go:"Anonimizza", clear:"Pulisci",
-  out_title:"② Risultato", v_prev:"Anteprima", v_text:"Testo da copiare",
-  v_pdf:"Anteprima PDF", v_raw:"Testo", v_opdf:"PDF censurato",
-  t_prev_loading:"Renderizzo il PDF…", t_prev_err:"Anteprima del PDF non disponibile",
-  t_pdf_render:"Genero il PDF anonimizzato…",
-  empty_prev:"L'anteprima con le PII evidenziate apparirà qui.",
-  anon_ph:"Il testo anonimizzato apparirà qui.",
-  copy:"Copia per ChatGPT", dl:"Scarica dizionario", dlpdf:"Scarica PDF anonimizzato",
-  t_pdf_making:"Genero il PDF…", t_pdf_ok:"PDF anonimizzato scaricato",
-  t_pdf_err:"Errore nella creazione del PDF",
-  t_pdf_warn:(r,s)=>"PDF scaricato · ATTENZIONE: "+(r+s)+" valori sono rimasti in chiaro"
-    +" ("+r+" non redatti, "+s+" troppo corti per essere cercati): controlla il file"
-    +" prima di condividerlo",
-  dict_title:"Dizionario reversibile", dict_hint:"resta solo qui, in locale",
-  th_id:"ID", th_val:"Valore originale", th_type:"Tipo",
-  callout:"Incolla qui la <b>risposta dell'LLM</b> (che contiene i placeholder come <span class=\"kbd\">[FULLNAME_1]</span>): l'app rimette i valori veri usando il dizionario di questa sessione. Se hai chiuso e riaperto l'app, <b>carica il dizionario .json</b> che avevi salvato.",
-  r_title1:"Risposta con i placeholder", loaddict:"📁 Carica dizionario",
-  rin_ph:"Incolla qui la risposta di ChatGPT…",
-  rev:"Ripristina valori", r_title2:"Testo ripristinato",
-  empty_rout:"Il testo con i valori reali apparirà qui.", rcopy:"Copia testo ripristinato",
-  st_ent:"entità", st_uniq:"valori unici", st_model:"dal modello",
-  st_regex:"da regex/checksum", st_chars:"caratteri", analyzing:"Analizzo…",
-  t_need_input:"Inserisci del testo o un PDF", t_error:"Errore",
-  t_copied:"Testo anonimizzato copiato", t_need_anon:"Prima anonimizza un testo",
-  t_nothing_dl:"Niente da scaricare", t_dl_ok:"Dizionario scaricato",
-  t_paste_restore:"Incolla la risposta da ripristinare",
-  t_no_dict:"Nessun dizionario: caricane uno .json", t_restored:"Valori ripristinati",
-  t_nothing_copy:"Niente da copiare", t_restored_copied:"Testo ripristinato copiato",
-  t_dict_loaded:"Dizionario caricato", t_json_invalid:"JSON non valido",
-  t_drag_pdf:"Formato non supportato: usa PDF, .md o .txt",
-  pii_found:(n,u)=>n+" PII trovate · "+u+" valori unici",
-  dict_n:n=>n+" ID nel dizionario",
-  dict_loaded_n:n=>"dizionario caricato · "+n+" ID",
-  dict_session:n=>"dizionario sessione · "+n+" ID",
-  chars:n=>n.toLocaleString('it'),
-  cfg_title:"Configurazione server", cfg_host:"Indirizzo", cfg_port:"Porta",
-  cfg_check:"Verifica porta", cfg_save:"Salva", cfg_cancel:"Annulla",
-  cfg_available:"Porta disponibile ✓", cfg_in_use:"Porta occupata ✗",
-  cfg_saved:"Configurazione salvata (riavvia per applicare)",
-  cfg_restart_note:"Le modifiche avranno effetto al prossimo avvio.",
-  tg_title:"Tag da anonimizzare",
-  tg_sub:"Deseleziona i tipi che vuoi <b>lasciare in chiaro</b>: verranno comunque rilevati, ma non sostituiti da un placeholder.",
-  tg_all:"Seleziona tutti", tg_none:"Nessuno",
-  tg_saved:"Selezione salvata", tg_err:"Salvataggio non riuscito",
-  tg_note:p=>"Salvato in "+p+" · vale anche per l'API /analyze.",
-  tg_env:"⚠️ La variabile d'ambiente PII_EXCLUDE_TAGS ha la precedenza al prossimo avvio.",
-  tg_count:(on,tot)=>on+" di "+tot+" tag anonimizzati",
-  st_excl:"tag esclusi",
-  map_ttl:"Dizionario reversibile", map_on:"ATTIVO", map_off:"DISATTIVO",
-  map_sub_on:"Ogni PII riceve un ID: potrai ripristinare i valori veri dalla risposta dell'LLM.",
-  map_sub_off:"Anonimizzazione <b>definitiva</b>: nessuna chiave placeholder → valore viene creata, salvata o scaricabile. Il ripristino non sarà possibile.",
-  t_map_on:"Dizionario reversibile attivo", t_map_off:"Dizionario disattivato: anonimizzazione definitiva",
-  dict_off:"Nessun dizionario: l'anonimizzazione di questo testo è <b>definitiva</b>.",
-  dict_off_hint:"lo switch è su DISATTIVO",
-  r_off:"Lo switch <b>Dizionario reversibile</b> è su DISATTIVO: le nuove anonimizzazioni non producono chiavi. Qui puoi comunque ripristinare con un dizionario <b>.json salvato in precedenza</b>.",
- },
- en:{
-  tagline:"local model on CPU · GDPR compliant", badge:"100% local",
-  notice:"<b>Work in progress.</b> The AI model isn't perfect and can make mistakes: always double-check the result before relying on it. These are the very first versions and the project is fully <b>open source</b>. If you find it useful, <b>leave a ⭐ on the repo</b> and help improve it: <a href=\"https://github.com/Rizzo-AI-Academy/rizzo-pii\" target=\"_blank\" rel=\"noopener\">open the repo on GitHub ↗</a>",
-  tab1:"Anonymize", tab2:"Restore the answer",
-  in_title:"① Your document", in_hint:"paste text or drop a PDF / .md",
-  src_ph:"Paste here the text of the deed, contract or judgment…\n\nOr drop a PDF or a .md file onto the area below.",
-  drop:"Drop a <b>PDF</b> or a <b>.md</b> here, or <b>choose a file</b>",
-  go:"Anonymize", clear:"Clear",
-  out_title:"② Result", v_prev:"Preview", v_text:"Text to copy",
-  v_pdf:"PDF preview", v_raw:"Text", v_opdf:"Redacted PDF",
-  t_prev_loading:"Rendering the PDF…", t_prev_err:"PDF preview not available",
-  t_pdf_render:"Building the anonymized PDF…",
-  empty_prev:"The preview with highlighted PII will appear here.",
-  anon_ph:"The anonymized text will appear here.",
-  copy:"Copy for ChatGPT", dl:"Download dictionary", dlpdf:"Download anonymized PDF",
-  t_pdf_making:"Building the PDF…", t_pdf_ok:"Anonymized PDF downloaded",
-  t_pdf_err:"Error while creating the PDF",
-  t_pdf_warn:(r,s)=>"PDF downloaded · WARNING: "+(r+s)+" values were left in clear"
-    +" ("+r+" not redacted, "+s+" too short to be searched safely): check the file"
-    +" before sharing it",
-  dict_title:"Reversible dictionary", dict_hint:"stays here only, locally",
-  th_id:"ID", th_val:"Original value", th_type:"Type",
-  callout:"Paste here the <b>LLM's answer</b> (containing placeholders like <span class=\"kbd\">[FULLNAME_1]</span>): the app puts the real values back using this session's dictionary. If you closed and reopened the app, <b>load the .json dictionary</b> you saved.",
-  r_title1:"Answer with placeholders", loaddict:"📁 Load dictionary",
-  rin_ph:"Paste ChatGPT's answer here…",
-  rev:"Restore values", r_title2:"Restored text",
-  empty_rout:"The text with the real values will appear here.", rcopy:"Copy restored text",
-  st_ent:"entities", st_uniq:"unique values", st_model:"from the model",
-  st_regex:"from regex/checksum", st_chars:"characters", analyzing:"Analyzing…",
-  t_need_input:"Enter some text or a PDF", t_error:"Error",
-  t_copied:"Anonymized text copied", t_need_anon:"Anonymize a text first",
-  t_nothing_dl:"Nothing to download", t_dl_ok:"Dictionary downloaded",
-  t_paste_restore:"Paste the answer to restore",
-  t_no_dict:"No dictionary: load a .json one", t_restored:"Values restored",
-  t_nothing_copy:"Nothing to copy", t_restored_copied:"Restored text copied",
-  t_dict_loaded:"Dictionary loaded", t_json_invalid:"Invalid JSON",
-  t_drag_pdf:"Unsupported format: use PDF, .md or .txt",
-  pii_found:(n,u)=>n+" PII found · "+u+" unique values",
-  dict_n:n=>n+" IDs in the dictionary",
-  dict_loaded_n:n=>"dictionary loaded · "+n+" IDs",
-  dict_session:n=>"session dictionary · "+n+" IDs",
-  chars:n=>n.toLocaleString('en'),
-  cfg_title:"Server configuration", cfg_host:"Host", cfg_port:"Port",
-  cfg_check:"Check port", cfg_save:"Save", cfg_cancel:"Cancel",
-  cfg_available:"Port available ✓", cfg_in_use:"Port in use ✗",
-  cfg_saved:"Config saved (restart to apply)",
-  cfg_restart_note:"Changes take effect on next startup.",
-  tg_title:"Tags to anonymize",
-  tg_sub:"Untick the types you want to <b>leave in clear text</b>: they are still detected, but not replaced by a placeholder.",
-  tg_all:"Select all", tg_none:"None",
-  tg_saved:"Selection saved", tg_err:"Could not save",
-  tg_note:p=>"Saved to "+p+" · also applies to the /analyze API.",
-  tg_env:"⚠️ The PII_EXCLUDE_TAGS environment variable takes precedence on next startup.",
-  tg_count:(on,tot)=>on+" of "+tot+" tags anonymized",
-  st_excl:"excluded tags",
-  map_ttl:"Reversible dictionary", map_on:"ON", map_off:"OFF",
-  map_sub_on:"Every PII gets an ID: you will be able to restore the real values from the LLM's answer.",
-  map_sub_off:"<b>Irreversible</b> anonymization: no placeholder → value key is created, stored or downloadable. Restoring will not be possible.",
-  t_map_on:"Reversible dictionary on", t_map_off:"Dictionary off: anonymization is irreversible",
-  dict_off:"No dictionary: anonymization of this text is <b>irreversible</b>.",
-  dict_off_hint:"the switch is OFF",
-  r_off:"The <b>Reversible dictionary</b> switch is OFF: new anonymizations produce no keys. You can still restore here using a <b>.json dictionary saved earlier</b>.",
- }
-};
-const tt=k=>T[L][k];
-
-function routEmpty(){
-  return '<div class="empty"><img src="/assets/mascot_doc.png" alt="" onerror="this.replaceWith(Object.assign(document.createElement(\'div\'),{className:\'big\',textContent:\'🔓\'}))"><div>'+tt('empty_rout')+'</div></div>';
-}
-
-function applyLang(l){
-  L=(l==='en')?'en':'it';
-  localStorage.setItem('pii_lang',L);
-  document.documentElement.lang=L;$('lang').value=L;
-  document.querySelectorAll('[data-i18n]').forEach(el=>{
-    const v=T[L][el.getAttribute('data-i18n')]; if(v!=null) el.innerHTML=v;});
-  document.querySelectorAll('[data-i18n-ph]').forEach(el=>{
-    const v=T[L][el.getAttribute('data-i18n-ph')]; if(v!=null) el.placeholder=v;});
-  if(!$('pdf').files.length) $('dropTxt').innerHTML=tt('drop');   // dropzone: solo se nessun file
-  if(!$('rout')._raw) $('rout').innerHTML=routEmpty();
-  renderMapping();
-  if(TAGS.length && $('tagsOverlay').classList.contains('open')) renderTags();
-  if(DATA) render();
-}
-
-/* ---- scroll sincronizzato editor (sx) <-> anteprima/testo (dx) ---- */
-let syncing=false;
-function matchScroll(target,from){
-  const rf=from.scrollHeight-from.clientHeight, rt=target.scrollHeight-target.clientHeight;
-  target.scrollTop = rf>0 ? (from.scrollTop/rf)*rt : 0;
-}
-function linkScroll(a,b){
-  a.addEventListener('scroll',()=>{
-    if(syncing)return; syncing=true; matchScroll(b,a);
-    setTimeout(()=>syncing=false,0);});   // reset robusto (rAF puo' non scattare in bg)
-}
-
-/* ---- colore deterministico per tipo di tag ---- */
-function hue(s){let h=0;for(const c of s)h=(h*31+c.charCodeAt(0))%360;return h;}
-function colors(label){const h=hue(label);
-  return {bg:`hsl(${h} 56% 96%)`,bd:`hsl(${h} 42% 81%)`,tx:`hsl(${h} 40% 38%)`};}
-
-function toast(msg,ok=true,ms=1800){const t=$('toast');t.textContent=msg;t.className='show'+(ok?' ok':'');
-  clearTimeout(t._t);t._t=setTimeout(()=>t.className='',ms);}
-
-/* ---- render di un PDF a video ----------------------------------------------
-   Le pagine arrivano gia' renderizzate dal server (/doc/<id>/page/<n>.png):
-   niente viewer PDF del browser (dentro Tauri non c'e' garanzia che ci sia) e
-   niente libreria JS esterna (l'app e' offline, nessuna CDN raggiungibile).
-   `loading=lazy` -> un PDF di 200 pagine non scarica 200 immagini all'apertura. */
-function renderPages(el,doc){
-  el.innerHTML='';
-  for(let i=0;i<doc.n_pages;i++){
-    const pg=document.createElement('div');pg.className='pg';
-    const im=document.createElement('img');
-    im.loading='lazy';im.alt=(i+1)+' / '+doc.n_pages;   // alt = pagina: se il render manca si vede quale
-    im.src=`/doc/${doc.doc_id}/page/${i}.png`;
-    pg.appendChild(im);
-    const n=document.createElement('span');n.className='pgn';
-    n.textContent=(i+1)+' / '+doc.n_pages;pg.appendChild(n);
-    el.appendChild(pg);
-  }
-  el.scrollTop=0;
-}
-function busy(el,msg){
-  el.innerHTML='<div class="pdfbusy"><span class="spin"></span>'+msg+'</div>';}
-
-/* ---- tabs ---- */
-function showTab(n){
-  $('tab1').classList.toggle('on',n===1);$('tab2').classList.toggle('on',n===2);
-  $('pane1').classList.toggle('on',n===1);$('pane2').classList.toggle('on',n===2);
-}
-
-/* ---- documento caricato: anteprima renderizzata (sx) ----------------------
-   Appena si sceglie un PDF lo si manda a /preview: il server lo tiene in memoria,
-   ne ritorna il testo estratto e le pagine da renderizzare. Da li' in poi la
-   colonna sinistra ha due viste, "Anteprima PDF" (default) e "Testo".
-   Per .md/.txt non c'e' niente da renderizzare: resta la sola textarea. */
-function setSrcView(v){
-  const p=(v==='pdf'&&SRC_DOC);
-  $('sPdf').classList.toggle('on',!!p);$('sText').classList.toggle('on',!p);
-  $('pdfSrcView').style.display=p?'':'none';
-  $('src').style.display=p?'none':'';
-}
-
-async function onFile(f){
-  $('dropTxt').innerHTML='📎 <b>'+escapeHtml(f.name)+'</b>';
-  SRC_DOC=null;$('srcTabs').style.display='none';$('inHint').style.display='';
-  setSrcView('text');
-  if(!(f.type==='application/pdf'||/\.pdf$/i.test(f.name)))return;
-  $('inHint').textContent=tt('t_prev_loading');
-  busy($('pdfSrcView'),tt('t_prev_loading'));
-  $('srcTabs').style.display='';$('pdfSrcView').style.display='';$('src').style.display='none';
-  $('sPdf').classList.add('on');$('sText').classList.remove('on');
-  try{
-    const fd=new FormData();fd.append('pdf',f);
-    const r=await fetch('/preview',{method:'POST',body:fd});
-    const d=await r.json();
-    if(!r.ok)throw new Error(d.error||'');
-    SRC_DOC=d;$('src').value=d.text||'';
-    renderPages($('pdfSrcView'),d);
-    $('inHint').style.display='none';
-  }catch(e){
-    SRC_DOC=null;$('srcTabs').style.display='none';setSrcView('text');
-    $('inHint').innerHTML=tt('in_hint');$('inHint').style.display='';
-    toast(tt('t_prev_err'),false);          // il file resta valido: l'analisi funziona lo stesso
-  }
-}
-
-/* ---- analyze ---- */
-async function run(){
-  const file=$('pdf').files[0];const text=$('src').value.trim();
-  if(!file&&!text){toast(tt('t_need_input'),false);return;}
-  $('go').disabled=true;const old=$('go').innerHTML;
-  $('go').innerHTML='<span class="spin"></span> '+tt('analyzing');
-  try{
-    let resp;
-    // override della UI. Se /settings non ha risposto non mandiamo nulla: comanda il server.
-    const excl=TAGS_LOADED?[...EXCL]:null;
-    if(file){const fd=new FormData();fd.append('pdf',file);
-      if(excl){fd.append('exclude_tags',excl.join(','));fd.append('include_mapping',MAPPING?'1':'0');}
-      resp=await fetch('/analyze',{method:'POST',body:fd});}
-    else{const body={text};if(excl){body.exclude_tags=excl;body.include_mapping=MAPPING;}
-      resp=await fetch('/analyze',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify(body)});}
-    const d=await resp.json();
-    if(!resp.ok){toast(d.error||tt('t_error'),false);return;}
-    if(d.source_text&&file)$('src').value=d.source_text;
-    DATA=d;off.clear();
-    // senza dizionario non tocchiamo MAP ne' il localStorage: nessuna chiave nuova nasce
-    if(d.mapping_enabled!==false){MAP=d.mapping;localStorage.setItem('pii_map',JSON.stringify(MAP));}
-    render();
-    toast(T[L].pii_found(d.n_entities,d.n_unique));
-  }catch(e){toast(tt('t_error')+': '+e.message,false);}
-  finally{$('go').disabled=false;$('go').innerHTML=old;}
-}
-
-function render(){
-  const d=DATA;
-  OUT_DOC=null;$('pdfOutView').innerHTML='';  // risultato nuovo -> il PDF censurato va rifatto
-  $('dictCard').style.display='';            // mostra la card dizionario (sotto le due colonne)
-  document.querySelector('.app').classList.add('has-result');  // -> scroll pagina, niente schiacciamento
-  // preview evidenziata
-  const prev=$('prev');prev.innerHTML='';prev.style.display='';$('emptyPrev').style.display='none';
-  for(const s of d.segments){
-    if(s.label){
-      const c=colors(s.label);const sp=document.createElement('span');
-      sp.className='ph'+(off.has(s.label)?' dim':'');
-      sp.style.background=c.bg;sp.style.borderColor=c.bd;sp.style.color=c.tx;
-      // senza dizionario il server non manda il valore originale: niente da mostrare al passaggio
-      sp.title=(s.t?s.t+'\n':'')+`(${s.src}${s.validated?' · checksum ✓':''})`;
-      sp.innerHTML=s.ph.replace(/[\[\]]/g,'')+(s.validated?'<span class="ck">✓</span>':'');
-      prev.appendChild(sp);
-    }else prev.appendChild(document.createTextNode(s.t));
-  }
-  // testo da copiare
-  $('anon').value=d.anonymized_text;
-  // meta
-  $('meta').innerHTML=
-    `<span class="stat"><b>${d.n_entities}</b> ${tt('st_ent')}</span>`+
-    `<span class="stat"><b>${d.n_unique}</b> ${tt('st_uniq')}</span>`+
-    `<span class="stat"><b>${(d.by_source.modello||0)}</b> ${tt('st_model')}</span>`+
-    `<span class="stat"><b>${(d.by_source.regex||0)}</b> ${tt('st_regex')}</span>`+
-    `<span class="stat"><b>${T[L].chars(d.n_chars)}</b> ${tt('st_chars')}</span>`+
-    ((d.excluded_tags&&d.excluded_tags.length)
-      ? `<span class="stat" title="${d.excluded_tags.join(', ')}"><b>${d.excluded_tags.length}</b> ${tt('st_excl')}</span>` : '');
-  // legenda cliccabile (toggle highlight)
-  const lg=$('legend');lg.innerHTML='';
-  for(const [k,v] of Object.entries(d.by_label)){
-    const c=colors(k);const el=document.createElement('span');
-    el.className='chip'+(off.has(k)?' off':'');
-    el.innerHTML=`<span class="sw" style="background:${c.bd}"></span>${k}<span class="n">${v}</span>`;
-    el.onclick=()=>{off.has(k)?off.delete(k):off.add(k);render();};
-    lg.appendChild(el);
-  }
-  // dizionario (assente quando lo switch e' su DISATTIVO)
-  const hasMap=d.mapping_enabled!==false;
-  const rows=$('maprows');rows.innerHTML='';
-  const keys=hasMap?Object.keys(d.mapping):[];
-  $('tablewrap').style.display=keys.length?'':'none';
-  $('dictNone').style.display=hasMap?'none':'';
-  $('dictHint').innerHTML=hasMap?tt('dict_hint'):tt('dict_off_hint');
-  $('dl').style.display=hasMap?'':'none';
-  for(const ph of keys){const lab=ph.slice(1,ph.lastIndexOf('_'));const c=colors(lab);
-    const tr=document.createElement('tr');
-    tr.innerHTML=`<td class="k" style="color:${c.tx}">${ph}</td>`+
-      `<td class="v">${escapeHtml(d.mapping[ph])}</td>`+
-      `<td><span class="chip" style="cursor:default"><span class="sw" style="background:${c.bd}"></span>${lab}</span></td>`;
-    rows.appendChild(tr);}
-  $('ulock').textContent=keys.length?T[L].dict_n(keys.length):'';
-  if(VIEW==='pdf')setView('pdf');            // stavo guardando il PDF: lo rigenero
-}
-
-function escapeHtml(s){return s.replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));}
-
-/* ---- view toggle (dx): anteprima con i tag | testo da copiare | PDF censurato ---- */
-async function setView(v){
-  if(v==='pdf'&&!DATA&&!$('pdf').files.length&&!$('src').value.trim()){
-    toast(tt('t_need_anon'),false);return;}
-  VIEW=v;
-  $('vPrev').classList.toggle('on',v==='prev');
-  $('vText').classList.toggle('on',v==='text');
-  $('vPdf').classList.toggle('on',v==='pdf');
-  $('viewPrev').style.display=v==='prev'?'':'none';
-  $('anon').style.display=v==='text'?'':'none';
-  $('pdfOutView').style.display=v==='pdf'?'':'none';
-  if(v!=='pdf'){
-    matchScroll(v==='prev'?$('viewPrev'):$('anon'),$('src'));  // allinea la vista appena mostrata
-    return;
-  }
-  if(OUT_DOC){renderPages($('pdfOutView'),OUT_DOC);return;}
-  busy($('pdfOutView'),tt('t_pdf_render'));
-  const d=await buildOutPdf();
-  if(VIEW!=='pdf')return;                    // l'utente ha cambiato vista nel frattempo
-  if(!d){setView('prev');return;}
-  renderPages($('pdfOutView'),d);
-  if(d.residual+d.skipped>0)toast(T[L].t_pdf_warn(d.residual,d.skipped),false,9000);
-}
-
-/* Genera UNA volta il PDF anonimizzato e lo lascia sul server: la stessa copia
-   serve sia l'anteprima a destra sia il download (una sola inferenza).
-   Come /pdf, il dizionario non viene inviato: il server lo ricostruisce e lo
-   butta, quindi funziona anche con lo switch "dizionario" su DISATTIVO. */
-let PDF_JOB=null;
-function buildOutPdf(){
-  if(OUT_DOC)return Promise.resolve(OUT_DOC);
-  if(PDF_JOB)return PDF_JOB;                 // click su tab + download insieme -> una richiesta sola
-  const file=$('pdf').files[0];const text=$('src').value.trim();
-  if(!DATA&&!file&&!text){toast(tt('t_need_anon'),false);return Promise.resolve(null);}
-  const excl=TAGS_LOADED?[...EXCL]:null;
-  PDF_JOB=(async()=>{
-    try{
-      let resp;
-      if(file){const fd=new FormData();fd.append('pdf',file);
-        if(excl)fd.append('exclude_tags',excl.join(','));
-          resp=await fetch('/pdf/preview',{method:'POST',body:fd});}
-      else{const body={text};if(excl)body.exclude_tags=excl;
-          resp=await fetch('/pdf/preview',{method:'POST',headers:{'Content-Type':'application/json'},
-          body:JSON.stringify(body)});}
-      const d=await resp.json();
-      if(!resp.ok){toast(d.error||tt('t_pdf_err'),false);return null;}
-      OUT_DOC=d;return d;
-    }catch(e){toast(tt('t_pdf_err')+': '+e.message,false);return null;}
-    finally{PDF_JOB=null;}
-  })();
-  return PDF_JOB;
-}
-
-/* ---- copy / download ---- */
-$('copy').onclick=()=>{if(!DATA){toast(tt('t_need_anon'),false);return;}
-  navigator.clipboard.writeText(DATA.anonymized_text).then(()=>toast(tt('t_copied')));};
-$('dl').onclick=()=>{if(!DATA||!Object.keys(MAP).length){toast(tt('t_nothing_dl'),false);return;}
-  const blob=new Blob([JSON.stringify(MAP,null,2)],{type:'application/json'});
-  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
-  a.download='dizionario_anonimizzazione.json';a.click();URL.revokeObjectURL(a.href);
-  toast(tt('t_dl_ok'));};
-
-/* ---- PDF anonimizzato (issue #7): redazione vera del PDF caricato, oppure PDF
-       ricostruito dal testo anonimizzato quando l'input non era un PDF.
-       Se lo si e' gia' guardato nella vista "PDF censurato" il file esiste gia'
-       sul server: si scarica quello, senza una seconda anonimizzazione. ---- */
-$('dlpdf').onclick=async()=>{
-  const btn=$('dlpdf');btn.disabled=true;const old=btn.innerHTML;
-  btn.innerHTML='<span class="spin"></span> '+tt('t_pdf_making');
-  try{
-    const d=await buildOutPdf();
-    if(!d)return;
-    const a=document.createElement('a');
-    a.href='/doc/'+d.doc_id+'/file.pdf';
-    a.download=d.filename||'documento_anonimizzato.pdf';a.click();
-    // residui = valori ancora leggibili nell'output; saltati = valori troppo corti
-    // per essere cercati senza devastare il documento. Entrambi restano IN CHIARO.
-    if(d.residual+d.skipped>0)toast(T[L].t_pdf_warn(d.residual,d.skipped),false,9000);
-    else toast(tt('t_pdf_ok'));
-  }finally{btn.disabled=false;btn.innerHTML=old;}
-};
-
-/* ---- reverse ---- */
-function reverse(){
-  const txt=$('rin').value;
-  if(!txt.trim()){toast(tt('t_paste_restore'),false);return;}
-  const keys=Object.keys(MAP);
-  if(!keys.length){toast(tt('t_no_dict'),false);return;}
-  // Una sola passata sul testo ORIGINALE, non N replace() sequenziali su un
-  // `out` che si accumula: se il valore sostituito per una chiave contenesse
-  // per caso il nome di una chiave successiva (es. una ragione sociale con
-  // dentro "CF_2"), il replace seguente lo ri-sostituiva -- un falso positivo
-  // di secondo ordine che nessuna delle due chiavi, prese da sole, produce.
-  // Il lookup avviene ricostruendo il nome dal testo appena matchato, quindi
-  // l'ordine delle chiavi nella mappa e' ora irrilevante (non serve piu'
-  // ordinare per lunghezza: parentesi TUTTO-O-NIENTE e confine di parola
-  // bastano a evitare che FULLNAME_1 matchi dentro FULLNAME_10, si veda sotto).
-  const byInner=new Map(keys.map(ph=>[ph.slice(1,-1),MAP[ph]]));
-  const alts=keys.map(ph=>{
-    const inner=ph.slice(1,-1);                 // FULLNAME_1
-    const esc=inner.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
-    // tollerante: parentesi o forma nuda, spazi, eventuale grassetto markdown.
-    // Gli spazi si consumano SOLO insieme alla parentesi: con '\[?\s*' un placeholder
-    // scritto senza parentesi si portava via anche gli spazi intorno, e "Il FULLNAME_1 ha"
-    // tornava "IlMario Rossiha". Con un tab o un a-capo spariva la colonna o la riga.
-    // E le parentesi sono TUTTO-O-NIENTE, con un confine di parola sulla forma nuda:
-    // se ognuna e' opzionale per conto suo, con CF_1 in mappa un indice inventato dal
-    // modello ([CF_12]) matcha per meta' e il ripristino scrive un codice fiscale
-    // SBAGLIATO - un segnaposto rimasto si vede, un valore sbagliato no.
-    // Il confine e' Unicode-aware (specchia _is_word() lato Python, che tratta le
-    // lettere accentate come interne alla parola): \b di JS e' ASCII-only, quindi
-    // su "CF_1e' gia'" non vedeva un confine e il valore tornava incollato alla
-    // lettera accentata -- lo stesso difetto che questa funzione deve evitare,
-    // riaperto in modo asimmetrico solo per le parole italiane.
-    return '\\[\\s*'+esc+'\\s*\\]|(?<![\\p{L}\\p{N}_])'+esc+'(?![\\p{L}\\p{N}_])';
-  }).join('|');
-  // Gli asterischi di grassetto markdown si assorbono in coppie SIMMETRICHE
-  // (stesso numero prima e dopo, fino a 2, col backreference \1): una sequenza
-  // di asterischi condivisa fra due placeholder adiacenti si divide cosi' in
-  // modo deterministico, invece di dipendere da quale chiave viene elaborata
-  // prima (con N pattern separati, un lato mangiava tutta la sequenza e
-  // lasciava l'altro placeholder non risolto o incollato al primo valore).
-  const rx=new RegExp('(\\*{0,2})(?:'+alts+')\\1','gu');
-  const out=txt.replace(rx,(m)=>{
-    const core=m.replace(/^\*+|\*+$/g,'');
-    const br=core.match(/^\[\s*([\s\S]*?)\s*\]$/);
-    const val=byInner.get(br?br[1]:core);
-    return val===undefined?m:val;               // per costruzione sempre trovato
-  });
-  const o=$('rout');o.textContent=out;o._raw=out;
-  toast(tt('t_restored'));
-}
-$('rev').onclick=reverse;
-$('rcopy').onclick=()=>{const o=$('rout');if(!o._raw){toast(tt('t_nothing_copy'),false);return;}
-  navigator.clipboard.writeText(o._raw).then(()=>toast(tt('t_restored_copied')));};
-$('rclear').onclick=()=>{$('rin').value='';$('rout').innerHTML=routEmpty();$('rout')._raw='';};
-
-/* ---- carica dizionario da file (per sessioni diverse) ---- */
-$('dictFile').onchange=e=>{const f=e.target.files[0];if(!f)return;
-  const r=new FileReader();r.onload=()=>{try{
-    const parsed=JSON.parse(r.result);
-    const dictKeys=parsed&&typeof parsed==='object'&&!Array.isArray(parsed)?Object.keys(parsed):[];
-    // Un file dizionario corrotto/troncato con una chiave vuota o non testuale
-    // degenera il pattern di reverse() in un match quasi universale e corrompe
-    // l'intero documento al ripristino, non solo un placeholder.
-    const valid=dictKeys.length>0&&dictKeys.every(k=>/^\[.+\]$/.test(k)&&typeof parsed[k]==='string');
-    if(!valid){toast(tt('t_json_invalid'),false);return;}
-    MAP=parsed;
-    $('dictInfo').textContent=T[L].dict_loaded_n(dictKeys.length);
-    toast(tt('t_dict_loaded'));}catch{toast(tt('t_json_invalid'),false);}};
-  r.readAsText(f);};
-
-/* ---- input helpers ---- */
-$('go').onclick=run;
-$('clear').onclick=()=>{$('src').value='';$('pdf').value='';$('dropTxt').innerHTML=tt('drop');
-  DATA=null;$('prev').style.display='none';$('emptyPrev').style.display='';
-  $('anon').value='';$('meta').innerHTML='';$('legend').innerHTML='';
-  $('dictCard').style.display='none';$('ulock').textContent='';
-  // la card era solo nascosta: senza queste tre righe il dizionario resta in MAP e su
-  // disco, e al riavvio ricompare zitto al posto di quello del documento nuovo
-  MAP={};localStorage.removeItem('pii_map');$('dictInfo').textContent='';
-  SRC_DOC=null;OUT_DOC=null;$('pdfSrcView').innerHTML='';$('pdfOutView').innerHTML='';
-  $('srcTabs').style.display='none';$('inHint').innerHTML=tt('in_hint');
-  $('inHint').style.display='';setSrcView('text');setView('prev');
-  document.querySelector('.app').classList.remove('has-result');};
-$('src').addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key==='Enter')run();});
-
-/* pdf picker + dropzone */
-const drop=$('drop');
-$('pdf').onchange=e=>{const f=e.target.files[0];if(f)onFile(f);};
-['dragenter','dragover'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('hot');}));
-['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('hot');}));
-const OK_EXT=/\.(pdf|md|markdown|txt|text)$/i;
-drop.addEventListener('drop',e=>{const f=e.dataTransfer.files[0];
-  if(f&&(f.type==='application/pdf'||OK_EXT.test(f.name))){
-    const dt=new DataTransfer();dt.items.add(f);$('pdf').files=dt.files;
-    onFile(f);}else toast(tt('t_drag_pdf'),false);});
-
-/* scroll sincronizzato: editor (sx) <-> anteprima e testo (dx) */
-linkScroll($('src'),$('viewPrev'));linkScroll($('viewPrev'),$('src'));
-linkScroll($('src'),$('anon'));linkScroll($('anon'),$('src'));
-/* e le due viste PDF fra loro: stesso documento, prima e dopo la censura */
-linkScroll($('pdfSrcView'),$('pdfOutView'));linkScroll($('pdfOutView'),$('pdfSrcView'));
-
-/* lingua: selettore + applicazione iniziale (default IT, preferenza salvata) */
-$('lang').onchange=e=>applyLang(e.target.value);
-applyLang(localStorage.getItem('pii_lang')||'it');
-
-/* avviso: popup a click (non hover), si chiude cliccando fuori o con Esc */
-$('infoBtn').addEventListener('click',e=>{e.stopPropagation();$('infoBtn').classList.toggle('open');});
-$('infoBtn').addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();$('infoBtn').classList.toggle('open');}});
-document.addEventListener('click',e=>{if(!$('infoBtn').contains(e.target))$('infoBtn').classList.remove('open');});
-document.addEventListener('keydown',e=>{if(e.key==='Escape'){$('infoBtn').classList.remove('open');closeConfig();closeTags();}});
-
-/* ---- config modal ---- */
-async function openConfig(){
-  const r=await fetch('/config');const d=await r.json();
-  $('cfgHost').value=d.host||'127.0.0.1';
-  $('cfgPort').value=d.port||5005;
-  $('cfgStatus').className='cfg-status';$('cfgStatus').textContent='';
-  $('cfgOverlay').classList.add('open');
-}
-function closeConfig(){$('cfgOverlay').classList.remove('open');}
-$('cfgOverlay').addEventListener('click',e=>{if(e.target===$('cfgOverlay'))closeConfig();});
-async function checkPort(){
-  const h=$('cfgHost').value.trim(),p=parseInt($('cfgPort').value);
-  if(!p||p<1024||p>65535){$('cfgStatus').className='cfg-status fail';$('cfgStatus').textContent=tt('cfg_in_use');return;}
-  const r=await fetch(`/port-check?host=${encodeURIComponent(h)}&port=${p}`);
-  const d=await r.json();
-  $('cfgStatus').className=d.available?'cfg-status ok':'cfg-status fail';
-  $('cfgStatus').textContent=d.available?tt('cfg_available'):tt('cfg_in_use');
-}
-async function saveConfig(){
-  const h=$('cfgHost').value.trim(),p=parseInt($('cfgPort').value);
-  if(!p||p<1024||p>65535){toast(tt('cfg_in_use'),false);return;}
-  await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({host:h,port:p})});
-  toast(tt('cfg_saved'));
-  closeConfig();
-}
-
-/* ---- switch "Dizionario reversibile" ---- */
-function renderMapping(){
-  const on=MAPPING;
-  $('mapToggle').classList.toggle('off',!on);
-  $('mapToggle').setAttribute('aria-checked',String(on));
-  $('mapSw').classList.toggle('off',!on);
-  $('mapState').textContent=on?tt('map_on'):tt('map_off');
-  $('mapSub').innerHTML=on?tt('map_sub_on'):tt('map_sub_off');
-  $('rOff').style.display=on?'none':'';
-  $('dl').style.display=on?'':'none';      // niente dizionario -> niente download
-}
-async function toggleMapping(){
-  MAPPING=!MAPPING;
-  renderMapping();
-  toast(MAPPING?tt('t_map_on'):tt('t_map_off'),MAPPING);
-  try{                                 // persiste: vale anche per l'API /analyze
-    await fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({mapping_enabled:MAPPING})});
-  }catch(e){}
-}
-
-/* ---- tags modal: legenda + selezione dei tag da anonimizzare ---- */
-let TAGS_META={};
-async function loadTags(){
-  try{
-    const d=await (await fetch('/settings')).json();
-    TAGS=d.tags||[];EXCL=new Set(d.excluded_tags||[]);TAGS_META=d;TAGS_LOADED=true;
-    MAPPING=d.mapping_enabled!==false;renderMapping();
-  }catch(e){/* server vecchio o offline: si continua con il comportamento di default */}
-}
-function renderTags(){
-  const list=$('tgList');list.innerHTML='';
-  for(const t of TAGS){
-    const c=colors(t.tag),on=!EXCL.has(t.tag);
-    const row=document.createElement('label');
-    row.className='tg-row'+(on?'':' off');
-    row.innerHTML=`<input type="checkbox" ${on?'checked':''}>`+
-      `<span class="sw" style="background:${c.bd}"></span>`+
-      `<span class="txt"><span class="nm" style="color:${c.tx}">${t.tag}</span>`+
-      `<div class="ds">${escapeHtml(L==='en'?t.en:t.it)}</div>`+
-      `<div class="ex">${escapeHtml(t.example||'')}</div></span>`;
-    row.querySelector('input').onchange=e=>{
-      e.target.checked?EXCL.delete(t.tag):EXCL.add(t.tag);
-      row.classList.toggle('off',!e.target.checked);tgCount();};
-    list.appendChild(row);
-  }
-  tgCount();
-}
-function tgCount(){$('tgCount').textContent=T[L].tg_count(TAGS.length-EXCL.size,TAGS.length);}
-function setAllTags(on){
-  EXCL=on?new Set():new Set(TAGS.map(t=>t.tag));
-  renderTags();
-}
-async function openTags(){
-  if(!TAGS.length)await loadTags();
-  if(!TAGS.length){toast(tt('t_error'),false);return;}
-  $('tgStatus').className='cfg-status';$('tgStatus').textContent='';
-  $('tgNote').innerHTML=(TAGS_META.env_override?'<b>'+tt('tg_env')+'</b><br>':'')+
-    T[L].tg_note(TAGS_META.config_path||'');
-  renderTags();
-  $('tagsOverlay').classList.add('open');
-}
-function closeTags(){$('tagsOverlay').classList.remove('open');loadTags();}  // ricarica: annulla = scarta
-$('tagsOverlay').addEventListener('click',e=>{if(e.target===$('tagsOverlay'))closeTags();});
-async function saveTags(){
-  try{
-    const r=await fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({excluded_tags:[...EXCL]})});
-    const d=await r.json();
-    if(!r.ok)throw new Error(d.error||'');
-    EXCL=new Set(d.excluded_tags||[]);
-    toast(tt('tg_saved'));
-    $('tagsOverlay').classList.remove('open');
-  }catch(e){$('tgStatus').className='cfg-status fail';$('tgStatus').textContent=tt('tg_err');}
-}
-loadTags();
-
-/* recupera dizionario da sessione precedente (dopo applyLang -> testo nella lingua giusta) */
-try{const m=localStorage.getItem('pii_map');if(m){MAP=JSON.parse(m);
-  if(Object.keys(MAP).length)$('dictInfo').textContent=T[L].dict_session(Object.keys(MAP).length);}}catch{}
-</script>
-</body>
-</html>
-"""
 
 if __name__ == "__main__":
     import argparse as _ap

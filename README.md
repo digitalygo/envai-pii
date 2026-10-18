@@ -1,797 +1,274 @@
-<div align="center">
+# envai-pii
 
-<img src="report/images/mascot_shield.png" alt="rizzo-pii mascot — a purple hedgehog guarding a document with a shield" width="180" />
+`envai-pii` is the [digitalygo fork](https://github.com/digitalygo/envai-pii) of [`rizzo-pii`](https://github.com/Rizzo-AI-Academy/rizzo-pii), the Italian legal PII anonymizer created upstream by Simone Rizzo and Rizzo AI Academy. This fork keeps training, the HTTP API service with its PDF workflows, and guardrail API v1. It removes desktop packaging and release targets, and the service no longer ships a browser UI. Supported deployments are Python from source and the container built from `Dockerfile`.
 
-# rizzo-pii
+The upstream [rizzo-pii:0.3B model](https://huggingface.co/rizzoaiacademy/rizzo-pii-0.3B) uses the multilingual [mmBERT-base backbone](https://huggingface.co/jhu-clsp/mmBERT-base). It predicts 22 categories; the application adds two regex-only categories. See the [tag taxonomy](docs/TASSONOMIA_TAG.md) for the complete list and mapping decisions.
 
-### Local, reversible PII anonymization for Italian legal text
+## Fork scope
 
-**_Use frontier models without giving up your data._**
+This fork maintains multilingual training, data preparation, evaluation, inspection, the HTTP API service, reversible dictionary, tag filters, PDF preview and export, guardrail API v1, tests, and the upstream technical report. The browser UI has been removed; the service is API-only. The Tauri shell, native launcher, PyInstaller targets, build scripts, installers, and desktop release workflows are no longer maintained or built. The upstream model and community dataset retain their Rizzo AI Academy names and attribution.
 
-<p>
-<img src="https://img.shields.io/badge/100%25-LOCAL-7c3aed?style=for-the-badge" alt="100% local" />
-<img src="https://img.shields.io/badge/GDPR-BY%20DESIGN-7c3aed?style=for-the-badge" alt="GDPR by design" />
-<img src="https://img.shields.io/badge/EU%20AI%20ACT-ALIGNED-7c3aed?style=for-the-badge" alt="EU AI Act aligned" />
-</p>
+## Run the app
 
-<p>
-<img src="https://img.shields.io/badge/params-%E2%89%880.3B-blue" alt="0.3B parameters" />
-<img src="https://img.shields.io/badge/RAM-~0.5%20GB%20·%20CPU-blue" alt="0.5 GB RAM CPU" />
-<img src="https://img.shields.io/badge/PII%20categories-22-blue" alt="22 PII categories" />
-<img src="https://img.shields.io/badge/micro--F1-0.989-brightgreen" alt="0.989 micro-F1" />
-<img src="https://img.shields.io/badge/offline-no%20API%20key-brightgreen" alt="offline, no API key" />
-</p>
+### Run in a container
 
-**📄 [Read the full technical report (PDF)](report/rizzo-pii-report.pdf)** — model, dataset, method and experiments in detail
-
-<p>
-<a href="https://github.com/Rizzo-AI-Academy/rizzo-pii/releases/latest"><img src="https://img.shields.io/badge/⬇%20Download%20for-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white" alt="Download for Windows" /></a>
-<a href="https://github.com/Rizzo-AI-Academy/rizzo-pii/releases/latest"><img src="https://img.shields.io/badge/⬇%20Download%20for-macOS-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS" /></a>
-<a href="https://github.com/Rizzo-AI-Academy/rizzo-pii/releases/latest"><img src="https://img.shields.io/badge/⬇%20Download%20for-Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Download for Linux" /></a>
-</p>
-
-<sub>🪟 **Windows installer** · 🍎 **macOS** (Apple Silicon) · 🐧 **Linux AppImage** — all available now</sub>
-
-</div>
-
-**`rizzo-pii:0.3B`** is a lightweight, CPU-friendly, **Italian-first** token-classification
-model (≈0.3B parameters, [mmBERT](https://huggingface.co/jhu-clsp/mmBERT-base) / ModernBERT
-backbone) that detects **22 categories of personal data** — including the Italian-legal
-identifiers (**codice fiscale**, **partita IVA**, **dati catastali**) that no other open model
-covers — and drives a fully **reversible** anonymization workflow:
-
-<div align="center">
-
-🔒 **anonymize locally** → 🏷️ **placeholder + reversible local dictionary** → ☁️ **frontier LLM** → 🔓 **restore locally**
-
-</div>
-
-It is built for law firms, accountants, notaries and anyone bound by the **GDPR** who wants to
-keep using ChatGPT / Claude / Gemini on sensitive documents **without ever sending the real data
-out**.
-
-<table>
-<tr>
-<td width="120" align="center" valign="middle">
-<img src="report/images/mascot_doc.png" alt="rizzo-pii redacting a document" width="110" />
-</td>
-<td valign="middle">
-
-| ≈0.3B | ~0.5 GB | 22 | 0.989 |
-|:---:|:---:|:---:|:---:|
-| parameters (mmBERT-base) | RAM footprint, CPU | PII categories | micro-F1 (real IT validation) |
-
-The hedgehog mascot does one job: it grabs your document, blacks out every identifier, and
-**stays inside the EU** while doing it.
-
-</td>
-</tr>
-</table>
-
----
-
-## The problem: convenience is leaking your data
-
-People summarize contracts, draft replies and ask legal questions simply by **pasting the
-document in**. It is fast and useful — and it quietly moves enormous amounts of personal and
-confidential data off the user's device. Names, addresses, tax codes, IBANs, health details,
-unsigned-contract clauses: all of it crosses the network to servers the user does not control,
-where it may be logged, cached, retained or exposed in a breach. For a law firm or a hospital this
-is not hypothetical; under the GDPR it can be a direct compliance failure.
-
-The intuitive fix is to **stop sending data out** and run an open model locally — but a
-frontier-grade open model is large and expensive to serve (€9,000–€10,000 of hardware), and the
-small models that fit a normal laptop are **not** in the same league on the hard tasks (legal
-reasoning, dense contracts, long official documents) — exactly where Italian professionals need
-the most help.
-
-**The trade-off we actually want:** keep the frontier model and *remove the data from the
-equation*. Anonymize the document **locally** on a CPU, send only placeholders to the cloud, and
-restore the real values **locally** from the answer. The sensitive content never leaves the
-machine.
-
----
-
-## rizzo-pii in one picture
-
-The workflow has three local steps and one remote step. Locally, rizzo-pii tags every span of
-personal data and replaces each one with a stable, type-aware placeholder
-(`[FULLNAME_1]`, `[IBAN_1]`, `[CF_1]`), recording the mapping `placeholder → real value` in a
-dictionary that **stays on disk**. Identical values share the same placeholder, so the frontier
-model still sees a coherent text and can reason about it. The anonymized text is sent to
-ChatGPT / Claude / Gemini; when the answer comes back, a local pass swaps the placeholders for the
-true values. **The cloud provider never receives a single real name, code or number.**
-
-<div align="center">
-<img src="report/images/schema_explainable.png" alt="The rizzo-pii workflow: everything runs locally on CPU; only placeholder text crosses to the cloud, and the answer is re-identified locally" width="780" />
-</div>
-
-Everything except the frontier query happens on the user's CPU; only placeholder text crosses the
-boundary, and the answer is re-identified locally.
-
----
-
-## Why this is different: privacy that is actually private
-
-This is not "yet another PII detector". It is an **architecture for using powerful models without
-surrendering data**, built so the privacy guarantee is structural rather than a promise:
-
-- **The data never leaves the device.** Detection and re-identification run locally on a CPU.
-  No API key, no telemetry, no upload. What the cloud receives is already stripped of identifiers.
-- **GDPR by design.** The workflow implements **data minimization** (Art. 5) almost literally:
-  the third-party processor only ever sees pseudonymized text, so the most common reason a cloud
-  LLM call is unlawful (transferring identifiable data to a third party without a basis) is removed
-  at the source.
-- **Aligned with the EU AI Act.** Keeping personal data under local control and out of
-  third-party model pipelines supports the Act's emphasis on data governance.
-- **Accessible to everyone.** The model is ≈0.3B parameters and runs on a CPU in well under 1 GB
-  of RAM — the privacy layer costs nothing extra in hardware. A normal laptop is enough.
-- **Reversible, not destructive.** Classic redaction throws information away. rizzo-pii
-  **pseudonymizes**: the answer from the frontier model is reconstructed with the real values, so
-  the tool is useful in real work, not just compliance theater.
-
-### How it compares
-
-| Property | **rizzo-pii:0.3B** | OpenAI Privacy Filter | MS Presidio |
-|---|---|---|---|
-| Type | Dense encoder (mmBERT / ModernBERT) | Sparse MoE encoder | NER + rules pipeline |
-| Parameters | ≈0.3B dense (all active) | 1.5B total / ≈50M active | spaCy model + rules |
-| Memory to load | 0.5–1.2 GB | 1.5B params resident | Varies (spaCy) |
-| Runs on | CPU, under 1 GB RAM | On-device | CPU |
-| Categories | **22 (incl. IT-legal)** | 8 generic | Configurable; EN defaults |
-| Italian CF / PIVA / catasto | **Yes** | No | Not by default |
-| Primary language | Italian (+7 more) | English | English |
-| Checksum validation | **Yes** (IBAN/CF/PIVA/card) | No | Some recognizers |
-| Reversible mapping | **Yes** (local dict) | Masking | Anonymization |
-
-The differentiators are **Italian-legal coverage**, a **smaller memory footprint**, and a
-**checksum-backed safety net** (mod-97 for IBAN, Luhn for cards, the official CF/PIVA algorithms)
-that the larger generic models do not provide.
-
-> **Concrete example.** Take *"Il Sig. Mario Rossi, C.F. RSSMRA85H12F205Y, P.IVA 12345678903, è
-> titolare dell'immobile al Foglio 12, particella 345, sub. 6."* rizzo-pii tags `FULLNAME`, `CF`,
-> `PIVA` and `CATASTO` and rewrites it as *"Il Sig. [FULLNAME_1], C.F. [CF_1], P.IVA [PIVA_1], è
-> titolare dell'immobile al [CATASTO_1]."* A generic English-first model has no label for the
-> fiscal code, the VAT number or the cadastral reference — the three most sensitive identifiers in
-> the sentence — and would leave them in the clear.
-
----
-
-## The taxonomy: 22 tags, and why
-
-rizzo-pii predicts 22 entity types in **BIO** format (a `B-`/`I-` label per tag, plus `O`). The
-raw datasets are left untouched; the mapping to these 22 tags is applied **at load time** through a
-single `TAG_MAP` in `train_pii.py`, so the taxonomy can be changed in one place without
-re-annotating anything. Details in **[docs/TASSONOMIA_TAG.md](docs/TASSONOMIA_TAG.md)**.
-
-| Tag | Meaning | Example | Source |
-|---|---|---|---|
-| `FULLNAME` | Person name (incl. legal roles: judge, lawyer, parties, witness) | Mario Rossi | real+synth |
-| `AGE` | Age | 45 anni | real |
-| `GENDER` | Sex / gender | Femmina | real |
-| `DATE` | Calendar date | 12/06/1985 | real+synth |
-| `TIME` | Time of day | ore 15:30 | real |
-| `STREET` | Street / square | Via Garibaldi | real+synth |
-| `BUILDINGNUM` | Street number | 24 | real+synth |
-| `ZIPCODE` | Postal code (CAP) | 00185 | real+synth |
-| `CITY` | City | Milano | real+synth |
-| `PROVINCE` | Province abbreviation | MI | synth |
-| `EMAIL` | E-mail (incl. PEC) | m.rossi@studio.it | real+synth |
-| `TELEPHONENUM` | Phone number | +39 333 1234567 | real+synth |
-| `CF` | Codice fiscale (personal tax code) | RSSMRA85H12F205Y | synth |
-| `PIVA` | Partita IVA (VAT number) | 12345678903 | real+synth |
-| `ID_DOC` | ID / passport / licence / social number | CA12345AB | real+synth |
-| `IBAN` | IBAN / bank account | IT60X05428… | synth |
-| `CREDITCARDNUMBER` | Credit-card number | 4111 1111 1111 1111 | real |
-| `AMOUNT` | Money amount | € 12.500,00 | synth |
-| `TARGA` | Vehicle plate | AB 123 CD | synth |
-| `ORG` | Private company / firm / bank | Edilnord S.r.l. | synth |
-| `DOCID` | Act identifier (RG, protocol, repertory, ruling) | 1234/2024 | synth |
-| `CATASTO` | Cadastral data (sheet, parcel, sub.) | Foglio 12, part. 345 | synth |
-
-**Two design decisions stand out.** First, **legal roles collapse into `FULLNAME`** — whether
-"Mario Rossi" is the judge, the lawyer or a witness is not a property of the string; the role, if
-needed, is recovered downstream as metadata. Second, **raw types that mean the same thing are
-merged**: names + surnames → `FULLNAME`; `PEC` → `EMAIL`; `TAXNUM` → `PIVA`; ID card / passport /
-licence / social number → `ID_DOC`; account number → `IBAN`. Honorifics (`Dott.`, `Avv.`) and the
-name of the **court** itself are dropped to `O` because they are not identifiers to mask.
-
-The five Italian-legal tags (`CF`, `PIVA`, `CATASTO`, `DOCID`, `PROVINCE`) are the reason
-rizzo-pii exists: they do not appear as labeled data in any public corpus, so they are created
-through synthesis with mathematically valid checksums.
-
-The app adds a 23rd tag, **`URL`**, handled by the regex net alone — the model is not trained on it.
-It matches `http(s)://…`, `www.…` and bare domains on a closed TLD list; the closed list is what
-keeps Italian legalese (`p.iva`, `n.ro`, `S.r.l.`) from being read as a domain, at the price of
-letting an exotic TLD through.
-
----
-
-## Dataset & training
-
-The model is fine-tuned on a **multilingual** pool of ≈**745k** labeled rows (Italian reinforced to
-~45%) assembled from four sources — real (Ai4Privacy, DeepMount) and synthetic — all remapped to the
-22 tags at load time. The synthetic part follows the **"LLM author, code labeler"** principle: an
-LLM writes only Italian legal prose with placeholders (`{SLOT}`) and our code injects the real
-values (CF/PIVA/IBAN with valid checksums), so BIO labels are exact, identifiers are valid by
-construction, and **no real personal data is ever produced by the LLM**. The backbone is
-**mmBERT-base** (ModernBERT architecture, native 8192-token context) and training runs in a single
-epoch on one 16 GB consumer GPU.
-
-> 📄 **The full dataset composition, the synthesis method, the training recipe and the
-> experiments are described in the [technical report](report/rizzo-pii-report.pdf).** See also
-> [docs/DATASET.md](docs/DATASET.md) and [CLAUDE.md](CLAUDE.md) for the operational details.
-
----
-
-## Results
-
-Training was a single epoch (~26.6k steps over 744,912 rows). The loss fell from ≈6.2 to below 0.1
-within the first few hundred steps, then settled into a clean, monotone, low regime; the validation
-loss decreased monotonically and was **still falling** when the epoch ended. Final training loss
-≈**0.003** and validation loss ≈**0.006** are both very low and very close, so the model is **not
-over-fitting** — a second epoch would very likely push it lower still.
-
-<div align="center">
-<img src="report/images/v12_training_loss_zoom.png" alt="Training loss (smoothed zoom): drops sharply then stays low and stable" width="46%" />
-<img src="report/images/v12_valid_loss.png" alt="Validation loss: decreases monotonically across the epoch, still falling at the end" width="46%" />
-</div>
-<p align="center"><sub><b>Left:</b> training loss (smoothed zoom) — fast drop, then low and stable. <b>Right:</b> validation loss — monotone, still decreasing when training stopped.</sub></p>
-
-On the 7,000-row held-out **real Italian** benchmark (`validation_real.jsonl`):
-
-| 0.987 | 0.990 | 0.989 | 0.998 |
-|:---:|:---:|:---:|:---:|
-| micro precision | micro recall | micro F1 | token accuracy |
-
-The unweighted per-tag mean (macro-F1) across all 22 tags is **0.987**, and **every one of the five
-Italian-legal identifiers scores a perfect 1.000**.
-
-### Per-tag precision / recall / F1 (v1.2.0)
-
-| Tag | Sup. | P | R | F1 | | Tag | Sup. | P | R | F1 |
-|---|---:|---:|---:|---:|---|---|---:|---:|---:|---:|
-| FULLNAME | 4390 | .989 | .990 | .990 | | GENDER | 472 | 1.00 | 1.00 | 1.00 |
-| CATASTO | 1200 | 1.00 | 1.00 | 1.00 | | PROVINCE | 400 | 1.00 | 1.00 | 1.00 |
-| CITY | 953 | .961 | .963 | .962 | | DOCID | 400 | 1.00 | 1.00 | 1.00 |
-| DATE | 922 | 1.00 | 1.00 | 1.00 | | CF | 400 | 1.00 | 1.00 | 1.00 |
-| TELEPHONENUM | 874 | 1.00 | 1.00 | 1.00 | | AGE | 385 | .979 | .977 | .978 |
-| ID_DOC | 800 | 1.00 | 1.00 | 1.00 | | ZIPCODE | 299 | .938 | .967 | .952 |
-| EMAIL | 748 | .999 | .999 | .999 | | IBAN | 278 | .996 | .996 | .996 |
-| TIME | 637 | .991 | .992 | .991 | | CREDITCARD | 257 | .919 | .973 | .945 |
-| STREET | 617 | .951 | .969 | .960 | | AMOUNT | 146 | 1.00 | .993 | .997 |
-| BUILDINGNUM | 594 | .969 | .958 | .964 | | ORG | 145 | .967 | 1.00 | .983 |
-| PIVA | 514 | 1.00 | 1.00 | 1.00 | | TARGA | 43 | 1.00 | 1.00 | 1.00 |
-
-All five Italian-legal identifiers (`CF`, `PIVA`, `CATASTO`, `DOCID`, `PROVINCE`) score a perfect
-1.000, as do `ID_DOC`, `DATE`, `TELEPHONENUM`, `GENDER` and `TARGA`. The remaining soft spots are
-the open, high-variability classes (`ZIPCODE`, `CREDITCARDNUMBER`, `STREET`, `CITY`) and `ORG`,
-which is exactly where a larger, better-balanced dataset would help.
-
----
-
-## Deployment: it runs on a normal computer
-
-The released checkpoint is ~1.2 GB on disk in fp32 and runs comfortably on a **CPU**: quantized, its
-memory footprint is on the order of **0.5 GB**, with **no GPU required**. That is the whole point —
-the privacy layer is cheap enough to run on the laptop the user already owns.
-
-In production the neural model is **never used alone**. It is paired with a deterministic **regex +
-checksum** network for the structured identifiers (EMAIL, phone, IBAN, CF, PIVA, credit card,
-amount, plate), where IBAN/PIVA/card must pass their **checksum** (mod-97 / Luhn) to be accepted,
-and a valid checksum **overrides** the model. This eliminates the classic failure mode of a neural
-tagger fragmenting a long code, and gives mathematically certain detection for exactly the
-identifiers whose leakage is most damaging. The app adds the reversible layer (stable placeholders,
-downloadable local dictionary, a "restore" tab tolerant to markdown/format drift), chunking with
-overlap for long PDFs, and a colored per-tag UI.
-
-| To use the model (inference) | To retrain the model |
-|---|---|
-| Any 64-bit CPU (no GPU) | A single 16 GB GPU is enough |
-| 0.5–1.2 GB RAM for the model | Reference run: RTX 5060 Ti, ~2 h |
-| Windows (installer) / Linux / macOS | PyTorch `cu128` for Blackwell |
-| Fully offline; no API key | ~745k rows, regenerable from scripts |
-
-The desktop app **Rizzo PII** (Tauri) launches the Python/Flask backend as a bundled CPU
-"sidecar"; a CPU-only PyTorch build keeps it fully **offline** on Windows (WebView2), macOS and Linux.
-Packaging instructions in **[docs/BUILD.md](docs/BUILD.md)**.
-
-> **⬇️ Download.** Grab the ready-to-use build from the
-> **[Releases page](https://github.com/Rizzo-AI-Academy/rizzo-pii/releases/latest)** — no Python or
-> setup required: a **Windows installer** (double-click), a **macOS `.dmg`** (Apple Silicon /
-> arm64 — **signed & notarized** by Apple, just open it), and a **Linux AppImage** (`chmod +x` then
-> run) are all available now.
-
----
-
-## Inference quickstart
-
-Just want to **anonymize documents**? You do not need the dataset, the training scripts or a GPU —
-only the model. Three ways, all of them fully local. (Regenerating the data and retraining is a
-different flow: **[Quickstart](#quickstart)**, further down.)
-
-### Run with Docker
-
-Nothing to install but Docker; the image carries the CPU dependencies and the model.
+Podman is preferred when available; Docker uses equivalent commands. The CPU-only image includes the Flask app and downloads upstream model revision v1.5.0 during the image build.
 
 ```bash
-git clone https://github.com/Rizzo-AI-Academy/rizzo-pii
-cd rizzo-pii
-
-docker build -t rizzo-pii .                          # ~10 min, 2.65 GB image
-docker run -d --name rizzo-pii \
-  -p 127.0.0.1:5005:5005 rizzo-pii                   # -> http://127.0.0.1:5005
-
-docker logs -f rizzo-pii                             # startup / gunicorn logs
-docker rm -f rizzo-pii                               # stop and remove
+git clone https://github.com/digitalygo/envai-pii
+cd envai-pii
+podman build -t envai-pii .
+podman run -d --name envai-pii -p 127.0.0.1:5005:5005 envai-pii
+podman logs -f envai-pii
+podman rm -f envai-pii
 ```
 
-The image is **self-contained**: the CPU-only PyTorch stack and the model
-([`rizzoaiacademy/rizzo-pii-0.3B`](https://huggingface.co/rizzoaiacademy/rizzo-pii-0.3B)) are baked
-in at build time, so `docker build` needs the network but `docker run` never does —
-`HF_HUB_OFFLINE=1` makes sure of it. Same deal as the desktop app: the documents never leave the
-machine. Inside the container the server is `gunicorn` with **1 worker** (the model is loaded once,
-~1.2 GB) and 4 threads; `/health` answers 503 until the model is ready, which is what the
-`HEALTHCHECK` polls — the first request is served when `docker ps` says `healthy`.
+Replace `podman` with `docker` when using Docker. Bind the published port to loopback as shown: the service listens on `0.0.0.0` inside the container, so publishing `5005:5005` can expose it to the LAN. The image build needs network access to download dependencies and model weights. `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` are set at runtime. The checked-in `docker-compose.yml` is a legacy service deployment and does not pass `PII_API_TOKEN`.
 
-Publish the port as `127.0.0.1:5005:5005`, not `5005:5005`, unless you actually mean to expose the
-service to your LAN — inside the container the bind is `0.0.0.0` on purpose, and the network
-boundary is Docker's job.
+### Run from source
 
-Useful knobs (all optional):
+`APP_MODEL_VERSION` in `src/app/app.py` selects the default model directory. Download revision v1.5.0 there before starting the app:
 
 ```bash
-# a different port, tags left in the clear, irreversible anonymization
-docker run -d -p 127.0.0.1:8080:8080 -e PII_PORT=8080 \
-  -e PII_EXCLUDE_TAGS=AGE,GENDER -e PII_MAPPING=0 rizzo-pii
-```
-
-> The image is **CPU-only**, which is the intended deployment (see the table above); `torch` and
-> `transformers` are pinned to the versions it was verified with. A GPU build would need the `cu128`
-> wheels and the NVIDIA container runtime. Note that `Dockerfile.linux` is a different thing: it is
-> the reproducible **build** environment for the Linux `.deb`/AppImage bundles, described in
-> [docs/BUILD.md](docs/BUILD.md).
-
-### Run the web app from source
-
-Same server, without Docker — this is what the desktop app runs internally.
-
-```bash
-git clone https://github.com/Rizzo-AI-Academy/rizzo-pii
-cd rizzo-pii
-python -m venv .venv && source .venv/bin/activate     # Windows: .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt                       # CPU torch is fine, no GPU needed
-
-# the model (~1.2 GB) into the folder the app looks for. The folder name carries the
-# version: app.py pins it in APP_MODEL_VERSION, so revision and directory must match.
+git clone https://github.com/digitalygo/envai-pii
+cd envai-pii
+python -m venv .venv
+source .venv/bin/activate                 # Windows: .venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 hf download rizzoaiacademy/rizzo-pii-0.3B --revision v1.5.0 \
   --local-dir models/rizzo-pii-0.3B-v1.5.0
-
-python src/app/app.py                                 # -> http://127.0.0.1:5005
-python src/app/app.py --port 8080 --exclude-tags AGE,GENDER --no-mapping   # same knobs as above
+python src/app/app.py
 ```
 
-### One document, from the CLI
+Both `app.py` and `serve.py` serve the same HTTP API only; there is no browser UI and no HTML page at `GET /`, and neither entry point opens a browser or native window. Use `GET /health` as the readiness probe while the model loads; unknown paths return a JSON `404`. `app.py` checks the port after loading the model; `serve.py` checks before importing `app.py`. `serve.py` logs to `%LOCALAPPDATA%\\rizzo-pii\\backend.log` on Windows or `~/rizzo-pii/backend.log` on Linux and macOS. Both use exit code 76 for a detected port conflict; `app.py` writes logs to stdout/stderr.
 
-No server at all: entities and anonymized text printed to stdout.
+`PII_MODEL_DIR` overrides the model directory. Source setup does not enable Hugging Face offline mode by default, so model downloads and other environment-level network activity are separate from local inference. Host and port precedence is CLI `--host`/`--port`, `PII_HOST`/`PII_PORT`, `config.json`, then `127.0.0.1:5005`. Legacy API preferences (excluded tags and reversible mapping) live in `prefs.json`, exposed by `GET /settings`; `PII_EXCLUDE_TAGS` sets excluded tags and `PII_MAPPING` controls reversible mapping. See the [environment notes](CLAUDE.md) and [`requirements.txt`](requirements.txt), including Blackwell GPU training constraints.
+
+### Command-line inference
 
 ```bash
 PII_MODEL_DIR=models/rizzo-pii-0.3B-v1.5.0 \
   python src/training/test_pii.py "Mi chiamo Mario Rossi, IBAN IT60X0542811101000000123456"
 ```
 
-### Call it over HTTP
+Inference runs locally after the model is available. The model and regex network can miss personal data, so review output before sharing it.
 
-Whichever way you started it, the process is a plain HTTP service — see
-**[The local HTTP API](#the-local-http-api)** below for `/analyze`, `/pdf`, `/preview` and the rest.
+## PDF support
+
+The PDF endpoints are API-only. `POST /preview` keeps an uploaded PDF in memory and returns extracted text and the page count; `GET /doc/<id>/page/<n>.png` renders one page on the server with PyMuPDF, with pages cached so a 200-page PDF does not cost 200 renders. Documents live in a small in-memory cache and are never written to disk.
+
+`POST /pdf` returns the anonymized PDF: it redacts the original document when the upload was a PDF, or lays out a new PDF from anonymized text otherwise. It reports residual and skipped values when it cannot safely redact every detected span. Scans with no extractable text need OCR first. `POST /pdf/preview` redacts once and keeps the PDF in memory so preview and download (`GET /doc/<id>/file.pdf`) reuse the same copy. Regex and checksum detectors supplement model predictions for structured values; neither guarantees complete coverage.
+
+## HTTP API
+
+The legacy routes are the service's own API surface and have no authentication of their own. Keep the service on loopback or protect it with network controls. Do not expose them directly to untrusted networks.
+
+Unknown paths and framework errors (`404`, `405`, `413`, `500`) return a generic JSON body that keeps the HTTP status and headers and contains no URL or exception detail; a `405` keeps its `Allow` header. A framework `OPTIONS` answers an empty `200`. Successful PDF and PNG responses remain binary.
+
+| Route | Purpose |
+|---|---|
+| `GET /health` | Readiness for startup checks, without inference |
+| `POST /analyze` | Analyze JSON text or PDF, Markdown, or text upload |
+| `POST /preview` | Extract text and prepare a PDF for preview |
+| `POST /pdf` | Return a redacted PDF or a newly laid out PDF for text input |
+| `POST /pdf/preview` | Redact and keep a PDF for preview and download |
+| `GET /doc/<id>/page/<n>.png` | Return a rendered page from in-memory storage |
+| `GET /doc/<id>/file.pdf` | Download a redacted PDF from in-memory storage |
+| `GET/POST /settings` | Read or update preferences; `/tags` is a historical alias |
+| `GET/POST /config` | Read or update host and port |
+| `GET /port-check` | Check whether a host and port can be bound |
+
+Legacy `/analyze` returns the request-local `mapping`. When mapping is disabled, it returns an empty `mapping` object, omits `source_text`, and omits original entity text from segments. Restore is caller-side: the service provides no restore endpoint, so store and protect the dictionary returned by `/analyze` yourself. Legacy routes and preferences do not apply to guardrail API v1.
+
+### Guardrail API v1
+
+`POST /api/v1/analyses` has two implemented request arms on one route. The JSON arm accepts one `text`, an optional `dictionary` seed, and an optional `categories` whitelist, and returns exactly one result with `input_id: "text"`. The `multipart/form-data` arm accepts up to 10 optional files (`.pdf`, `.txt`, `.text`, `.md`, `.markdown`, case-insensitive), an optional `text` form field, an optional `dictionary` form string, and an optional `categories` form string, and returns one result per file in part order (`file_1` to `file_10`) followed by `text` when a non-blank text is present, with one aggregate `dictionary_delta` of new placeholder-to-original pairs. The `files`, `text` and `dictionary` fields are individually optional in the multipart arm, but at least one file or one non-blank text is required: a text-only request with no file part is valid, and the file field name is `files`, never `files[]`. The seed and full mapping are never returned.
+
+`categories` is a request-only whitelist of canonical labels such as `["FULLNAME", "EMAIL"]` that selects which labels are anonymized on every file and on the optional text. When it is absent, `null`, `[]`, or an empty or whitespace-only string, all 24 categories are used, which is the historical default. A selected subset replaces only those labels: every other category stays in clear by explicit caller choice, so a subset is not a complete PII anonymization guarantee. The endpoint remains stateless and ignores the legacy preferences; there is no server-side category opt-out, the request can only narrow the default, and `include_tags` or `exclude_tags` are not aliases for `categories`. In a JSON body the value is an array of canonical, case-sensitive names; at most 24 raw items and duplicates are allowed and deduplicated, and any other value, a non-canonical entry, or more than 24 raw items answers 400 `invalid_request`. In `multipart/form-data` the field is one Text value containing strict JSON; omitted or blank content selects all, and malformed JSON or a `categories` part sent as a file answers 400. JSON arrays of texts or files are not accepted.
+
+The multifile arm is text-only: it does not OCR, redact pages, protect text inside images, or return PDF binaries or ZIP archives. Its fixed limits are 20 MiB for the multipart body, 5 MiB per file, 13 parts (10 files plus the three value fields `text`, `dictionary`, and `categories`), 1 MiB per value field, 24 raw `categories` items, 100000 aggregate characters, and 200 pages per PDF. A PDF, or a `%PDF-` file with an accepted text extension, is extracted with PyMuPDF on a strict bounded path; when native MuPDF privacy controls are unavailable, the PDF arm answers 503 while JSON and plain-text inputs keep working. See the [guardrail API contract](docs/GUARDRAIL_API.md) and [OpenAPI schema](docs/guardrail-openapi.yaml) for request limits, errors, concurrency, dictionary rules, and the multipart example.
+
+The server process needs a non-empty `PII_API_TOKEN`; clients send the same token in `Authorization: Bearer <token>`. An unset token returns 503; missing or incorrect client credentials return 401. Authentication, model readiness, and the per-process lock are evaluated before any body byte is read, so an unauthenticated or busy request is answered without touching the payload. The processing deadline is a server-side cooperative budget, not a hard HTTP timeout and not a client setting. It is read from the non-secret `PII_ANALYSIS_TIMEOUT_SECONDS` variable, a positive finite float in seconds, once per request; unset, blank, or invalid values fall back to the 60-second default. Use a worker or proxy timeout longer than the configured budget plus the upload and native-work margin, because increasing a client or Postman timeout alone does not extend the server budget.
+
+For a source deployment, set the token securely in the shell or secret manager before starting the server process:
 
 ```bash
-curl localhost:5005/health                      # 200 = model loaded and ready
-curl -X POST localhost:5005/analyze -H 'Content-Type: application/json' \
-     -d '{"text": "Mario Rossi, CF RSSMRA85M01H501Q"}'
+# PII_API_TOKEN must already be set securely in this shell.
+export PII_API_TOKEN
+# Non-secret analysis budget; 120 seconds is an example override.
+export PII_ANALYSIS_TIMEOUT_SECONDS=120
+python src/app/app.py
 ```
 
----
+A container does not inherit host environment variables automatically. Set the host variable securely, then pass it explicitly with `-e PII_API_TOKEN`:
+
+```bash
+podman run -d --name envai-pii \
+  -p 127.0.0.1:5005:5005 \
+  -e PII_API_TOKEN \
+  -e PII_ANALYSIS_TIMEOUT_SECONDS=120 \
+  envai-pii
+```
+
+Use `docker run` with the same `-e PII_API_TOKEN` and `-e PII_ANALYSIS_TIMEOUT_SECONDS=120` options for Docker, or the runtime's standard environment passthrough. The budget variable is non-secret and independent of the token secret. The checked-in Compose file does not pass this token; configure an override before using the endpoint through Compose. The guardrail token does not authenticate legacy routes. For access beyond loopback, place an authenticated internal proxy and TLS in front of the service, as described in the [API deployment notes](docs/GUARDRAIL_API.md#deployment).
+
+```bash
+curl -X POST http://127.0.0.1:5005/api/v1/analyses \
+  -H "Authorization: Bearer $PII_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"dictionary": {"[FULLNAME_7]": "Mario Rossi"}, "text": "Mario Rossi, scrivi a mario@example.com"}'
+```
+
+Selecting categories in a JSON request:
+
+```bash
+curl -X POST http://127.0.0.1:5005/api/v1/analyses \
+  -H "Authorization: Bearer $PII_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Mario Rossi, mario@example.com, telefono 333 1234567", "categories": ["FULLNAME", "EMAIL"]}'
+```
+
+Only `FULLNAME` and `EMAIL` are replaced; the phone number stays in clear because `TELEPHONENUM` was not selected.
+
+Multipart call with repeated files, an optional text, and a dictionary form string:
+
+```bash
+curl -X POST http://127.0.0.1:5005/api/v1/analyses \
+  -H "Authorization: Bearer $PII_API_TOKEN" \
+  -F 'files=@nota.txt;type=text/plain' \
+  -F 'files=@contratto.md;type=text/markdown' \
+  -F 'dictionary={"[FULLNAME_7]": "Mario Rossi"}' \
+  -F 'text=Referente: Mario Rossi.'
+```
+
+Text-only multipart call with no file parts (the `files` field is omitted; when files are present the field is named `files`, never `files[]`):
+
+```bash
+curl -X POST http://127.0.0.1:5005/api/v1/analyses \
+  -H "Authorization: Bearer $PII_API_TOKEN" \
+  -F 'text=Referente: Mario Rossi.'
+```
+
+Text-only multipart selection; `categories` is a value part, not a file:
+
+```bash
+curl -X POST http://127.0.0.1:5005/api/v1/analyses \
+  -H "Authorization: Bearer $PII_API_TOKEN" \
+  -F 'text=Referente: Mario Rossi.' \
+  -F 'categories=["FULLNAME", "EMAIL"]'
+```
+
+In Postman, leave the `files` row unchecked or remove it; do not add a file-type row with an empty placeholder, because that posts an empty file part and the all-or-nothing file checks fail the request. Add `categories` as a Text field whose value is a JSON array such as `["FULLNAME", "EMAIL"]`; do not send it as a File field, and do not send CSV, because `FULLNAME,EMAIL` is not valid JSON.
 
 ## Quickstart
 
-> Prerequisites and critical environment constraints (Blackwell GPU, torch **cu128**, etc.) are in
-> **[CLAUDE.md](CLAUDE.md)**. The `dataset/raw/` sources are downloaded from Hugging Face (see the
-> `hf download` commands in CLAUDE.md). All scripts force UTF-8 and resolve their paths from
-> `__file__`, so they run from any working directory.
+This workflow regenerates training data and trains a model. To use the app without training, see [Run the app](#run-the-app). Training requirements and environment constraints are in [CLAUDE.md](CLAUDE.md). Raw corpora come from Hugging Face; scripts resolve paths from `__file__` and run from any working directory.
 
-> 💡 Just want to **use** the app? You don't need any of this — download the ready-to-use build
-> (Windows / macOS / Linux) from the
-> [Releases page](https://github.com/Rizzo-AI-Academy/rizzo-pii/releases/latest), or run the web app
-> with Docker / from source: **[Inference quickstart](#inference-quickstart)**. The steps
-> below are for developers who want to regenerate the data and retrain the model.
+### Install and prepare data
 
-### 0) Install
+On Windows, use PowerShell. For RTX 50-series training, install CUDA 12.8 PyTorch first with `pip install torch --index-url https://download.pytorch.org/whl/cu128`; CPU PyTorch is sufficient for inference. DeepMount preparation requires Hugging Face authentication. Gemini-authored templates are optional.
 
 ```powershell
-git clone https://github.com/Rizzo-AI-Academy/rizzo-pii
-cd rizzo-pii
+git clone https://github.com/digitalygo/envai-pii
+cd envai-pii
 python -m venv .venv; .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt          # NVIDIA Blackwell? install torch cu128 first — see requirements.txt
-copy .env.example .env                    # optional: add W&B / Gemini keys
-```
-
-### 1) Generate the data
-
-```powershell
-python src/data_pipeline/llm_template_bank.py --per-type 5 --append          # (opt.) legal templates via Gemini
+pip install -r requirements.txt
+copy .env.example .env                    # optional: W&B and Gemini keys
+python src/data_pipeline/llm_template_bank.py --per-type 5 --append
 python src/data_pipeline/generate_synthetic_pii.py -n 200000 --out dataset/synthetic/synthetic_pii_it_200k.jsonl
-python src/data_pipeline/augment_real_pii.py     -n 40000  --out dataset/synthetic/synthetic_pii_it_realaug.jsonl
-python src/data_pipeline/prepare_deepmount.py                                 # requires HF login
-python src/data_pipeline/build_validation.py                                 # real validation (7k, it)
-python src/data_pipeline/build_subset.py                                     # 10k/5k subsets for smoke tests
+python src/data_pipeline/augment_real_pii.py -n 40000 --out dataset/synthetic/synthetic_pii_it_realaug.jsonl
+python src/data_pipeline/prepare_deepmount.py
+python src/data_pipeline/build_validation.py
+python src/data_pipeline/build_subset.py
 ```
 
-### 2) Train
+The pool combines Ai4Privacy, generated examples, augmented Ai4Privacy sentences, and DeepMount. It contains about 745,000 rows across eight languages, with Italian reinforced. The 7,000-row validation set is Italian and includes legal identifiers injected into held-out real sentences. See [dataset composition](docs/DATASET.md) and the [training guide](docs/TRAINING.md) for source, split, and preprocessing details.
+
+### Train and evaluate
 
 ```powershell
-# fast smoke test / tuning on the subset (~3 min)  -> experiments/subset_smoke/
 python src/training/train_pii.py --type subset
-
-# full run on the whole dataset  -> models/rizzo-pii-0.3B-v{VERSION}/ + experiments/full_run_v{VERSION}/
 python src/training/train_pii.py --type full
-python src/training/train_pii.py --type full --version 1.2.0   # or an explicit version
-```
-
-### 3) Use the model
-
-```powershell
+python src/training/train_pii.py --type full --version 1.2.0
 python src/training/test_pii.py "Mi chiamo Mario Rossi, IBAN IT60X0542811101000000123456"
-python src/app/app.py            # http://127.0.0.1:5005  (paste text or upload a PDF)
+python src/app/app.py --port 8080 --exclude-tags AGE,GENDER --no-mapping
 ```
 
-The web app assigns every PII a **reversible ID** (`[FULLNAME_1]`, `[IBAN_1]`…) plus a local
-dictionary, pairing the model with the regex/checksum net. You copy the anonymized text into an LLM
-and **restore** the real values from the response. Input: pasted text, a **PDF**, or a
-**`.md` / `.txt`** file.
+Full runs write models to `models/rizzo-pii-0.3B-v{VERSION}/`, artifacts to `experiments/full_run_v{VERSION}/`, and update `models/registry.json`. Generated data, models, and run artifacts are not included in the repository. The app default remains model v1.5.0; set `PII_MODEL_DIR` to use a model produced by training.
 
-### The local HTTP API
-
-The same process is a plain HTTP service, so you can use it as a sidecar in a fail-closed pipeline:
+### Run tests
 
 ```bash
-curl localhost:5005/health                      # readiness, no inference: 200 = model loaded
-curl -X POST localhost:5005/analyze -H 'Content-Type: application/json' \
-     -d '{"text": "Mario Rossi, IBAN IT60X0542811101000000123456"}'
-curl -F "file=@atto.pdf" localhost:5005/analyze  # .pdf, .md, .txt
-curl -F "file=@atto.pdf" localhost:5005/pdf -o atto_anonimizzato.pdf   # anonymized PDF back
-curl localhost:5005/settings                     # tag legend, excluded tags, dictionary state
+python -m unittest discover -v tests
 ```
 
-### Get the anonymized document back as a PDF
+GitHub Actions runs discovery on Python 3.11, 3.13, and 3.14 without installing torch or model weights. Tests that need optional Flask or PyMuPDF are skipped when unavailable. CI tests logic and contracts, not model accuracy.
 
-`POST /pdf` takes the same input as `/analyze` and returns a PDF. Upload a **PDF** and you get that
-same document back **truly redacted**: the PII is removed from the content stream (not covered with a
-black box) and replaced in place by its placeholder, so the layout survives — handy for feeding a
-whole stack of documents to an LLM at once. Paste text or upload `.md`/`.txt` and you get a
-freshly typeset PDF of the anonymized text.
+## Historical upstream results
 
-The dictionary never crosses the wire in either direction: the server rebuilds it internally to
-locate the PII and drops it when the request ends. That is why the button works unchanged with the
-reversible dictionary switched off.
-
-Two things can leave a value in clear, and both raise a warning in the UI (response headers
-`X-PII-Residual` and `X-PII-Skipped`): a value still readable in the output at the final check, and
-values too short to search safely (under 2 alphanumeric characters, or 2 bare digits like `45`).
-Metadata, XMP, annotations, form-field values and bookmark titles are scrubbed too, and embedded
-attachments are dropped. Text baked into a raster image cannot be redacted at all — if **no**
-occurrence is found anywhere in the PDF the endpoint fails with `422` rather than handing you a file
-that only looks anonymized.
-
-### See the document, not just its text
-
-Drop a PDF and the left column **renders it**, page by page, right there: two views, `Anteprima PDF`
-and `Testo`. Anonymize and the right column gains a third view next to the highlighted preview and
-the raw text — **`PDF censurato`**, the same document redacted, so you can compare the two side by
-side before downloading anything.
-
-Pages are rendered **server-side by PyMuPDF** and served as PNGs (`GET /doc/<id>/page/<n>.png`):
-no PDF viewer is assumed in the webview and no pdf.js is fetched from a CDN — the app stays offline.
-Documents live in a small in-memory LRU and **never touch disk**. `POST /pdf/preview` does the same
-work as `POST /pdf` but keeps the binary server-side and answers with `{doc_id, n_pages, residual,
-skipped}`, so previewing then downloading costs **one** anonymization, not two.
-
-### Reversible or irreversible: your call
-
-By default every PII gets a reversible ID and a **local dictionary**, so you can restore the real
-values from the LLM's answer. Some users want the opposite: anonymize and have **no restore key
-exist at all**. The switch in the input card does that — and it is not cosmetic. With the dictionary
-off the server builds no `placeholder → value` map, returns none, stores none in the browser, offers
-no download, and strips the original text out of the response entirely (the per-entity `t` field
-disappears, so the map cannot be rebuilt from the payload either). The numbering survives —
-`[FULLNAME_1]` twice still means "same person" — but a number alone leads back to nothing.
-
-```bash
-python src/app/app.py --no-mapping                  # CLI
-PII_MAPPING=0 python src/app/serve.py               # env
-curl -X POST localhost:5005/settings -H 'Content-Type: application/json' \
-     -d '{"mapping_enabled": false}'                # persisted to prefs.json
-curl -X POST localhost:5005/analyze -H 'Content-Type: application/json' \
-     -d '{"text": "…", "include_mapping": false}'   # per-request override
-```
-
-**Not every tag has to be masked.** Comparing the amounts in a contract, or keeping age and sex in a
-clinical record, needs those values in clear text. Untick them in the 🏷️ panel (they are still
-detected, just not replaced), or set it outside the UI:
-
-```bash
-python src/app/app.py --exclude-tags AMOUNT,AGE     # CLI
-PII_EXCLUDE_TAGS=AMOUNT,AGE python src/app/serve.py # env
-curl -X POST localhost:5005/settings -H 'Content-Type: application/json' \
-     -d '{"excluded_tags": ["AMOUNT"]}'             # persisted to prefs.json
-curl -X POST localhost:5005/analyze -H 'Content-Type: application/json' \
-     -d '{"text": "…", "exclude_tags": ["AMOUNT"]}' # per-request override
-```
-
----
-
-## Repository structure
-
-```
-rizzo_pii/
-├─ README.md                 this file
-├─ LICENSE                   MIT
-├─ THIRD_PARTY_LICENSES.md   what ships inside the binaries, and under which licence
-├─ CONTRIBUTING.md           how to contribute (code, docs, data)
-├─ requirements.txt          Python dependencies (see the cu128 note for Blackwell GPUs)
-├─ Dockerfile                the web app in a container (CPU deps + model baked in)
-├─ Dockerfile.linux          reproducible build env for the Linux .deb/AppImage bundles
-├─ .env.example              template for the optional W&B / Gemini keys
-├─ CLAUDE.md                 operating instructions + environment constraints (GPU, CUDA…)
-├─ report/                   the technical report (PDF + Typst source)
-├─ docs/
-│   ├─ DATASET.md            full composition of train/validation
-│   ├─ TASSONOMIA_TAG.md     the 22 final tags and the merge decisions
-│   ├─ BUILD.md              desktop app build (Tauri recommended + PyInstaller legacy)
-│   ├─ CHANGELOG.md          change log, with rationale
-│   └─ star_history_*.png    star chart shown below (regenerated by scripts/)
-├─ scripts/
-│   └─ plot_star_history.py  reads the stargazers, renders docs/star_history_*.png
-├─ src/
-│   ├─ data_pipeline/        data generation & preparation
-│   │   ├─ llm_template_bank.py       Gemini writes legal templates → legal_templates.json
-│   │   ├─ generate_synthetic_pii.py  injects checksum-valid values into the templates
-│   │   ├─ augment_real_pii.py        injects synthetic entities into real Ai4Privacy sentences
-│   │   ├─ prepare_deepmount.py       remaps DeepMount (56 types) onto our 22 tags
-│   │   ├─ build_validation.py        builds the single real validation set (it)
-│   │   └─ build_subset.py            stratified subsets for smoke tests / tuning
-│   ├─ training/
-│   │   ├─ train_pii.py               train, evaluate, save the model + metrics
-│   │   ├─ evaluate_pii.py            per-tag (P/R/F1) evaluation on validation_real
-│   │   └─ test_pii.py                CLI inference on the saved model
-│   ├─ inspect/                       read-only utilities (counts, lengths, checksums)
-│   └─ app/                           local anonymization app
-│       ├─ app.py                     Flask server: reversible anonymization + regex/checksum net
-│       ├─ pdf_export.py              anonymized-PDF download: true redaction of the uploaded PDF
-│       ├─ serve.py                   headless entry (backend of the Tauri app, no browser)
-│       ├─ desktop_app.py             legacy PyInstaller entry (opens the browser)
-│       └─ assets/                    mascot (the hedgehog) and icons
-├─ tauri/                    native desktop app (Tauri) + Windows installer — see docs/BUILD.md
-├─ dataset/                  (gitignored — regenerable from the scripts)
-├─ models/                   (gitignored) trained models, one folder per version
-└─ experiments/             (gitignored) run artifacts (logs, plots, metrics, checkpoints)
-```
-
----
+These measurements belong to upstream Rizzo AI Academy checkpoints. This fork has not rerun
+them, and CI does not measure model accuracy. The v1.2.0 checkpoint reported micro-F1 0.989 on
+the 7,000-row held-out Italian `validation_real` set. The v1.5.0 release reports micro-F1 0.9999
+on `validation_clean`, 0.9886 on `validation_real`, and 99.89% masking coverage on that neutral
+benchmark. See the [upstream v2.0.0 release notes](docs/releases/v2.0.0.md), the
+[technical report](report/rizzo-pii-report.pdf) and its [Typst source](report/rizzo-pii.typ),
+and the [upstream v1.5.0 evaluation](https://huggingface.co/rizzoaiacademy/rizzo-pii-0.3B/blob/v1.5.0/EVAL_v1.5.0_vs_main.md)
+for benchmark definitions, provenance, and per-tag results.
 
 ## Limitations
 
-Stated plainly:
+- The model and regex network can miss spans, especially in scans, unusual layouts, and short values. Review output before sharing.
+- Scanned PDFs need OCR. If the PDF endpoint finds no redaction target, it returns an error instead of a successful-looking file.
+- Training is multilingual, but the published `validation_real` benchmark is Italian-only. Five Italian legal identifiers are injected into real validation sentences because public labeled examples are unavailable.
+- Some tags are under-represented, and DeepMount includes values outside Italian usage. See the [dataset](docs/DATASET.md) and [taxonomy](docs/TASSONOMIA_TAG.md) documentation.
+- This project is not a GDPR certification or legal advice. Compliance depends on deployment and use.
 
-- **Validation is Italian-only.** Training is multilingual, but the 7,000-row benchmark measures
-  Italian only, by design. The other seven languages are trained but not certified.
-- **The IT-legal tags are validated against injected entities.** `CF`, `PIVA`, `CATASTO`, `DOCID`,
-  `PROVINCE` have no real public data, so even in validation they are generated entities placed into
-  real sentences — a good proxy, not a fully blind test.
-- **Class imbalance and under-represented categories.** The corpus is heavily skewed (`FULLNAME`
-  outnumbers `CREDITCARDNUMBER` ~97×), so the rarer tags are noisier. The clearest case is
-  organizations (`ORG`): an open, highly variable class that today comes largely from synthetic
-  templates and off-domain Faker data — exactly where a larger, balanced dataset would help most.
-- **Off-domain synthetic values.** DeepMount supplies US-style names/addresses: useful for
-  form/context, not as Italian values.
-- **Evaluation is sentence-level, not document-level.** The benchmark is built from short
-  sentences, whereas the real use case is whole documents. Measuring true end-to-end behaviour
-  (long context, PDF chunking with overlap, real act structure) needs a dedicated test set of
-  large, real Italian documents, which still has to be assembled.
-
-The mitigation that matters in practice: **always pair the model with the regex/checksum safety
-net** (`src/inspect/validate_checksums.py` is the blueprint). The two together are stronger than
-either alone.
-
----
-
-## Next step: a community-owned Italian PII dataset
-
-<img src="report/images/mascot_eu_hat.png" alt="rizzo-pii mascot wearing an EU cap, thumbs up" width="150" align="right" />
-
-rizzo-pii proves the thesis: you **can** keep using frontier models and still keep your data
-private, on ordinary hardware, with Italian-legal coverage no other open model offers. The single
-biggest lever on quality from here is **data** — a large, real, lawfully collected Italian corpus:
-both for the legal identifiers that are scarce today and, above all, to **balance the classes** and
-add genuine coverage where the model is weakest (organizations), plus a **test set of large, real
-documents** so the model can be measured end-to-end on the documents it is actually meant to
-anonymize.
-
-So the project is **open source**, and this is an open invitation. The community dataset lives on
-Hugging Face at
-**[`rizzoaiacademy/anonimizzazione-testi-italiano`](https://huggingface.co/datasets/rizzoaiacademy/anonimizzazione-testi-italiano)**
-— a public, collaborative corpus we are starting to fill. If you work with Italian documents —
-lawyers, accountants, notaries, developers, researchers — help build it: contribute templates,
-annotation, edge cases, and review. **A privacy tool for Italy is something Italy should build
-together, for the good of everyone's privacy.**
-
-### Contribute data in one shot — paste this to your coding agent
-
-The script [`src/data_pipeline/contribute_dataset.py`](src/data_pipeline/contribute_dataset.py)
-generates **genuinely new** synthetic examples — Gemini writes fresh legal prose on every run,
-the code injects valid values (CF/PIVA/IBAN checksums) and exact BIO labels — then opens a
-**Pull Request** on the dataset for a maintainer to review. You can let your coding agent
-(Claude Code, Cursor, …) do everything: get a [Gemini API key](https://aistudio.google.com/apikey)
-and a [Hugging Face token](https://huggingface.co/settings/tokens), then **copy-paste the prompt
-below** (fill in the two keys and your handle).
-
-> 🖥️ **No API key? Use your own local model.** Set `LLM_BASE_URL` (any OpenAI-compatible
-> endpoint — llama.cpp server, Ollama, vLLM, LM Studio) and `LLM_MODEL` instead of
-> `GEMINI_API_KEY`, and the templates are written **on your machine**: no key, no prompt
-> leaving the device. Fitting, for a privacy project.
+## Repository layout
 
 ```text
-Sei nel repository rizzo-pii. Voglio CONTRIBUIRE dati sintetici NUOVI al dataset Hugging Face
-"rizzoaiacademy/anonimizzazione-testi-italiano" eseguendo src/data_pipeline/contribute_dataset.py.
-
-I dati DEVONO essere generati davvero da zero: lo script usa Gemini per scrivere NUOVI template
-legali ad ogni run (non riusare dati esistenti). Prima di partire LEGGI docs/FORMATO_DATI.md per
-capire il formato esatto di ogni esempio (JSONL: source_text, tokens, bio_labels, entities, schema
-BIO, checksum CF/PIVA/IBAN obbligatori, nessuna PII reale).
-
-Fai tutto questo, in ordine:
-1. Crea/attiva un venv e installa il minimo necessario:  pip install huggingface_hub
-   (lo script per i dati NON richiede torch).
-2. Imposta le credenziali (NON committarle):
-     export GEMINI_API_KEY="<LA_MIA_CHIAVE_GEMINI>"
-     export HF_TOKEN="<IL_MIO_TOKEN_HF>"          # in alternativa: hf auth login
-3. Fai una prova locale SENZA caricare, controlla la distribuzione dei tag in output:
-     python src/data_pipeline/contribute_dataset.py --n 300 --handle <IL_MIO_HANDLE> --no-upload
-4. Genera il batch vero e APRI LA PR, rinforzando i tag più deboli (ORG e gli identificativi):
-     python src/data_pipeline/contribute_dataset.py --n 5000 --handle <IL_MIO_HANDLE> \
-       --per-type 3 --boost ORG=6 IBAN=4 CF=4 CATASTO=3 DOCID=3
-5. Stampami l'URL della Pull Request creata.
-
-Vincoli: SOLO dati sintetici (mai PII reali). Se Gemini non è disponibile, fermati e segnalamelo
-(non usare --offline senza il mio ok, perché produce dati meno nuovi).
+envai-pii/
+├── README.md, LICENSE, THIRD_PARTY_LICENSES.md, CONTRIBUTING.md
+├── requirements.txt, Dockerfile, docker-compose.yml, CLAUDE.md
+├── src/                     app/, data_pipeline/, inspect/, training/
+├── tests/                   standard-library test suite
+├── docs/                    API, data, training and taxonomy guides
+├── report/                  upstream technical report and evaluation artifacts
+└── reports/                 TARGA stress-test baseline
 ```
 
-> Prefer to do it yourself? Run the same commands manually — see
-> [CONTRIBUTING.md](CONTRIBUTING.md) and the format spec in
-> [docs/FORMATO_DATI.md](docs/FORMATO_DATI.md).
-
----
+Generated `dataset/`, `models/`, `experiments/`, and `wandb/` directories are ignored by Git.
 
 ## Documentation
 
-| Document | Contents |
-|---|---|
-| [CLAUDE.md](CLAUDE.md) | Environment constraints, repo map, architectural decisions, commands |
-| [docs/DATASET.md](docs/DATASET.md) | Full composition of train (~745k) and validation (7k) |
-| [docs/TRAINING.md](docs/TRAINING.md) | Training run: union of both HF datasets, subword-label handling, hyperparameters |
-| [docs/TASSONOMIA_TAG.md](docs/TASSONOMIA_TAG.md) | The 22 final tags and the merges (`TAG_MAP`) |
-| [docs/FORMATO_DATI.md](docs/FORMATO_DATI.md) | Exact dataset row format for contributing data (JSONL/BIO/checksums) |
-| [docs/BUILD.md](docs/BUILD.md) | Desktop executable build (CPU, Windows) |
-| [docs/CHANGELOG.md](docs/CHANGELOG.md) | Change log for the pipeline, with rationale |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute code, docs and (above all) data |
+- [Dataset composition](docs/DATASET.md)
+- [Training guide](docs/TRAINING.md)
+- [Tag taxonomy](docs/TASSONOMIA_TAG.md)
+- [Dataset contribution format](docs/FORMATO_DATI.md)
+- [Guardrail API contract](docs/GUARDRAIL_API.md) and [OpenAPI schema](docs/guardrail-openapi.yaml)
+- [TARGA generation notes](docs/targa_generation_notes.md)
+- [Change log](docs/CHANGELOG.md)
+- [Historical upstream v2.0.0 notes](docs/releases/v2.0.0.md)
+- [Contributor guide](CONTRIBUTING.md)
+- [Developer environment and architecture notes](CLAUDE.md)
+- [Third-party license notices](THIRD_PARTY_LICENSES.md)
 
-## Contributors
+## Contributing
 
-Thanks to everyone who has had a pull request merged into this repository, in alphabetical order:
+Code, documentation, and synthetic data contributions are welcome. Start with
+[CONTRIBUTING.md](CONTRIBUTING.md). Never submit real personal data. The upstream technical
+report lists contributors to the original community dataset.
 
-[Alessio Langiu](https://github.com/LangiuAlessio) ·
-[Andrea M. Piovesana](https://github.com/andreampiovesana) ·
-[Antonio Sarno](https://github.com/tonytonycoder11) ·
-[@cosmico89](https://github.com/cosmico89) ·
-[Emanuele Scarlata](https://github.com/Fenix46) ·
-[Fabio Scialanga](https://github.com/fabioscialanga) ·
-[Fabrizio Salmi](https://github.com/fabriziosalmi) ·
-[@FrankTheRope](https://github.com/FrankTheRope) ·
-[@Lazza003](https://github.com/Lazza003) ·
-[@marco88cappelli](https://github.com/marco88cappelli) ·
-[@marcomodonesi](https://github.com/marcomodonesi) ·
-[Massimo Fontana](https://github.com/maxxflyer) ·
-[Nicholas Angelucci](https://github.com/nicholas1990) ·
-[@pieronoviello](https://github.com/pieronoviello) ·
-[Quirino Zagarese](https://github.com/qzagarese) ·
-[Roberto](https://github.com/not-knope) ·
-[Salvatore Arena](https://github.com/Fanfulla) ·
-[@Umberto65UT](https://github.com/Umberto65UT)
+## License and attribution
 
-The people who contributed **data** to the community dataset are listed in the
-[technical report](report/rizzo-pii-report.pdf), under *Dataset contributors*.
+The source code remains under the upstream [MIT License](LICENSE), copyright (c) 2026 Simone
+Rizzo, Rizzo AI Academy. This fork adds no separate terms. The upstream model and mmBERT-base are
+declared MIT. The Ai4Privacy dataset card declares `license: other` and `license_name: cc-by-4.0`,
+with attribution required; DeepMount declares no dataset license. See
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for component details.
 
-## License
-
-Released under the **[MIT License](LICENSE)** © 2026 Simone Rizzo — Rizzo AI Academy.
-The **released binaries** are a different matter: they bundle PyMuPDF and are therefore conveyed
-under the AGPL-3.0 — see [Licensing of the released binaries](#licensing-of-the-released-binaries)
-at the end of this file, and [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
-
-Note on third-party data: the training corpus draws on
-[Ai4Privacy](https://huggingface.co/datasets/ai4privacy/open-pii-masking-500k-ai4privacy)
-(CC-BY-4.0) and [DeepMount00](https://huggingface.co/datasets/DeepMount00/pii-masking-ita); the
-backbone is [mmBERT-base](https://huggingface.co/jhu-clsp/mmBERT-base). Please respect their
-respective licenses when redistributing data or weights.
-
----
-
-<div align="center">
-
-<img src="report/images/mascot_idle.png" alt="rizzo-pii mascot waving" width="130" />
-
-### Contribute to the project
-
-⭐ Star it · 🐛 open an issue · 🔀 send a pull request · 📎 or just share a hard example
-
-**Author** — Simone Rizzo · **Sponsor** — [Rizzo AI Academy](https://rizzoaiacademy.com)
-
-_The mascot, a hedgehog, guards the document and **stays inside the EU**. Built and trained in Italy._ 🇮🇹🇪🇺
-
-</div>
-
----
-
-## Star History
-
-<div align="center">
-
-<a href="https://github.com/Rizzo-AI-Academy/rizzo-pii/stargazers">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/star_history_dark.png" />
-    <source media="(prefers-color-scheme: light)" srcset="docs/star_history_light.png" />
-    <img src="docs/star_history_light.png" alt="Star History Chart" width="700" />
-  </picture>
-</a>
-
-<sub>Rendered locally by <code>scripts/plot_star_history.py</code> — no third-party service, no GitHub App
-installed on the org. Refresh it with <code>python scripts/plot_star_history.py</code> and commit the PNGs.</sub>
-
-</div>
-
----
-
-### References
-
-1. mmBERT: a multilingual ModernBERT encoder. JHU-CLSP, `jhu-clsp/mmBERT-base`, Hugging Face.
-2. Warner, B. et al. *Smarter, Better, Faster, Longer: A Modern Bidirectional Encoder* (ModernBERT), 2024.
-3. Ai4Privacy. `open-pii-masking-500k`, Hugging Face (CC-BY-4.0).
-4. DeepMount00. `pii-masking-ita`, Hugging Face.
-5. OpenAI. *Introducing OpenAI Privacy Filter*, 2026; model `openai/privacy-filter`, Hugging Face (Apache-2.0).
-6. Microsoft. *Presidio: Data Protection and De-identification SDK*. Open source (MIT).
-7. Regulation (EU) 2016/679: General Data Protection Regulation (GDPR).
-8. Regulation (EU) 2024/1689: Artificial Intelligence Act (EU AI Act).
-
----
-
-### Licensing of the released binaries
-
-The **source code in this repository is MIT** — clone it, install the dependencies yourself, and
-nothing here is copyleft.
-
-The **binaries published under Releases** (`.exe`, `.dmg`, `.deb`, `.AppImage`) are conveyed under
-the **AGPL-3.0**, because they bundle [PyMuPDF](https://pypi.org/project/PyMuPDF/), which is dual
-licensed AGPL-3.0 or Artifex Commercial. PyMuPDF is what performs the real redaction — the glyphs
-leave the PDF content stream instead of being covered with a rectangle. The corresponding source
-required by the AGPL is this repository.
-
-**This does not affect your documents.** Copyleft applies to the software, not to its output:
-anonymising a contract with this app obliges you to publish nothing. Commercial use is fine, and so
-is selling it — what the AGPL forbids is redistributing the binaries *closed*, without their source.
-One caveat for network deployments: if you serve the app to other people (`--host 0.0.0.0`, or
-Docker on an office server) the AGPL's §13 asks you to offer them the corresponding source; running
-an unmodified build satisfies that by pointing here. The default bind is `127.0.0.1`, so ordinary
-desktop use never gets there.
-
-Full dependency-by-dependency breakdown, including the model weights and training data:
-**[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)**.
+PyMuPDF is dual-licensed under AGPL-3.0 or a commercial license and is used for PDF rendering
+and redaction. A container built from `Dockerfile` bundles PyMuPDF. Redistributing a combined
+work requires the corresponding source under the terms described in
+[the third-party notices](THIRD_PARTY_LICENSES.md). For a service reachable by other people,
+the AGPL network clause requires an offer of corresponding source. The obligations apply to the
+software, not the anonymized documents.

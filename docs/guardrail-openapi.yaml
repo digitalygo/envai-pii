@@ -1,0 +1,811 @@
+openapi: 3.1.0
+
+info:
+  title: envai-pii guardrail API (ENVAS-23)
+  version: 0.3.0
+  summary: Stateless PII guardrail with a caller-supplied dictionary seed
+  description: |
+    Contract for the ENVAS-23 guardrail API, schema version 0.3.0. The 0.3.0 schema adds
+    one optional request field, `categories`, to both arms. When `categories` is absent
+    or empty the historical default applies (all 24 categories), the success-response
+    shape is unchanged. JSON body and dictionary capacities now have larger bounded
+    defaults and server-configurable hard ceilings; text and file limits remain unchanged.
+
+    Implementation status: both request arms are implemented in this repository. The JSON
+    arm uses the dependency-free engine in `src/app/pii_dictionary.py`, the HTTP shell in
+    `src/app/guardrail_api.py`, the adapter registered from `src/app/app.py`, and the
+    dedicated tests in `tests/test_pii_dictionary.py` and `tests/test_guardrail_api.py`;
+    its 0.1.0 request and success-response schema and body-validation statuses, codes
+    and messages are preserved, with the optional `categories` field added in 0.3.0. The multipart arm adds the native-Werkzeug
+    intake in `src/app/guardrail_inputs.py` and is covered by
+    `tests/test_guardrail_multifiles.py` and `tests/test_guardrail_pdf_privacy.py`, with
+    the bounded collector in `tests/test_pdf_text_limits.py`; category selection has
+    dedicated coverage in `tests/test_guardrail_categories.py`. Pre-body ordering is
+    explicit: token configuration, credentials, model readiness and lock checks yield
+    503, 401, 503 or 429 before the body is read; media type and charset are validated
+    and the body cap is chosen for the media type before the bounded read. In
+    combined-invalid cases these pre-body outcomes take precedence over body-level
+    errors, so historical JSON error precedence is not preserved. The guardrail PDF
+    branch requires native MuPDF privacy controls: when they are missing or broken only
+    that branch answers 503, while JSON and plain-text inputs keep working. Legacy
+    routes and preferences are unchanged. Quality-gate and final security-review
+    verdicts are not declared in this contract, and ENVAS-23 acceptance criteria beyond
+    this endpoint are out of scope.
+
+    Scope: one endpoint, `POST /api/v1/analyses`.
+
+    - `application/json`: one UTF-8 JSON object with one `text`, an optional
+      `dictionary` seed and an optional `categories` whitelist. Exactly one result with
+      `input_id: "text"`. JSON arrays of
+      texts or files are not part of the contract.
+    - `multipart/form-data`: repeated optional `files` parts named `files`, never
+      `files[]` (up to 10; extensions `.pdf`, `.txt`, `.text`, `.md`, `.markdown`,
+      case-insensitive), plus optional `text`, `dictionary` and the `categories` value
+      field. `dictionary` is a form
+      string containing strict JSON with canonical `[LABEL_N]` keys such as `[ORG_6]`;
+      `categories` is a form string containing a strict JSON array such as
+      `["FULLNAME", "EMAIL"]`. `files`, `text`, `dictionary` and `categories` are each
+      optional, but a valid request needs at
+      least one file part or one non-blank `text`, so a text-only request with no
+      `files` part is valid; a selection-only or dictionary-only request is not.
+      Results are `file_1`..`file_10` in file-part order, then
+      `text`; one aggregate `dictionary_delta`. File handling is all-or-nothing and
+      text-only: no OCR, no raster redaction, no PDF binary or ZIP output, no
+      attachment extraction, and no promise that text inside images is protected.
+
+    Authentication is a server-only Bearer secret from the `PII_API_TOKEN` environment
+    variable. The value is never documented, logged or echoed. When the secret is unset
+    or blank the endpoint is disabled and answers 503; missing or wrong credentials
+    answer 401. Authentication, model readiness and the per-process lock are evaluated
+    before any body byte is read, so an unauthenticated or busy request is answered
+    without touching the payload. POST errors are sanitized to `{error, code}` with
+    stable codes and never echo request values, filenames, authorization headers or the
+    token. Successful responses intentionally contain input-derived `anonymized_text` and
+    newly allocated original values in `dictionary_delta`; text not detected as PII stays
+    unchanged. The service must not log request values, filenames, seed values, file
+    contents, placeholder-original pairs, authorization headers or the token. Request-scoped
+    state is released after the response; no global mapping or file cache is retained across
+    requests. Releasing references is not a secure-erasure guarantee, and runtime-managed
+    memory copies may remain. An unsupported method answers `405` with the framework's
+    generic JSON error body, not this envelope, and preserves the `Allow` header; an
+    automatic `OPTIONS` answers an empty `200`.
+    Every response at the path sets `Cache-Control: no-store`.
+
+    Bounded dictionary and JSON-body limits are resolved once per authenticated request.
+    `PII_MAX_SEED_ENTRIES` defaults to 10000 and is capped at 20000;
+    `PII_MAX_ORIGINAL_CHARS` defaults to 4096 and is capped at 65536;
+    `PII_MAX_AGGREGATE_CHARS` defaults to 1048576 and is capped at 2097152; and
+    `PII_MAX_JSON_BODY_BYTES` defaults to 8388608 and is capped at 16777216. Blank,
+    invalid or non-positive values fall back to defaults; higher values are clamped.
+    JSON `text` remains capped at 100000 Unicode code points. Multipart body remains
+    20971520 bytes (20 MiB), with the Flask framework ceiling at 50 MiB; one file is
+    5242880 bytes, up to 10 files and 13 parts (10 files plus `text`, `dictionary` and
+    `categories`). The multipart `dictionary` field uses the configured JSON-body cap;
+    `text` and `categories` form fields remain capped at 1048576 raw bytes. Aggregate
+    extracted inputs remain 100000 Unicode characters and one PDF remains capped at 200
+    pages. The effective seed plus new delta must satisfy the same dictionary limits
+    before success. Size and count caps answer 413 `payload_too_large`; the `categories`
+    raw-item cap is a value validation answered with 400 `invalid_request`. The processing deadline is a server-configured cooperative
+    budget: the non-secret `PII_ANALYSIS_TIMEOUT_SECONDS` environment variable holds a
+    positive finite float in seconds, defaults to 60 when unset or blank, and falls back
+    safely to 60 for invalid values (non-numeric text, zero, negative, NaN, infinity or
+    overflow). It is read once per request before the deadline snapshot, is not a
+    request field, and a longer client or Postman timeout cannot override it. The
+    budget starts after the bounded body read inside the owned lock and is global over
+    parsing, extraction, all inputs and allocation for both arms. It is not a hard
+    cancellation or completion guarantee: it cannot interrupt a native PDF operation or
+    an in-flight model call. One analysis in flight per process; contention answers 429
+    without queueing and without reading the body.
+
+    `categories` is a request-only whitelist of canonical `TAG_NAMES` labels that selects
+    which labels are anonymized on every file and on the optional `text`. Absent, `null`,
+    `[]` and empty-or-whitespace values select all 24 categories; a valid array selects
+    only those labels, leaving every other category in clear by explicit caller choice.
+    A subset selection is therefore not a complete PII anonymization guarantee. Legacy
+    server preferences and legacy fields stay ignored, there is no server-side opt-out,
+    and no `include_tags` or `exclude_tags` alias exists: the request can only narrow the
+    default. The seed and the ID space are still validated, reserved and protected across
+    all 24 categories, including inactive ones; `dictionary_delta` carries only new pairs
+    of selected categories, and `statistics.placeholder_count` counts every canonical
+    placeholder token in the output.
+
+    Semantics and decisions are documented in `docs/GUARDRAIL_API.md`.
+
+servers:
+  - url: http://127.0.0.1:5005
+    description: |
+      Default loopback bind of the envai-pii app. Legacy routes and this endpoint share
+      the process; the versioned path keeps the new contract separate.
+  - url: https://pii.internal.invalid
+    description: |
+      Placeholder origin for an internal deployment behind an authenticated proxy with
+      TLS. Replace with the real internal origin; do not expose the endpoint directly
+      outside loopback or a private network.
+
+tags:
+  - name: guardrail
+    description: Versioned, stateless guardrail API for machine-to-machine use.
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/v1/analyses:
+    post:
+      tags:
+        - guardrail
+      operationId: createAnalysis
+      summary: Anonymize one text or a file batch with an imported dictionary seed
+      description: |
+        Stateless and additive. `application/json` processes one `text` and returns
+        exactly one result with `input_id: "text"`. `multipart/form-data` processes up
+        to 10 optional files plus an optional `text` (at least one file or non-blank
+        `text` is required, so a text-only request with no `files` part is valid) and
+        returns one result per file in part order (`file_1`..`file_10`), then `text`;
+        `dictionary_delta` is one aggregate map for the whole request. The cooperative
+        processing budget is server-configured (`PII_ANALYSIS_TIMEOUT_SECONDS`, positive
+        finite float seconds, default 60) and is never taken from the request.
+
+        `categories` is an optional request-only whitelist of canonical `TAG_NAMES`
+        labels, for example `["FULLNAME", "EMAIL"]`. Absent, `null`, `[]` and
+        empty-or-whitespace values select all 24 categories; a valid array selects only
+        those labels, so every other category stays in clear by explicit caller choice
+        and a subset is not a complete PII anonymization guarantee. A non-blank string,
+        an object, a boolean, a number, a non-string array entry, a blank entry or a
+        non-canonical name (unknown, lower-case or whitespace-padded) answers 400
+        `invalid_request`; at most 24 raw items; duplicates are allowed and
+        deduplicated, and more than 24 raw items answers 400 `invalid_request`.
+        In `multipart/form-data` the field is one value part containing a
+        strict JSON array; omitted or blank content selects all, `null` and `[]` are
+        accepted as empty, and malformed JSON, invalid UTF-8, a duplicate `categories`
+        part or a `categories` part sent as a file answers 400. Legacy server
+        preferences (`EXCLUDED_TAGS`, `MAPPING_ENABLED`) and request overrides such as
+        `exclude_tags` and `include_mapping` remain ignored or unknown, and no
+        `include_tags` or `exclude_tags` alias exists; the request can only narrow the
+        all-category default.
+
+        Seed pairs are immutable and identity is the normalized original across labels.
+        Known originals are located even when the model misses them. An inactive seed
+        value is not located literally, but an active detection of that same normalized
+        value reuses the seed's existing token. IDs are reserved across every input and
+        the seed before any allocation, and new IDs are allocated above the maximum
+        already occupied per category. The first placeholder binding wins when a later
+        detection assigns another category; that token is reused in later inputs and the
+        delta retains only the first surface form. The seed and full working map are never
+        returned.
+
+        A JSON request retains its 0.1.0 success shape, text limit and body-validation
+        statuses, codes and messages once the pre-body checks pass, and adds only the
+        optional `categories` field to the request schema. JSON-body and dictionary
+        capacities use the bounded server defaults and hard ceilings above. Request-order
+        outcomes can differ when multiple conditions are invalid: configuration, credentials,
+        readiness and lock are checked before reading the body, then the overall media type
+        and charset are validated and the body cap is chosen before the bounded read, so
+        503, 401, 503 or 429 takes precedence, and an unsupported type or charset answers
+        415 without reading the body. This does not preserve every historical JSON error
+        outcome.
+
+        Multipart file errors are all-or-nothing: the accepted-extension whitelist is
+        checked first, so an unsupported extension answers 415 `unsupported_file_type`
+        (a `.jpg` whose bytes start with `%PDF-` included); an accepted `.txt`, `.text`,
+        `.md` or `.markdown` file whose bytes start with `%PDF-` follows the same strict
+        bounded PDF path as a `.pdf`; a zero-byte or blank text file answers 422
+        `empty_file`; a zero-byte or corrupt, encrypted or unsupported PDF answers 422
+        `unreadable_file`; a valid PDF with no extractable text answers 422
+        `no_extractable_text`. OCR is not available.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnalysisRequest'
+            examples:
+              seedReusedAndNewEmail:
+                summary: Known FULLNAME reused, new email allocated as EMAIL_1
+                value:
+                  dictionary:
+                    "[FULLNAME_7]": "Mario Rossi"
+                  text: "Mario Rossi, scrivi a mario@example.com"
+              categoriesSelected:
+                summary: Only FULLNAME and EMAIL selected; other categories stay in clear
+                value:
+                  text: "Mario Rossi, scrivi a mario@example.com, telefono 333 1234567"
+                  categories:
+                    - FULLNAME
+                    - EMAIL
+              categoriesDefaultAll:
+                summary: No categories field, so all 24 categories remain enabled
+                value:
+                  text: "Mario Rossi, scrivi a mario@example.com"
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/MultipartAnalysisRequest'
+            encoding:
+              files:
+                contentType: application/pdf, application/octet-stream, text/plain, text/markdown
+            examples:
+              twoFilesAndText:
+                summary: |
+                  Schematic example: two file parts, a dictionary form string and a text
+                  form string (multipart parts are not representable as JSON).
+                value:
+                  files:
+                    - nota.txt
+                    - contratto.md
+                  dictionary: '{"[FULLNAME_7]": "Mario Rossi"}'
+                  text: 'Referente: Mario Rossi.'
+              textOnly:
+                summary: |
+                  Text-only multipart: no `files` part and no `files[]`; the request is
+                  valid because `text` is non-blank. Leave the `files` row unchecked or
+                  omitted in Postman instead of adding a file-type row with an empty
+                  placeholder.
+                value:
+                  text: 'Referente: Mario Rossi.'
+              categoriesSelectedTextOnly:
+                summary: |
+                  Text-only multipart with a `categories` Text value containing a strict
+                  JSON array; no `files` part. Send `categories` as a Text field, not as
+                  a File field and not as CSV.
+                value:
+                  text: 'Referente: Mario Rossi.'
+                  categories: '["FULLNAME", "EMAIL"]'
+      responses:
+        '200':
+          description: |
+            Anonymized text and the delta of newly allocated pairs. `Cache-Control:
+            no-store`. A JSON request returns exactly one `text` result; a multipart
+            request returns one result per file in part order (`file_1`..`file_10`) and
+            then `text` when a non-blank text was present.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalysisResponse'
+              examples:
+                jsonSeedReusedAndNewEmail:
+                  summary: JSON; seed pair reused, new email allocated; count is 2
+                  value:
+                    results:
+                      - input_id: text
+                        anonymized_text: "[FULLNAME_7], scrivi a [EMAIL_1]"
+                        statistics:
+                          placeholder_count: 2
+                    dictionary_delta:
+                      "[EMAIL_1]": "mario@example.com"
+                multipartTwoFilesAndText:
+                  summary: Multipart; shared name and email, single aggregate delta
+                  value:
+                    results:
+                      - input_id: file_1
+                        anonymized_text: "[FULLNAME_7] scrive a [EMAIL_1]."
+                        statistics:
+                          placeholder_count: 2
+                      - input_id: file_2
+                        anonymized_text: "Conferma per [FULLNAME_7]: [EMAIL_1]."
+                        statistics:
+                          placeholder_count: 2
+                      - input_id: text
+                        anonymized_text: "Referente: [FULLNAME_7]."
+                        statistics:
+                          placeholder_count: 1
+                    dictionary_delta:
+                      "[EMAIL_1]": "mario.rossi@example.com"
+                jsonCategoriesSelected:
+                  summary: |
+                    JSON; only FULLNAME and EMAIL selected, so the phone number stays in
+                    clear and the delta contains only the newly allocated selected pairs
+                  value:
+                    results:
+                      - input_id: text
+                        anonymized_text: "[FULLNAME_1], scrivi a [EMAIL_1] o chiama 333 1234567"
+                        statistics:
+                          placeholder_count: 2
+                    dictionary_delta:
+                      "[FULLNAME_1]": "Mario Rossi"
+                      "[EMAIL_1]": "mario@example.com"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/Busy'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/DeadlineExceeded'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Server-only secret from the `PII_API_TOKEN` environment variable. The value is
+        never documented, logged or echoed. When the variable is unset or blank the
+        endpoint is disabled and answers 503 before credentials are evaluated; a missing
+        or wrong credential answers 401. No other authentication mode is accepted.
+
+  headers:
+    NoStore:
+      description: |
+        Always `no-store`. Responses may contain personal data and must not be cached by
+        proxies. Set on every outcome, success and error, including 405 and OPTIONS.
+      schema:
+        type: string
+        enum:
+          - no-store
+
+  responses:
+    BadRequest:
+      description: |
+        Invalid request, invalid seed, seed conflict or allocation exhaustion. The code
+        is one of `invalid_request`, `invalid_seed`, `seed_conflict`,
+        `allocation_exhausted`. JSON: malformed body, duplicate keys, unknown fields,
+        blank `text`, unpaired UTF-16 surrogates, invalid `categories` values
+        (non-blank string, object, boolean, number, non-string array entry, blank
+        entry, or a name that is not canonical because it is unknown, lower-case or
+        whitespace-padded), and a `categories` array with more than 24 raw items.
+        Multipart: unknown field, wrong file
+        part name, value part with a filename, duplicate `text`, `dictionary` or
+        `categories` part,
+        missing or empty part name or filename, duplicated `Content-Disposition` lines,
+        duplicated disposition parameters (`name`/`NAME`, `filename`/`FILENAME`),
+        invalid or ambiguous `Content-Disposition`, bad boundary, invalid field UTF-8,
+        blank or malformed dictionary JSON, duplicate dictionary JSON keys, malformed
+        `categories` JSON, missing
+        input, a dictionary-only request or a selection-only request.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: |
+        Missing or wrong Bearer credential. Code: `unauthorized`. Evaluated before any
+        body byte is read.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    PayloadTooLarge:
+      description: |
+        A configured or fixed limit was exceeded. JSON body defaults to 8388608 bytes
+        and has a 16777216-byte hard ceiling; dictionary defaults are 10000 entries,
+        4096 characters per original and 1048576 aggregate code points, with hard
+        ceilings of 20000 entries, 65536 characters per original and 2097152 aggregate
+        code points. The effective seed plus delta must fit those same limits.
+        Multipart body is 20971520 bytes, one file is 5242880 bytes, file count is 10,
+        part count is 13, the dictionary field uses the configured JSON-body cap, other
+        value fields are 1048576 raw bytes, aggregate extracted inputs are 100000 Unicode
+        characters and PDF page count is 200. Code: `payload_too_large`.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    UnsupportedMediaType:
+      description: |
+        `Content-Type` is neither `application/json` nor `multipart/form-data` encoded as
+        UTF-8 (including a non-UTF-8 charset); the check runs before the body is read.
+        Code: `unsupported_media_type`.
+
+        Multipart only: a file part has an extension outside `.pdf`, `.txt`, `.text`,
+        `.md`, `.markdown` (case-insensitive), checked before any content handling, so a
+        `%PDF-` file named `.jpg` also answers this. Code: `unsupported_file_type`,
+        message `Unsupported file type.`
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    UnprocessableContent:
+      description: |
+        Multipart file content could not be used (no JSON request produces these codes).
+        All-or-nothing: no partial results. Codes: `empty_file` (zero-byte or blank
+        decoded text file, message `File is empty.`; a zero-byte `.pdf` is
+        `unreadable_file` instead), `unreadable_file` (corrupt, encrypted or unreadable
+        PDF, message `Unable to read file.`), `no_extractable_text` (valid PDF without
+        non-blank extractable text, message `File has no extractable text. OCR is not
+        available.`).
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Busy:
+      description: |
+        Another analysis is already in flight in this process. The request is rejected
+        immediately, not queued, and its body is not read. Code: `busy`.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    InternalError:
+      description: |
+        Unexpected processing failure. Code: `internal_error`. The message never
+        contains request values, filenames, seed values, authorization headers, exception
+        text or the token.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unavailable:
+      description: |
+        `PII_API_TOKEN` is unset or blank, so the endpoint is disabled; the model is not
+        ready (readiness is checked before the per-process lock, even when the text could
+        be resolved entirely from the seed or from placeholders already present); the
+        detector became unavailable mid-request; the native MuPDF privacy controls
+        required by the guardrail PDF branch are missing or broken; or the service is
+        unavailable. Code: `unavailable`. The PDF condition blocks only PDF extraction:
+        JSON and plain-text inputs keep working, and `/health` is unchanged with no
+        PDF-capability field.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    DeadlineExceeded:
+      description: |
+        The configured cooperative processing budget was reached: the non-secret
+        `PII_ANALYSIS_TIMEOUT_SECONDS` positive finite float in seconds, default 60 when
+        unset, blank or invalid. The budget starts after the bounded body read, inside
+        the owned lock, is read once per request before the deadline snapshot, cannot be
+        set by the client, and cannot interrupt an in-flight model call or a native PDF
+        operation, so it is not a cancellation or completion guarantee: deployments must
+        also set a hard worker or proxy timeout longer than the configured budget plus
+        the upload and native-work margin. Code: `deadline_exceeded`.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    PlaceholderKey:
+      type: string
+      pattern: '^\[(AGE|AMOUNT|BUILDINGNUM|CATASTO|CF|CITY|CREDITCARDNUMBER|DATE|DOCID|EMAIL|FULLNAME|GENDER|IBAN|ID_DOC|IPADDR|ORG|PIVA|PROVINCE|STREET|TARGA|TELEPHONENUM|TIME|URL|ZIPCODE)_[1-9][0-9]{0,8}\]$'
+      description: |
+        Canonical placeholder token. `LABEL` is one of the current `TAG_NAMES`
+        categories (the 22 model categories plus the regex-only `URL` and `IPADDR`); `N`
+        is a positive ASCII integer from 1 to 999999999 written without leading zeros.
+        Brackets are part of the format.
+
+    CategoryName:
+      type: string
+      enum:
+        - FULLNAME
+        - AGE
+        - GENDER
+        - DATE
+        - TIME
+        - STREET
+        - BUILDINGNUM
+        - ZIPCODE
+        - CITY
+        - PROVINCE
+        - EMAIL
+        - TELEPHONENUM
+        - CF
+        - PIVA
+        - ID_DOC
+        - IBAN
+        - CREDITCARDNUMBER
+        - AMOUNT
+        - TARGA
+        - ORG
+        - DOCID
+        - CATASTO
+        - URL
+        - IPADDR
+      description: |
+        One canonical category label, exactly as in `TAG_NAMES` in `src/app/app.py`: the
+        22 model categories plus the regex-only `URL` and `IPADDR`. Matching is
+        case-sensitive; blank, unknown, lower-case and whitespace-padded names are not
+        canonical.
+
+    AnalysisRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - text
+      properties:
+        text:
+          type: string
+          minLength: 1
+          pattern: '\S'
+          maxLength: 100000
+          description: |
+            Required. The single text to anonymize. It must contain at least one
+            non-whitespace character and is measured in Unicode characters (code
+            points). Missing, blank or non-string values are rejected. Plain text; not
+            parsed as Markdown or HTML. An unpaired UTF-16 surrogate is rejected with
+            `invalid_request`; valid surrogate pairs (astral-plane characters, emoji)
+            are accepted.
+        dictionary:
+          type: object
+          maxProperties: 20000
+          propertyNames:
+            $ref: '#/components/schemas/PlaceholderKey'
+          additionalProperties:
+            type: string
+            minLength: 1
+            pattern: '\S'
+            maxLength: 65536
+          description: |
+            Optional seed of known `placeholder -> original` pairs. Absent or `{}` means
+            an empty seed; `null` is invalid. Pairs are immutable and the first binding
+            for a normalized original is reused regardless of a later detector category
+            (Unicode casefold, strip and collapse whitespace to one ASCII space; no accent
+            removal, no NFC or NFKC folding, no punctuation stripping). Known originals are located literally with safe word
+            boundaries even when the model misses them, and replacements are applied
+            once on original offsets with no recursive rescan.
+
+            Server defaults are 10000 entries, 4096 characters per original and 1048576
+            aggregate original code points. Hard ceilings are 20000 entries, 65536
+            characters per original and 2097152 aggregate code points. Configure these
+            with `PII_MAX_SEED_ENTRIES`, `PII_MAX_ORIGINAL_CHARS` and
+            `PII_MAX_AGGREGATE_CHARS`; invalid or non-positive values use defaults and
+            higher values are clamped. The effective seed plus new delta must satisfy
+            these same limits before success. Two seed entries that normalize to the
+            same original conflict, even with different labels, and reject the request.
+            A value with an unpaired UTF-16 surrogate rejects the request with
+            `invalid_seed`; valid surrogate pairs are accepted. The seed is never echoed
+            back.
+        categories:
+          oneOf:
+            - type: array
+              maxItems: 24
+              items:
+                $ref: '#/components/schemas/CategoryName'
+            - type: string
+              pattern: '^\s*$'
+            - type: 'null'
+          description: |
+            Optional request-only whitelist of canonical category labels to anonymize.
+            Absent, `null`, an empty array and an empty or whitespace-only string select
+            all 24 categories. Otherwise the value must be an array of canonical
+            `TAG_NAMES` names, for example `["FULLNAME", "EMAIL"]`; items are
+            case-sensitive and must not have surrounding whitespace. A non-blank string,
+            an object, a boolean or a number, and an array entry that is not a canonical
+            name (including blank, unknown, lower-case or whitespace-padded entries)
+            answer 400 `invalid_request`. At most 24 raw items; duplicates are allowed
+            and deduplicated, more than 24 raw items answers 400 `invalid_request`, and a
+            selection that covers all 24 categories is equivalent to no selection.
+            Only the selected labels are anonymized, so entities of other categories stay
+            in clear by explicit caller choice and a selection is not a complete PII
+            anonymization guarantee. Legacy server preferences (`EXCLUDED_TAGS`,
+            `MAPPING_ENABLED`) and legacy fields such as `exclude_tags` or
+            `include_mapping` remain ignored or unknown; there is no server-side category
+            opt-out and no `include_tags` or `exclude_tags` alias. The seed and the ID
+            space still cover all 24 categories, including inactive ones.
+
+    MultipartAnalysisRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Implemented `multipart/form-data` request: up to 10 optional `files` parts plus
+        optional `text` and `dictionary`, parsed in memory with the native Werkzeug
+        multipart decoder (no `request.files`, no spool or temporary files). `files`,
+        `text` and `dictionary` are each optional on their own; a valid request needs at
+        least one file part or one non-blank `text`, so a dictionary alone, an empty
+        body and a blank `text` with no file part are invalid, while a text-only request
+        omits `files` entirely. A file part that is present but empty or malformed is
+        not treated as a missing input: it still fails all-or-nothing. The field name is
+        exactly `files`, never `files[]`. Value parts must
+        be form fields (no filename). Only these four field names are allowed (`files`,
+        `text`, `dictionary` and `categories`), all
+        file parts must be named `files`, and every part must carry exactly one
+        `Content-Disposition: form-data; name=...` header line; duplicated header lines
+        and duplicated disposition parameters (`name`/`NAME`, `filename`/`FILENAME`)
+        answer 400 `invalid_request`. Quoted filename semicolons, escaped quotes,
+        Unicode filenames and the RFC 2231 `filename*` form are accepted. The body is
+        capped at 20971520 bytes, one file at 5242880 bytes, the `dictionary` field at
+        the configured JSON-body cap (default 8388608, hard ceiling 16777216 bytes),
+        other value fields at 1048576 raw bytes and the total part count at 13; exceeding
+        a cap answers 413 `payload_too_large`, while structural problems answer 400
+        `invalid_request`. The
+        file family is chosen by filename extension and `%PDF-` magic, not by the part
+        `Content-Type`.
+      properties:
+        files:
+          type: array
+          maxItems: 10
+          items:
+            type: string
+            format: binary
+          description: |
+            Optional repeated file parts named exactly `files`, in input order; the
+            property is not required, a text-only request omits it, and the field name
+            is never `files[]`. Accepted extensions,
+            case-insensitive: `.pdf`, `.txt`, `.text`, `.md`, `.markdown`. The
+            whitelist is checked before any content handling, so a `.jpg` whose bytes
+            start with `%PDF-` is still 415; an accepted text extension whose bytes
+            start with `%PDF-` follows the strict bounded PDF path. Each file is at
+            most 5242880 bytes; at most 10 files. Filename metadata is not returned
+            and filenames must not be logged; filenames may repeat. If a filename also
+            occurs in extracted document text, it can appear in `anonymized_text` unless
+            the detector identifies and replaces it. Results use positional IDs
+            `file_1`..`file_10` in part order. When no file part is present, a
+            non-blank `text` remains required as the single input.
+        text:
+          type: string
+          description: |
+            Optional singleton text input, sent as a form value (no filename). Blank or
+            whitespace-only content is treated as absent and produces no result.
+            Processed after all files and returned with `input_id: "text"`. The decoded
+            input counts toward the 100000-character aggregate across all inputs.
+        dictionary:
+          type: string
+          contentMediaType: application/json
+          description: |
+            Optional singleton form string containing a strict JSON object with the same
+            seed semantics as the JSON arm. Missing or `{}` means an empty seed. Blank or
+            malformed JSON and duplicate JSON keys are rejected with `invalid_request`;
+            parsed `null`, arrays, strings, numbers and booleans are rejected with
+            `invalid_seed`. The content is a strict JSON object literal for the form
+            string, and its keys are canonical `[LABEL_N]` placeholders such as
+            `[ORG_6]`, not arbitrary names. The same entry, original-length,
+            aggregate-length and conflict rules apply.
+        categories:
+          type: string
+          contentMediaType: application/json
+          description: |
+            Optional singleton form string (value part, no filename) containing strict
+            JSON for the same request-only whitelist. Omitted or blank content selects
+            all 24 categories; otherwise the decoded JSON follows the JSON-arm policy:
+            `null` and `[]` are accepted as empty (all categories), an array of
+            canonical `TAG_NAMES` names selects those labels, and a decoded non-blank
+            string, object, boolean or number is invalid. At most 24 raw items and
+            duplicates are deduplicated. Malformed JSON, invalid UTF-8, a duplicate
+            `categories` part and a `categories` part sent as a file answer 400
+            `invalid_request`. In Postman, send `categories` as a Text field whose value
+            is a JSON array such as `["FULLNAME", "EMAIL"]`, not as a File field and not
+            as CSV.
+
+    AnalysisResult:
+      type: object
+      additionalProperties: false
+      required:
+        - input_id
+        - anonymized_text
+        - statistics
+      properties:
+        input_id:
+          type: string
+          pattern: '^(text|file_(?:[1-9]|10))$'
+          description: |
+            `text` for the JSON arm and for the multipart text input; `file_1` to
+            `file_10` for multipart file inputs, in file-part order. A JSON request
+            always produces exactly one result with `input_id: "text"`.
+        anonymized_text:
+          type: string
+          description: |
+            The input text with seed matches, known matches from earlier inputs and new
+            PII replaced by canonical placeholders; everything else unchanged.
+            Placeholder tokens already present in the input are kept untouched and their
+            IDs stay reserved.
+        statistics:
+          type: object
+          additionalProperties: false
+          required:
+            - placeholder_count
+          properties:
+            placeholder_count:
+              type: integer
+              minimum: 0
+              description: |
+                Number of canonical placeholder tokens in `anonymized_text`, counting
+                every occurrence; a placeholder repeated twice counts twice. Includes
+                seed placeholders reused in the output, placeholders reused from earlier
+                inputs and newly allocated placeholders.
+
+    AnalysisResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - results
+        - dictionary_delta
+      properties:
+        results:
+          type: array
+          minItems: 1
+          maxItems: 11
+          description: |
+            One element for a JSON request (`input_id: "text"`); one to eleven elements
+            for a multipart request: `file_1`..`file_10` in file-part order, then `text`
+            when a non-blank text was present.
+          items:
+            $ref: '#/components/schemas/AnalysisResult'
+        dictionary_delta:
+          type: object
+          propertyNames:
+            $ref: '#/components/schemas/PlaceholderKey'
+          additionalProperties:
+            type: string
+            minLength: 1
+            pattern: '\S'
+          description: |
+            One aggregate map for the whole request: new pair only, placeholder -> first
+            observed surface form of the original, preserving casing and spacing. A pair
+            allocated while processing one input is reused in later inputs; seed pairs
+            and placeholder tokens already present in an input never appear here. Empty
+            object when nothing new. The full seed and full working map are never
+            returned. The response does not include `source_text`, `segments`, filename
+            metadata, raw file bytes, PDF binaries, ZIP archives or per-entity original
+            fields. It intentionally returns input-derived `anonymized_text`, where text
+            not detected as PII stays unchanged, and `dictionary_delta`, whose values are
+            the first observed originals for newly allocated pairs. A filename that also
+            occurs in document text may appear in `anonymized_text` unless detected and
+            replaced; the contract does not guarantee that arbitrary source text or
+            filename strings are absent from success responses.
+
+    Error:
+      type: object
+      additionalProperties: false
+      description: |
+        Error envelope for `POST /api/v1/analyses` only. The endpoint keeps the two-field
+        shape for every outcome, including file errors: no per-input error object and no
+        `input_id`. A request with an unsupported method does not use this envelope: it
+        answers `405` with the framework's generic JSON error body, preserves the `Allow`
+        header, and an automatic `OPTIONS` answers an empty `200`. Every response at the
+        path still sets `Cache-Control: no-store`.
+      required:
+        - error
+        - code
+      properties:
+        error:
+          type: string
+          description: |
+            Generic human-readable message. It contains no request values, entity names,
+            seed values, filenames, file contents, authorization headers, token, stack
+            trace or exception text; clients branch on `code`.
+        code:
+          type: string
+          enum:
+            - invalid_request
+            - invalid_seed
+            - seed_conflict
+            - allocation_exhausted
+            - payload_too_large
+            - unsupported_media_type
+            - unsupported_file_type
+            - empty_file
+            - unreadable_file
+            - no_extractable_text
+            - unauthorized
+            - busy
+            - unavailable
+            - deadline_exceeded
+            - internal_error

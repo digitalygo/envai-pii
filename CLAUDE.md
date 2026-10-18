@@ -18,7 +18,7 @@ API → ricostruzione), per studi legali / compliance GDPR.
 Scelta di mmBERT (encoder multilingue, architettura ModernBERT, context nativa 8192) e non
 ModernBERT vanilla perché quest'ultimo è quasi solo inglese.
 
-## Ambiente — vincoli critici e non ovvi
+## Ambiente: vincoli critici e non ovvi
 
 GPU **RTX 5060 Ti (Blackwell, sm_120)** su Windows; Python in `D:\programmi\python`.
 Questi punti fanno fallire tutto se ignorati:
@@ -37,129 +37,188 @@ Questi punti fanno fallire tutto se ignorati:
 
 ## Mappa della repo
 
+Questo fork di digitalygo mantiene training, pipeline dati, servizio Flask solo API con workflow
+PDF, oltre alla guardrail API v1. La UI browser è stata rimossa: `app.py` non serve più pagine
+HTML, solo endpoint. Il packaging desktop Tauri, gli installer nativi e
+`src/app/desktop_app.py` sono stati rimossi. Gli entry point mantenuti sono `app.py` e `serve.py`;
+il container usa `Dockerfile`.
+
 Struttura completa in [README.md](README.md). In breve: codice in `src/`, dati in `dataset/`,
 modelli in `models/<versione>/`, artefatti dei run in `experiments/<run>/`, doc in `docs/`.
 **I path negli script sono assoluti (risolti da `__file__`): girano da qualsiasi CWD.**
 
-**Pipeline dati — `src/data_pipeline/` (ordine di esecuzione):**
-- `llm_template_bank.py` — Gemini scrive documenti legali con soli segnaposto `{SLOT}` →
+**Pipeline dati: `src/data_pipeline/` (ordine di esecuzione):**
+
+- `llm_template_bank.py`: Gemini scrive documenti legali con soli segnaposto `{SLOT}` →
   `dataset/synthetic/legal_templates.json` (72 template). Guard scarta i template con nomi inline.
-- `generate_synthetic_pii.py` — inietta nei template dati con **checksum validi** (CF/PIVA/IBAN)
+- `generate_synthetic_pii.py`: inietta nei template dati con **checksum validi** (CF/PIVA/IBAN)
   → `dataset/synthetic/synthetic_pii_it_200k.jsonl` (`tokens` + `bio_labels`).
-- `augment_real_pii.py` — inietta entità sintetiche in **frasi reali** Ai4Privacy (it) in posizioni
+- `augment_real_pii.py`: inietta entità sintetiche in **frasi reali** Ai4Privacy (it) in posizioni
   variabili → `dataset/synthetic/synthetic_pii_it_realaug.jsonl`. Spezza il legame template/posizione.
-- `prepare_deepmount.py` — rimappa `DeepMount00/pii-masking-ita` (56 tipi Faker IT) sui 22 tag →
+- `prepare_deepmount.py`: rimappa `DeepMount00/pii-masking-ita` (56 tipi Faker IT) sui 22 tag →
   `dataset/processed/deepmount_pii_it_{train,test}.jsonl`.
-- `build_validation.py` — **unica validation reale** → `dataset/validation/validation_real.jsonl`.
-- `build_subset.py` — subset stratificati (multilingua + tag) per smoke test →
+- `build_validation.py`: **unica validation reale** → `dataset/validation/validation_real.jsonl`.
+- `build_subset.py`: subset stratificati (multilingua + tag) per smoke test →
   `dataset/subsets/{train_subset_10k,val_subset_5k}.jsonl`.
 
-**Training — `src/training/`:**
-- `train_pii.py` — fonde tutte le fonti, addestra, salva il modello, plotta la loss, stampa
+**Training: `src/training/`:**
+
+- `train_pii.py`: fonde tutte le fonti, addestra, salva il modello, plotta la loss, stampa
   metriche train/val, logga su **W&B** (run `rizzo-pii:0.3B-v{VERSION}`). **Modello versionato**:
   ogni run grande salva in `models/rizzo-pii-0.3B-v{VERSION}/` (storico, niente sovrascrittura;
   `MODEL_VERSION` in cima al file o `--version`; storia in `models/registry.json`). Vedi "Parametri".
-- `test_pii.py` — inferenza CLI sul modello salvato (entità + testo anonimizzato). Risolve in automatico
+- `test_pii.py`: inferenza CLI sul modello salvato (entità + testo anonimizzato). Risolve in automatico
   l'**ultima** versione `rizzo-pii-0.3B-v*` (fallback al vecchio non versionato → legacy; override `PII_MODEL_DIR`).
 
-**Utility / ispezione (read-only) — `src/inspect/`:**
-- `validate_checksums.py` — ricalcola i checksum CF/IBAN/PIVA; **blueprint della rete regex+checksum**
+**Utility / ispezione (read-only): `src/inspect/`:**
+
+- `validate_checksums.py`: ricalcola i checksum CF/IBAN/PIVA; **blueprint della rete regex+checksum**
   da affiancare al modello in produzione.
 - `inspect_ai4privacy.py` (conteggi lingue/tag), `inspect_lengths.py` (lunghezze), `inspect_no_iban.py`.
 
-**App di anonimizzazione locale — `src/app/` (+ packaging in `docs/BUILD.md`):**
-- `server_config.py` — **configurazione host/porta** (+ `prefs.json` con tag esclusi e stato del
-  dizionario) condivisa tra tutti gli entry point e con Tauri.
+**App di anonimizzazione locale: `src/app/`:**
+
+- `server_config.py`: **configurazione host/porta** (+ `prefs.json` con tag esclusi e stato del
+  dizionario) condivisa tra tutti gli entry point.
   Catena di precedenza: **CLI `--host`/`--port` > env `PII_HOST`/`PII_PORT` > `config.json` > default
   `127.0.0.1:5005`**. Il config.json è in `%LOCALAPPDATA%\rizzo-pii\` (Windows) /
-  `~/.local/share/rizzo-pii/` (Linux) / `~/Library/Application Support/rizzo-pii/` (macOS), lo
-  stesso file letto/scritto da Tauri (lib.rs). Include `port_available()` (pre-bind check) e il
-  codice di uscita `EXIT_PORT_CONFLICT = 76`: i 3 entry point escono con 76 se la porta è occupata
-  **prima di caricare il modello** (evita secondi sprecati). Tauri riconosce il codice 76 e mostra
-  il form di configurazione nello splash screen.
-- `app.py` — server Flask + **UI**: testo, PDF o file `.md`/`.txt`, chunking con overlap, offset
+  `~/.local/share/rizzo-pii/` (Linux) / `~/Library/Application Support/rizzo-pii/` (macOS).
+  Include `port_available()` (pre-bind check) e il codice di uscita `EXIT_PORT_CONFLICT = 76`.
+  `serve.py` controlla la porta prima di importare `app.py` e caricare il modello. `app.py` importa
+  e carica il modello prima di controllare la porta nel blocco CLI. Entrambi usano il codice 76 se
+  il controllo o il bind finale rileva un conflitto.
+- `app.py`: server Flask **solo API/HTTP** (nessuna pagina HTML). L'input arriva come testo JSON o
+  come file caricato (`.pdf`/`.md`/`.txt`), chunking con overlap, offset
   globali + dedup. Anonimizzazione **reversibile** (ogni PII → `[FULLNAME_1]`/`[IBAN_1]`… +
-  dizionario locale; tab "Ripristina"). Affianca al modello una **rete regex/checksum** (EMAIL/
-  TELEFONO/IBAN/CF/PIVA/carta/importo/targa/**URL**; IBAN/CF/PIVA/carta validati con checksum, che ha
-  priorità sul modello). `URL` è un **23° tag solo-regex**: il modello non lo conosce; matcha schema,
-  `www.` e domini nudi solo su una **lista chiusa di TLD** (senza, `p.iva`/`S.r.l.` diventerebbero
-  domini). `APP_VERSION`. Endpoint: `GET /health` (readiness senza inference, 200/503),
+  dizionario `mapping` nella risposta; il ripristino è **a carico del chiamante**). Affianca al
+  modello una **rete regex/checksum** (EMAIL/
+  TELEFONO/IBAN/CF/PIVA/carta/importo/targa/**URL**/**IPADDR**; IBAN/CF/PIVA/carta validati con
+  checksum, che ha priorità sul modello). `URL` e `IPADDR` sono i **due tag solo-regex** (23° e 24°):
+  il modello non li conosce; `URL` matcha schema, `www.` e domini nudi solo su una **lista chiusa di
+  TLD** (senza, `p.iva`/`S.r.l.` diventerebbero domini), `IPADDR` quattro ottetti 0-255 incluse le
+  forme CIDR e range. Le richieste a `/` o a percorsi sconosciuti rispondono **404 JSON**; gli
+  errori framework (404/405/413/500) escono come JSON generico con status e header invariati
+  (405 conserva `Allow`, corpo senza URL né dettagli dell'eccezione). `APP_VERSION`. Endpoint:
+  `GET /health` (readiness senza inference, 200/503),
   `POST /analyze`, `POST /pdf`, `POST /preview`, `POST /pdf/preview`, `GET /doc/<id>/page/<n>.png`,
   `GET /doc/<id>/file.pdf`, `GET/POST /settings` (alias storico `/tags`), `GET/POST /config`,
-  `GET /port-check`; CLI `--host`/`--port`/`--exclude-tags`/`--no-mapping`.
-- **Anteprima del PDF a video, prima e dopo** — le due colonne mostrano il documento *renderizzato*,
-  non solo il testo. A sinistra, appena si carica un PDF: `POST /preview` lo tiene in memoria e
-  ritorna testo + numero di pagine, e la card offre due viste (**Anteprima PDF** default, **Testo**).
-  A destra, dopo l'anonimizzazione, una **terza vista** accanto ad Anteprima/Testo: **PDF censurato**,
-  cioè lo stesso documento redatto con i placeholder al posto delle PII.
-  Il render è **server-side con PyMuPDF** (`page.get_pixmap` → PNG per pagina): dentro Tauri non c'è
-  un viewer PDF affidabile (WebView2/WKWebView) e l'app è offline, quindi niente pdf.js da CDN.
-  Le pagine sono **pigre** (`loading=lazy`) e messe in cache: un PDF di 200 pagine non costa 200 render.
+  `GET /port-check`, `POST /api/v1/analyses` (guardrail v1, vedi sotto); CLI
+  `--host`/`--port`/`--exclude-tags`/`--no-mapping`.
+- `pii_dictionary.py` + `guardrail_api.py` + `guardrail_inputs.py`: **guardrail API v1**
+  (ENVAS-23): endpoint additivo `POST /api/v1/analyses` con due arm implementati. Il ramo a
+  **un solo testo JSON** mantiene il contratto 0.1.0 e accetta in piu' il campo opzionale
+  `categories` (schema 0.3.0). Il ramo
+  **multifile** (schema 0.2.0, esteso a 0.3.0 dal campo `categories`) e' implementato: stessa
+  route, media type `multipart/form-data`
+  con fino a 10 file opzionali (`.pdf`/`.txt`/`.text`/`.md`/`.markdown`, estensione
+  case-insensitive e whitelist controllata prima del contenuto), `text` singolo opzionale,
+  `dictionary` come stringa form con JSON severo (chiavi placeholder canoniche come `[ORG_6]`,
+  mai arbitrarie), `categories` come stringa form con JSON severo e un solo `dictionary_delta`
+  aggregato, per un massimo di 13 parti (10 file piu' i campi valore `text`, `dictionary` e
+  `categories`); `files`, `text`, `dictionary` e `categories` sono
+  facoltativi singolarmente ma serve almeno un file o un `text` non vuoto (il campo
+  `categories` seleziona soltanto e non conta come input), quindi una richiesta
+  solo-testo senza file e' valida e il campo si chiama `files`, mai `files[]`. L'intake usa il
+  `MultipartDecoder` nativo di Werkzeug alimentato in RAM (mai `request.files`, niente spool o
+  file temporanei); il testo mantiene la policy di codifica legacy e un contenuto `%PDF-` su nome
+  `.txt`/`.md` segue lo stesso percorso PDF strict e bounded dei `.pdf` (200 pagine, budget
+  aggregato 100000 caratteri, annots/widgets/TOC strict, deadline cooperativa server-side).
+  Niente OCR, redazione raster, PDF binario/ZIP, array JSON, UI, training o modifiche AAAS.
+  Bearer `PII_API_TOKEN` configurato nell'ambiente del server. La deadline e' un budget
+  cooperativo interno, globale su entrambi i rami, letto una volta per richiesta da
+  `PII_ANALYSIS_TIMEOUT_SECONDS` (float positivo e finito; assente, vuoto o invalido: fallback
+  sicuro a 60 s), non e' un campo della richiesta e non interrompe PDF nativo o model call; il
+  timeout di worker/proxy esterno va tenuto piu' lungo del budget piu' margine per upload e
+  lavoro nativo. La variabile e' non-segreta e indipendente dal segreto `PII_API_TOKEN`.
+  Motore senza dipendenze in `pii_dictionary.py`, guscio HTTP in
+  `guardrail_api.py`, intake multipart in `guardrail_inputs.py`, adapter registrato da `app.py`;
+  stateless, non legge `prefs.json` e non ha fallback da env/CLI/impostazioni. Il campo
+  **solo-richiesta `categories`** e' la whitelist delle etichette da anonimizzare: nello JSON un
+  array di nomi canonici (`["FULLNAME","EMAIL"]`), nel multipart un singolo campo valore con
+  JSON severo; assente, `null`, `[]`, stringa vuota o di soli spazi = tutte le 24 categorie
+  (default storico), valori o voci non validi = `400 invalid_request`, massimo 24 voci grezze
+  (oltre il tetto -> `400 invalid_request`) con duplicati deduplicati. La selezione filtra
+  modello e regex prima del merge e vale su ogni file e sul `text`: le categorie non selezionate
+  restano in chiaro per scelta esplicita del
+  chiamante, quindi un sottoinsieme non e' una garanzia di anonimizzazione completa. Il seed
+  resta validato e copiato su tutte le 24 categorie anche inattive (stessi conflitti e tetti,
+  ID riservati, nessun match ne' delta per le inattive), `dictionary_delta` contiene solo le
+  coppie nuove selezionate e `statistics.placeholder_count` conta tutti i token canonici.
+  **Capability PDF
+  nativa**: all'avvio, una volta per processo, le diagnostiche di MuPDF (errori/warning) vengono
+  spente con readback delle flag e reset del buffer verificati; il buffer viene svuotato dopo
+  ogni tentativo di estrazione PDF della guardrail che arriva al parser nativo e, se il controllo
+  nativo manca o si rompe, solo il ramo PDF risponde 503 (JSON e testo continuano a funzionare)
+  fino al riavvio del processo. Contratto:
+  `docs/GUARDRAIL_API.md` + `docs/guardrail-openapi.yaml`; test: `tests/test_guardrail_api.py`,
+  `tests/test_pii_dictionary.py` (JSON), `tests/test_guardrail_multifiles.py` (multipart e
+  cablaggio), `tests/test_guardrail_pdf_privacy.py` (privacy nativa), `tests/test_pdf_text_limits.py`
+  (collector strict/bounded), `tests/test_guardrail_timeout.py` (budget e file opzionali),
+  `tests/test_guardrail_categories.py` (selezione delle categorie su entrambi gli arm).
+- **Anteprima e download del PDF via API**: `POST /preview` tiene il PDF in memoria e ritorna
+  testo + numero di pagine; `GET /doc/<id>/page/<n>.png` rende le pagine **server-side con
+  PyMuPDF** (`page.get_pixmap` → PNG per pagina), per una resa coerente senza dipendere da pdf.js
+  o da una CDN.
+  Le pagine sono messe in cache: un PDF di 200 pagine non costa 200 render.
   I documenti stanno in una **LRU in memoria** (`_DOCS`, `MAX_DOCS=6`) e **mai su disco**: valgono
   quanto il documento stesso e muoiono col processo.
   `POST /pdf/preview` fa lo stesso lavoro di `/pdf` ma lascia il binario nello store e ritorna
-  `{doc_id, n_pages, residual, skipped}`: l'anteprima a destra e il bottone "Scarica PDF" usano
-  **la stessa copia**, quindi guardare il PDF e poi scaricarlo costa **una sola** anonimizzazione
-  (il download passa da `/doc/<id>/file.pdf`). `/pdf` resta invariato per chi usa l'API.
+  `{doc_id, n_pages, residual, skipped}`: anteprima e download (`GET /doc/<id>/file.pdf`) usano
+  **la stessa copia**, quindi guardare il PDF e poi scaricarlo costa **una sola** anonimizzazione.
+  `/pdf` resta invariato per chi usa l'API.
 - **Preferenze di anonimizzazione** → `prefs.json` nella config dir (`EXCLUDED_TAGS`,
-  `MAPPING_ENABLED`). File **separato da `config.json`** perché Tauri riscrive quest'ultimo per
-  intero quando si cambia porta dallo splash. Precedenza: campo nella richiesta > CLI > env > file.
-- **Tag disattivabili**: i tag deselezionati vengono rilevati ma **non** sostituiti (restano in
-  chiaro) — serve a confrontare gli importi o a tenere età/sesso in un caso clinico. Env
-  `PII_EXCLUDE_TAGS`, campo `exclude_tags`. UI: icona 🏷️ nell'header → legenda dei 23 tag con
-  toggle. La legenda (descrizioni IT/EN + esempi) vive in `TAGS` in cima a `app.py`.
+  `MAPPING_ENABLED`). File **separato da `config.json`** perché quest'ultimo viene riscritto per
+  intero quando si cambia porta. Precedenza: campo nella richiesta > CLI > env > file.
+- **Tag disattivabili**: i tag esclusi vengono rilevati ma **non** sostituiti (restano in
+  chiaro), utile per confrontare gli importi o tenere età/sesso in un caso clinico. Env
+  `PII_EXCLUDE_TAGS`, campo `exclude_tags` nella richiesta, preferenza in `prefs.json`. I 24 tag
+  applicativi (22 del modello + `URL`/`IPADDR`) con descrizioni IT/EN ed esempi vivono in `TAGS`
+  in cima a `app.py` e sono esposti da `GET /settings`.
 - **Dizionario reversibile on/off** (`MAPPING_ENABLED`, default **on**; env `PII_MAPPING=0`, campo
-  `include_mapping`): con off l'anonimizzazione è **definitiva**. Non è cosmetico — `analyze()` non
-  costruisce la mappa, la risposta non ha `mapping`, e i segmenti-entità **perdono il campo `t`**
-  (altrimenti il dizionario si ricostruirebbe dal payload); l'UI non scrive `pii_map` in
-  localStorage e nasconde il download. La **numerazione resta** (`[FULLNAME_1]` due volte = stesso
-  soggetto): è utile all'LLM e da sola non riporta al valore. UI: switch nella card di input, ambra
-  quando è off. `source_text` continua a tornare — è il documento che hai appena mandato tu, non una
-  chiave di ripristino.
-- `pdf_export.py` + endpoint **`POST /pdf`** — **download del PDF anonimizzato** (issue #7, punto 1),
-  bottone "📄 Scarica PDF anonimizzato" nella card Risultato. Due modalità: se l'input era un **PDF**
+  `include_mapping`): con off l'anonimizzazione è **definitiva**. `analyze()` restituisce comunque
+  `mapping: {}`, senza valori originali, e i segmenti-entità **perdono il campo `t`** (altrimenti il
+  dizionario si ricostruirebbe dal payload). La route `/analyze` omette `source_text` quando il
+  mapping è disattivato; con il mapping attivo lo restituisce, così il chiamante può conservare
+  testo originale e dizionario. Il ripristino è **a carico del chiamante**: il backend non espone
+  un endpoint di restore e non conserva la mappa. La **numerazione resta**
+  (`[FULLNAME_1]` due volte = stesso soggetto): da sola non riporta al valore.
+- `pdf_export.py` + endpoint **`POST /pdf`**: **download del PDF anonimizzato** (issue #7, punto 1).
+  Due modalità: se l'input era un **PDF**
   si fa **redazione vera** del documento originale (`apply_redactions()`: il testo esce dal content
   stream, non ci si disegna sopra un rettangolo) con i placeholder al posto delle PII e il layout
   intatto; altrimenti (testo incollato, `.md`/`.txt`) si **ricostruisce** un PDF impaginando da zero
   il solo testo anonimizzato.
   **Il dizionario non viaggia sulla rete in nessuna direzione**: `/pdf` prende lo stesso input di
   `/analyze`, richiama `analyze(..., mapping_enabled=True)` internamente e la mappa muore con la
-  richiesta. Per questo il bottone funziona identico anche con il **dizionario reversibile
-  disattivato**, dove il client non ne ha nessuno (il costo è una seconda inferenza).
+  richiesta. Per questo la redazione funziona identica anche con il **dizionario reversibile
+  disattivato**, dove il chiamante non ne ha nessuno (il costo è una seconda inferenza).
   Matching **char-preciso** con confini di parola (indice per carattere da `rawdict` + regex ancorate
   `(?<!\w)…(?!\w)`), tollerante alla **sillabazione a fine riga** e agli spazi tra token: "DE" non
   viene redatto dentro "CORDELLA". Unica eccezione alle ancore: se il valore ha **punteggiatura ai
   bordi** il modello ha tagliato a metà una parola spezzata a fine riga (su "Fran-\ncesco Cordella"
-  etichetta `-\ncesco Cordella`) — lì il confine di parola è proprio ciò che impedirebbe di trovarlo,
+  etichetta `-\ncesco Cordella`), dove il confine di parola impedirebbe di trovarlo,
   quindi si toglie, ma **solo** se il resto ha ≥ 4 caratteri alfanumerici (altrimenti `.it`
   matcherebbe "it" dentro ogni parola).
   Oltre al testo di pagina ripulisce ciò che `apply_redactions()` **non** tocca e in cui la PII
   sopravviverebbe: metadati + XMP, contenuto delle **annotazioni**, valore dei **campi modulo**,
   titoli dei **segnalibri**; gli **allegati incorporati** vengono rimossi in blocco.
-  **Due casi in cui un valore resta in chiaro, entrambi segnalati con un avviso nell'UI** (header
-  `X-PII-Residual` e `X-PII-Skipped`): (a) *residui* = valore ancora leggibile nell'output alla
+  **Due casi in cui un valore resta in chiaro, entrambi segnalati negli header della risposta**
+  (`X-PII-Residual` e `X-PII-Skipped`): (a) *residui* = valore ancora leggibile nell'output alla
   verifica finale; (b) *saltati* = valori con < 2 caratteri alfanumerici o di 2 sole cifre (es. "45"),
   non cercabili senza devastare il documento. Se in tutto il PDF non si trova **nessuna** occorrenza
   → `422`, non un PDF "anonimizzato" che non lo è (caso tipico: scansione, serve OCR → punti 2-4
   della issue). Nessuna dipendenza dal modello: `pdf_export.py` è testabile in isolamento.
-- `serve.py` — entry **headless** (solo Flask, niente browser): è il backend dell'app Tauri; log su
-  `%LOCALAPPDATA%\rizzo-pii\backend.log`. Pre-check porta + `sys.exit(76)` se occupata.
-  `desktop_app.py` — entry PyInstaller legacy (apre il browser); stesso pre-check.
-  `assets/` — mascotte (il riccio) + icone. `smoke_app.py`, `make_test_pdf.py`.
+- `serve.py`: entry **headless** adatto a un process manager. `app.py` e `serve.py` servono la
+  stessa API HTTP; nessuno dei due apre una finestra nativa, un browser o pagine statiche.
+  `app.py` scrive su stdout/stderr e controlla la porta dopo aver caricato il modello.
+  `serve.py` scrive in `%LOCALAPPDATA%\rizzo-pii\backend.log` su Windows o `~/rizzo-pii/backend.log`
+  altrove, e controlla la porta prima di importare `app.py`. Entrambi escono con codice 76 se il
+  controllo o il bind finale rileva un conflitto. Restano `smoke_app.py` e `make_test_pdf.py`.
 
-**App desktop Tauri — `tauri/`:** finestra nativa **Rizzo PII** (WebView2) che lancia il backend
-`serve.py` impacchettato come **sidecar** (`build_sidecar.spec` → `tauri/src-tauri/backend/`).
-All'avvio legge `config.json` (host/porta), passa i valori al sidecar via env `PII_HOST`/`PII_PORT`,
-attende il server sulla porta configurata e mostra l'UI. Se il sidecar esce con codice **76** (porta
-occupata), lo splash mostra un form di configurazione (host + porta) con "Salva e riprova": Tauri
-scrive `config.json`, rilancia il sidecar e riprova. Splash con badge UE/GDPR + versione. `npx tauri build`
-→ installer NSIS per-utente. Dettagli e comandi in `docs/BUILD.md`. Comandi Tauri esposti allo splash:
-`save_config(host, port)` e `retry_backend`.
-
-**Config:** `.env` (segreti W&B, **gitignorato**), `.gitignore`, `build.spec`/`build_sidecar.spec`/
-`installer.iss` + `tauri/` (packaging).
-**Artefatti non versionati** (gitignored): `dataset/`, `models/`, `experiments/`, `wandb/`, `build_env/`,
-`dist/`, `build/`, `tauri/node_modules/`, `tauri/src-tauri/{target,gen,backend}/`.
+**Config:** `.env` (segreti W&B, **gitignorato**) e `.gitignore` (protegge credenziali, vecchi
+output di build e snapshot di stato locali).
+**Artefatti non versionati** (gitignored): `dataset/`, `models/`, `experiments/`, `wandb/`,
+`build_env/`, `dist/`, `build/`.
 
 ## Idea architetturale chiave: "LLM autore, codice etichettatore"
 
@@ -184,17 +243,19 @@ dato reale da nessuna parte → vengono solo dai sintetici.
 ## Fonti dati (dettaglio in DATASET.md)
 
 Quattro fonti, tutte ricondotte ai 22 tag al caricamento:
-1. **Ai4Privacy** `open-pii-masking-500k` — reale, **8 lingue**, ~464k righe train (it ~55k).
+
+1. **Ai4Privacy** `open-pii-masking-500k`, reale, **8 lingue**, ~464k righe train (it ~55k).
    `hf download ai4privacy/open-pii-masking-500k-ai4privacy`. Ha `mbert_tokens`+`mbert_token_classes`.
-2. **Sintetico da template** — `generate_synthetic_pii.py`, 200k righe, copre i tag legali IT.
-3. **Augment** — `augment_real_pii.py`, 40k, entità sintetiche in frasi reali it.
-4. **DeepMount** `DeepMount00/pii-masking-ita` — Faker IT, 41k; dà contesto reale a IBAN/ORG/AMOUNT/TARGA.
+2. **Sintetico da template**: `generate_synthetic_pii.py`, 200k righe, copre i tag legali IT.
+3. **Augment**: `augment_real_pii.py`, 40k, entità sintetiche in frasi reali it.
+4. **DeepMount** `DeepMount00/pii-masking-ita`, Faker IT, 41k; dà contesto reale a IBAN/ORG/AMOUNT/TARGA.
 
 Train pool ≈ **745k righe** (multilingue; italiano rinforzato al ~45%). ~38% sintetico.
 
-## Validation: UNA validation reale unificata
+## Validation: una validation reale unificata
 
 `validation_real.jsonl` (7k righe, **solo italiano**, da `build_validation.py`):
+
 - base reale held-out = Ai4Privacy val (it) + DeepMount test;
 - i 5 tag senza dato reale sono **iniettati in frasi reali held-out** (frasi della validation
   Ai4, non nel training) → contesto reale, niente leakage.
@@ -262,7 +323,7 @@ python src/training/train_pii.py --type full --version 1.2.0  # oppure versione 
 
 # inferenza / app
 python src/training/test_pii.py "Mi chiamo Mario Rossi, IBAN ..."
-python src/app/app.py            # http://127.0.0.1:5005  (PII_PORT per override; 5000 = AirPlay su macOS)
+python src/app/app.py            # API su http://127.0.0.1:5005  (PII_PORT per override; 5000 = AirPlay su macOS)
 
 # ispezione read-only
 python src/inspect/inspect_ai4privacy.py

@@ -1,17 +1,16 @@
 # ============================================================================
-# Rizzo PII — webapp (server Flask + UI) in un container.
+# Rizzo PII: API (server Flask, nessuna UI) in un container.
 #
 # L'immagine e' AUTOSUFFICIENTE: dentro ci sono le dipendenze CPU e il modello
 # scaricato da Hugging Face in fase di build. A runtime NON esce nulla verso
-# internet (HF_HUB_OFFLINE=1): e' lo stesso patto dell'app desktop, i documenti
-# non lasciano la macchina.
+# internet (HF_HUB_OFFLINE=1): i documenti non lasciano la macchina.
 #
 #   docker build -t rizzo-pii .
 #   docker run --rm -p 5005:5005 rizzo-pii        # -> http://127.0.0.1:5005
 #
-# NB: e' un'immagine CPU. Per la GPU servirebbe il torch cu128 + nvidia-runtime;
-# per l'inferenza su un documento la CPU basta (vedi README, sezione Deployment).
-# Per la build dei bundle Linux (.deb/.AppImage) c'e' Dockerfile.linux, altra cosa.
+# NB: e' un'immagine CPU per il servizio Flask servito da gunicorn. Per la GPU
+# servirebbe il torch cu128 + nvidia-runtime; per l'inferenza su un documento
+# la CPU basta (vedi README, sezione "Run the app").
 # ============================================================================
 FROM python:3.11-slim AS base
 
@@ -32,7 +31,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # torch e transformers PINNATI alle versioni con cui l'immagine e' stata verificata:
 # senza pin la stessa build fra sei mesi tira una major diversa e "funzionava ieri"
 # diventa un bug da riprodurre. Per aggiornarli: alza i numeri e ricostruisci.
-# (NB: transformers 5.x qui, mentre Dockerfile.linux resta sul 4.57.3 di PyInstaller.)
 RUN pip install --upgrade pip \
  && pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.13.0" \
  && pip install "transformers==5.14.1" tokenizers safetensors flask pymupdf gunicorn huggingface_hub
@@ -49,12 +47,12 @@ allow_patterns=['*.json','*.safetensors','*.txt','*.model'])"
 
 # --- applicazione ------------------------------------------------------------
 # Solo src/app: il resto della repo (training, data pipeline, dataset) non serve
-# a servire l'app e ogni file in piu' e' un layer che si invalida per niente.
+# a servire l'API e ogni file in piu' e' un layer che si invalida per niente.
 WORKDIR /app
 COPY src/app/ /app/src/app/
 
 # utente non-root; la home deve essere scrivibile perche' server_config scrive
-# config.json/prefs.json in ~/.local/share/rizzo-pii (preferenze dell'UI).
+# config.json/prefs.json in ~/.local/share/rizzo-pii (preferenze legacy dell'API).
 RUN useradd --create-home --uid 10001 app && chown -R app:app /app
 USER app
 ENV HOME=/home/app

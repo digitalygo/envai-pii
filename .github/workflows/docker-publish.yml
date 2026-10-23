@@ -1,0 +1,401 @@
+name: docker-publish
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-publish-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    name: Test suite
+    uses: ./.github/workflows/tests.yml
+
+  publish:
+    name: Publish the GPU image to GHCR
+    needs: tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: "3.13"
+
+      - name: Check the required Dockerfiles
+        run: python3 .github/scripts/registry_publish.py check-dockerfiles
+
+      - name: Validate the release source
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          RELEASE_DRAFT: ${{ github.event.release.draft }}
+          RELEASE_ACTION: ${{ github.event.action }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          peeled_sha="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          python3 .github/scripts/registry_publish.py validate-source \
+            --tag "$RELEASE_TAG" \
+            --prerelease "$RELEASE_PRERELEASE" \
+            --draft "$RELEASE_DRAFT" \
+            --action "$RELEASE_ACTION" \
+            --event-sha "$EVENT_SHA" \
+            --peeled-sha "$peeled_sha"
+
+      - name: Plan the tag set
+        id: plan
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          python3 .github/scripts/registry_publish.py plan \
+            --release-tag "$RELEASE_TAG" \
+            --prerelease "$RELEASE_PRERELEASE" \
+            --sha "$EVENT_SHA"
+
+      - name: Resolve the image reference
+        id: image
+        run: |
+          image_ref="ghcr.io/${GITHUB_REPOSITORY,,}"
+          case "$image_ref" in
+            ghcr.io/*/*) ;;
+            *) echo "::error::Resolved image reference is not a GHCR repository"; exit 1 ;;
+          esac
+          echo "ref=$image_ref" >> "$GITHUB_OUTPUT"
+
+      - name: Reclaim runner disk space
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]; then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost
+          fi
+          available="$(df --output=avail -B1 / | tail -n 1 | tr -d ' ')"
+          budget="$((30 * 1024 * 1024 * 1024))"
+          if (( available < budget )); then
+            echo "::error::Free disk space is ${available} bytes, below the 30 GiB budget"
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          context: .
+          file: ./Dockerfile.gpu
+          platforms: linux/amd64
+          outputs: type=image,name=${{ steps.image.outputs.ref }},push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=false
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.plan.outputs.version }}
+          cache-from: type=gha,scope=gpu
+          cache-to: type=gha,mode=min,scope=gpu
+          provenance: false
+          sbom: false
+
+      - name: Persist build metadata
+        env:
+          BUILD_METADATA: ${{ steps.build.outputs.metadata }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$BUILD_METADATA" ]]; then
+            echo "::error::The build step produced no metadata output"
+            exit 1
+          fi
+          printf '%s' "$BUILD_METADATA" > "$RUNNER_TEMP/build-metadata.json"
+
+      - name: Validate the pushed digest
+        id: digest
+        env:
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+          PLATFORM: linux/amd64
+        run: |
+          python3 .github/scripts/registry_publish.py validate-build \
+            --metadata "$RUNNER_TEMP/build-metadata.json" \
+            --platform "$PLATFORM" \
+            --expected "$BUILD_DIGEST"
+
+      - name: Validate the exact remote manifest and config
+        id: remote
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          ref="${IMAGE_REF}@${DIGEST}"
+          docker buildx imagetools inspect "$ref" --raw > "$RUNNER_TEMP/remote-manifest.json"
+          docker buildx imagetools inspect "$ref" --format '{{json .Image}}' > "$RUNNER_TEMP/remote-config.json"
+          python3 .github/scripts/registry_publish.py validate-remote \
+            --manifest "$RUNNER_TEMP/remote-manifest.json" \
+            --config "$RUNNER_TEMP/remote-config.json" \
+            --digest "$DIGEST"
+
+      - name: Scan the remote digest with Trivy
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/trivy/cache" "$RUNNER_TEMP/trivy/out"
+          docker run --rm \
+            --memory 4g \
+            --cpus 2 \
+            --user "$(id -u):$(id -g)" \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --read-only \
+            --tmpfs /tmp \
+            -e HOME=/tmp \
+            -e TRIVY_USERNAME \
+            -e TRIVY_PASSWORD \
+            -e TRIVY_CACHE_DIR=/cache \
+            -v "$RUNNER_TEMP/trivy/cache:/cache" \
+            -v "$RUNNER_TEMP/trivy/out:/out" \
+            ghcr.io/aquasecurity/trivy:0.76.1@sha256:2e6c00d711ab4ae41d8a30c2c1fd3bd3b62704c177bb120f95012e939edfb3df \
+            image --image-src remote --scanners vuln,secret \
+            --format json --output /out/trivy.json --exit-code 0 --timeout 10m \
+            "${IMAGE_REF}@${DIGEST}"
+
+      - name: Evaluate the scan gate
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          IMAGE_ID: ${{ steps.remote.outputs.config_digest }}
+        run: |
+          python3 .github/scripts/scan_gate.py evaluate \
+            --trivy "$RUNNER_TEMP/trivy/out/trivy.json" \
+            --artifact "${IMAGE_REF}@${DIGEST}" \
+            --image-id "$IMAGE_ID"
+
+      - name: Delete the scan report
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/trivy"
+
+      - name: Inspect existing tags
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+          TAGS: ${{ steps.plan.outputs.tags }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tags"
+          printf '%s\n' "$TAGS" | sed '/^[[:space:]]*$/d' > "$RUNNER_TEMP/tags.txt"
+          if [[ ! -s "$RUNNER_TEMP/tags.txt" ]]; then
+            echo "::error::The tag plan is empty"
+            exit 1
+          fi
+          while IFS= read -r tag; do
+            if [[ -z "$tag" ]]; then
+              continue
+            fi
+            if docker buildx imagetools inspect "${IMAGE_REF}:${tag}" --format '{{.Manifest.Digest}}' \
+              > "$RUNNER_TEMP/tags/${tag}.digest" 2> "$RUNNER_TEMP/tags/${tag}.stderr"; then
+              echo "0" > "$RUNNER_TEMP/tags/${tag}.status"
+              if ! docker buildx imagetools inspect "${IMAGE_REF}:${tag}" --format '{{json .Image}}' \
+                > "$RUNNER_TEMP/tags/${tag}.config" 2> "$RUNNER_TEMP/tags/${tag}.config.stderr"; then
+                rm -f "$RUNNER_TEMP/tags/${tag}.config"
+              fi
+            else
+              echo "1" > "$RUNNER_TEMP/tags/${tag}.status"
+            fi
+          done < "$RUNNER_TEMP/tags.txt"
+
+      - name: Preflight tag conflicts
+        id: preflight
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          python3 .github/scripts/registry_publish.py preflight \
+            --expected "$DIGEST" \
+            --image "$IMAGE_REF" \
+            --release-tag "$RELEASE_TAG" \
+            --prerelease "$RELEASE_PRERELEASE" \
+            --sha "$EVENT_SHA" \
+            --inspect-dir "$RUNNER_TEMP/tags"
+
+      - name: Promote the scanned digest
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          CREATE_TAGS: ${{ steps.preflight.outputs.create_tags }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$CREATE_TAGS" | sed '/^[[:space:]]*$/d' > "$RUNNER_TEMP/create-tags.txt"
+          if [[ ! -s "$RUNNER_TEMP/create-tags.txt" ]]; then
+            echo "All planned tags already resolve to the scanned digest"
+            exit 0
+          fi
+          while IFS= read -r tag; do
+            if [[ -z "$tag" ]]; then
+              continue
+            fi
+            docker buildx imagetools create \
+              --prefer-index=false \
+              --tag "${IMAGE_REF}:${tag}" \
+              "${IMAGE_REF}@${DIGEST}"
+          done < "$RUNNER_TEMP/create-tags.txt"
+
+      - name: Verify the tags resolve to the scanned digest
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          VERIFY_TAGS: ${{ steps.preflight.outputs.verify_tags }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$VERIFY_TAGS" | sed '/^[[:space:]]*$/d' > "$RUNNER_TEMP/verify-tags.txt"
+          if [[ ! -s "$RUNNER_TEMP/verify-tags.txt" ]]; then
+            echo "::error::No tags were selected for verification"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/verified"
+          while IFS= read -r tag; do
+            if [[ -z "$tag" ]]; then
+              continue
+            fi
+            if docker buildx imagetools inspect "${IMAGE_REF}:${tag}" --format '{{.Manifest.Digest}}' \
+              > "$RUNNER_TEMP/verified/${tag}.digest" 2> "$RUNNER_TEMP/verified/${tag}.stderr"; then
+              echo "0" > "$RUNNER_TEMP/verified/${tag}.status"
+            else
+              echo "1" > "$RUNNER_TEMP/verified/${tag}.status"
+              echo "::error::Tag ${tag} could not be inspected after publication"
+              exit 1
+            fi
+          done < "$RUNNER_TEMP/verify-tags.txt"
+          python3 .github/scripts/registry_publish.py verify-tags \
+            --expected "$DIGEST" \
+            --inspect-dir "$RUNNER_TEMP/verified" \
+            --tags "$RUNNER_TEMP/verify-tags.txt"
+
+      - name: Dispatch to the swarm when configured
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+        env:
+          SWARM_TOKEN: ${{ secrets.SWARM_REPOSITORY_DISPATCH_TOKEN }}
+          SWARM_REPOSITORY: ${{ vars.SWARM_REPOSITORY }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+        with:
+          script: |
+            const token = process.env.SWARM_TOKEN;
+            const repository = process.env.SWARM_REPOSITORY;
+            if (!token || !repository) {
+              return;
+            }
+            if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) {
+              return;
+            }
+            const [owner, repo] = repository.split('/');
+            try {
+              const response = await fetch(
+                `https://api.github.com/repos/${owner}/${repo}/dispatches`,
+                {
+                  method: 'POST',
+                  signal: AbortSignal.timeout(30000),
+                  headers: {
+                    Accept: 'application/vnd.github+json',
+                    Authorization: `Bearer ${token}`,
+                    'Content-Type': 'application/json',
+                    'X-GitHub-Api-Version': '2022-11-28',
+                  },
+                  body: JSON.stringify({
+                    event_type: 'renovate-run',
+                    client_payload: {
+                      source_repository: process.env.SOURCE_REPOSITORY,
+                      release_tag: process.env.RELEASE_TAG,
+                      commit_sha: process.env.COMMIT_SHA,
+                      run_id: process.env.RUN_ID,
+                    },
+                  }),
+                },
+              );
+              if ([401, 403, 404].includes(response.status)) {
+                return;
+              }
+              if (!response.ok) {
+                core.warning(`Swarm dispatch failed with HTTP ${response.status}`);
+              }
+            } catch {
+              return;
+            }
+
+  notify:
+    name: Notify kChat
+    needs: [tests, publish]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Send the notification
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+        continue-on-error: true
+        env:
+          KCHAT_WEBHOOK_URL: ${{ secrets.KCHAT_WEBHOOK_URL }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          TESTS_RESULT: ${{ needs.tests.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+        with:
+          script: |
+            const webhook = process.env.KCHAT_WEBHOOK_URL;
+            if (!webhook) {
+              core.info('kChat notification skipped');
+              return;
+            }
+            const success =
+              process.env.TESTS_RESULT === 'success' &&
+              process.env.PUBLISH_RESULT === 'success';
+            const emoji = success ? '✅' : '❌';
+            const outcome = success ? 'success' : 'failure';
+            const message = `${emoji} Docker publish ${outcome}\n\nRepository: ${process.env.REPOSITORY}\nRelease: ${process.env.RELEASE_TAG}\nCommit: ${process.env.COMMIT_SHA}\nOutcome: ${outcome}`;
+            try {
+              const response = await fetch(webhook, {
+                method: 'POST',
+                signal: AbortSignal.timeout(30000),
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: message }),
+              });
+              if (!response.ok) {
+                core.warning(`kChat notification failed with HTTP ${response.status}`);
+              }
+            } catch (error) {
+              core.warning('kChat notification failed');
+            }

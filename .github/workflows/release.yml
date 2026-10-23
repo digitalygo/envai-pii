@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - dev
+      - alpha
+      - beta
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    uses: ./.github/workflows/tests.yml
+    permissions:
+      contents: read
+
+  release:
+    name: Publish release
+    needs: tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Require RELEASE_TOKEN
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          if [ -z "${RELEASE_TOKEN}" ]; then
+            echo "::error::Required secret RELEASE_TOKEN is not configured; release publication never falls back to GITHUB_TOKEN"
+            exit 1
+          fi
+
+      - name: Check out exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Publish release
+        id: publish
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_BRANCH: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          python3 .github/scripts/release.py publish \
+            --repository "${RELEASE_REPOSITORY}" \
+            --branch "${RELEASE_BRANCH}" \
+            --sha "${RELEASE_SHA}" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Report release result
+        env:
+          RELEASED: ${{ steps.publish.outputs.released }}
+          VERSION: ${{ steps.publish.outputs.version }}
+          TAG: ${{ steps.publish.outputs.tag }}
+          REASON: ${{ steps.publish.outputs.reason }}
+        run: |
+          echo "release released=${RELEASED} version=${VERSION} tag=${TAG} reason=${REASON}"

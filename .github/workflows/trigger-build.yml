@@ -1,0 +1,66 @@
+name: Trigger image build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trigger-build-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  trigger:
+    name: Push trigger commit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Require RELEASE_TOKEN
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          if [ -z "${RELEASE_TOKEN}" ]; then
+            echo "::error::Required secret RELEASE_TOKEN is not configured; refusing to fall back to GITHUB_TOKEN"
+            exit 1
+          fi
+
+      - name: Create empty trigger commit
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          TARGET_BRANCH: ${{ github.ref_name }}
+        with:
+          github-token: ${{ secrets.RELEASE_TOKEN }}
+          script: |
+            if (!process.env.RELEASE_TOKEN) {
+              core.setFailed('Required secret RELEASE_TOKEN is not configured; refusing to fall back to GITHUB_TOKEN');
+              return;
+            }
+            const branch = process.env.TARGET_BRANCH;
+            if (!branch) {
+              core.setFailed('TARGET_BRANCH is required');
+              return;
+            }
+            const { owner, repo } = context.repo;
+            const ref = await github.rest.git.getRef({ owner, repo, ref: `heads/${branch}` });
+            const head = ref.data.object.sha;
+            const commit = await github.rest.git.getCommit({ owner, repo, commit_sha: head });
+            const tree = commit.data.tree.sha;
+            const created = await github.rest.git.createCommit({
+              owner,
+              repo,
+              message: 'chore: trigger image build',
+              tree,
+              parents: [head],
+            });
+            await github.rest.git.updateRef({
+              owner,
+              repo,
+              ref: `heads/${branch}`,
+              sha: created.data.sha,
+              force: false,
+            });
+            core.info(`Pushed trigger commit ${created.data.sha} to ${branch}`);

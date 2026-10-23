@@ -1,0 +1,215 @@
+---
+status: completed
+created_at: 2026-10-21
+updated_at: 2026-10-22
+files_edited:
+  - Dockerfile.gpu
+  - src/app/requirements-gpu.txt
+  - src/app/cloud_service.py
+  - src/app/smoke_cloud.py
+  - tests/test_cloud_service.py
+  - tests/test_gpu_image.py
+  - tests/test_smoke_cloud.py
+  - docs/runpod-service.md
+  - README.md
+  - docs/CHANGELOG.md
+  - AGENTS.md
+  - .github/CODEOWNERS
+  - .github/renovate.json
+  - .github/scripts/release.py
+  - .github/scripts/registry_publish.py
+  - .github/scripts/scan_gate.py
+  - .github/workflows/tests.yml
+  - .github/workflows/release.yml
+  - .github/workflows/docker-publish.yml
+  - .github/workflows/trigger-build.yml
+  - tests/test_ci_config.py
+  - tests/test_ci_release.py
+  - tests/test_ci_publish.py
+  - tests/test_ci_scan.py
+  - docs/ci-release.md
+rationale:
+  - Prepare GPU execution of the existing HTTP service without changing training or the CPU deployment.
+  - Require working CUDA and authenticate the entire cloud API before request bodies or legacy routes are reached.
+  - Provide reproducible direct dependency pins and a synthetic remote verification client.
+  - Complete local image export after disk cleanup and verify the resulting artifact without claiming GPU inference.
+  - Configure the approved Digitalygo release and GHCR automation bundle with scan-before-tag publication and explicit activation prerequisites.
+supporting_docs:
+  - ../research/2026-10-21-runpod-readiness.md
+  - ../../../docs/runpod-service.md
+  - ../../../docs/GUARDRAIL_API.md
+  - ../../../docs/ci-release.md
+---
+
+# RunPod service preparation
+
+## Summary of changes
+
+Created `feature/runpod-service` from `feature/teams-pii-integration` at `0fd115c5dbee905882ef6651dfb3c77a92cb3739`, following the user's explicit instruction to branch from the current checkout. Implemented the service-only GPU container, authenticated cloud entry point, remote smoke client, tests and deployment guide. Training, the existing CPU Dockerfile and Compose deployment, and `src/app/app.py` remain unchanged.
+
+The repository implementation passed quality and focused security review. No image was published and no RunPod resource was provisioned. Final image export and actual GPU inference remain outstanding, as described below; completion here refers to the repository changes, not a deployed service.
+
+## Technical reasoning
+
+The existing engine already supports CUDA and the existing HTTP API already implements the request contracts. Native Pod container execution, Gunicorn and standard-library WSGI/HTTP facilities resolved the deployment requirement without a RunPod SDK, Serverless handler, engine rewrite or new web framework.
+
+- `Dockerfile.gpu` uses the verified `linux/amd64` Python 3.11.17 Bookworm image digest, CUDA PyTorch `2.13.0+cu130` and Transformers `5.14.1`. The latter versions preserve CPU runtime parity rather than introducing unrelated ML upgrades. The cu130 channel was verified against official PyTorch information and installed successfully; the older Blackwell cu128 guidance is not applicable to this torch pin.
+- Direct dependencies are exact-pinned in `src/app/requirements-gpu.txt`. Transitive dependencies and OS package resolution are not locked. The cu130 wheel comes from the official PyTorch index, with remaining requirements resolved separately from PyPI.
+- The v1.5.0 model is included at build time. Offline Hugging Face flags prevent runtime model fetches, but are not an egress firewall. The non-root runtime requires no training assets or model volume.
+- `cloud_service:create_app()` verifies a nonblank token, actual CUDA tensor arithmetic and synchronization, then imports the unchanged app and checks GPU/model readiness. There is no CPU fallback in this entry point.
+- The WSGI wrapper authenticates every non-health request before application routing or body access. Only exact GET/HEAD health probes are anonymous and expose minimal readiness. Responses receive `no-store`; error logging and late WSGI failures are sanitized. HEAD and streaming cleanup retain protocol and resource semantics.
+- Existing legacy functionality remains accessible to authenticated clients. A shared token represents one trusted tenant, not multi-user isolation. Guardrail concurrency remains one request per process; extra Gunicorn threads do not change that lock.
+- `smoke_cloud.py` exercises public readiness, guardrail and legacy authentication, JSON anonymization, seed reuse and multipart aggregation using synthetic values only. It requires HTTPS except literal loopback, refuses redirects, bounds responses and never prints response bodies or credentials.
+
+Implementation was split into bounded runtime, container and smoke tasks with disjoint file ownership, followed by documentation. No competing architecture or algorithm was needed. Two primary implementation calls ended with provider errors after partial writes; fallback writers inspected and completed their own bounded slices without resetting unrelated work.
+
+## Impact assessment
+
+The new image adds authentication and minimal health responses only through its cloud entry point. The existing local entry points and API schemas are unchanged. The pre-existing research note was preserved. No training, taxonomy, dataset, model source, existing tests, workflow, production VPN configuration or unrelated repository was modified. No commit or push was performed.
+
+RunPod deployment requires a compatible NVIDIA host driver for CUDA 13, registry access and a runtime `PII_API_TOKEN` secret. Use the RunPod HTTPS proxy, not public plaintext TCP. The documented 100-second proxy limit is separate from the cooperative application deadline; Gunicorn's gthread worker timeout is not a hard per-request cancellation mechanism.
+
+Only synthetic data was used. Cloud execution processes data before anonymization on provider infrastructure; deployment does not retain the original local-only privacy boundary. Real documents require separate approval of provider, region, access and retention terms.
+
+## Validation steps
+
+The orchestrator inspected implementation files, tests, documentation and the combined worktree delta, and independently executed verification rather than accepting member test claims.
+
+### Deterministic verification
+
+- Baseline standard-library discovery: 458 tests passed, 186 optional-dependency skips.
+- Final discovery in a disposable Python 3.11.16 environment with Flask 3.1.3, PyMuPDF 1.28.2 and Gunicorn 26.2.0: **575 tests passed, no skips**.
+- Branch-aware coverage on the two new executable Python modules: **95% aggregate**, 95% for each module. GPU image tests additionally verify structural deployment contracts; they do not claim real CUDA coverage.
+- A disposable, network-isolated, read-only container using the existing real CPU torch runtime confirmed that the new factory rejects both a missing token and unavailable CUDA before importing the model application. It was removed with `--rm`.
+- The base image digest and architecture were independently inspected. The GPU dependency set resolved and was actually installed during the image build, including successful `pip check`.
+- `git diff --check` passed. Existing tracked runtime, training and CPU deployment files were unchanged.
+
+The final test command was:
+
+```bash
+PYTHONPATH=src/app COVERAGE_FILE=/tmp/envai-pii-runpod.coverage \
+  /tmp/envai-pii-runpod-verify/bin/python -m coverage run --branch \
+  --source=cloud_service,smoke_cloud -m unittest discover -v tests
+```
+
+Local evidence logs are `/tmp/envai-pii-runpod-tests-final.log` and `/tmp/envai-pii-runpod-build.log`. These are ephemeral machine-local evidence, not required repository artifacts. The temporary verification environments are removed at closure.
+
+### Review outcomes
+
+- Initial quality review: **FAIL**, identifying a lazy HEAD error path that did not close the response body. The delegated correction added guaranteed cleanup and nine regression tests, followed by independent full-suite and coverage reruns.
+- Final `quality-gate-a` judgment: **PASS**. A Dockerfile comment was corrected to acknowledge the CUDA userspace dependencies installed by PyTorch. The README documentation-index link was explicitly within the documentation delegation, resolving the review's scope question.
+- Focused `security-review-specialist-a` review and follow-up: **PASS**. No blocking findings remain in the implementation delta.
+- Non-blocking security observation: Gunicorn's pre-WSGI parser/error logs can still include malformed request targets or query strings. The Flask logger filter is not a server-wide or provider-wide logging guarantee. This limitation is disclosed in the deployment guide; secrets must never be carried in URLs.
+
+### Build and GPU limitations
+
+All 18 Dockerfile instructions completed successfully, including dependency installation, model download and CUDA-build/model-file checks. Podman then failed during final image commit with `no space left on device` while exporting `model.safetensors`. Approximately 19 GB was available before the build; **no final GPU image artifact was produced**. The failed build's temporary container was not retained.
+
+There is no local NVIDIA GPU. Actual GPU model inference, GPU memory sizing, RunPod proxy behavior and remote smoke verification were not performed. Build-instruction success and mocked CUDA tests are not evidence that a chosen RunPod GPU/driver combination works.
+
+Next steps are to complete the build on a builder with sufficient free disk, manually publish and record the registry digest, then run the documented synthetic smoke test on a CUDA-compatible Pod. Do not send real personal data or declare the service deployed before those checks.
+
+## Update 2026-10-22: local image build and packaging verification
+
+### Summary of changes
+
+After the user freed disk space, both local build attempts completed all 18 instructions and final image commit. This resolves the image-export blocker recorded above. The user explicitly deferred GitHub Actions automation and GHCR publication to a later step; neither was configured or executed.
+
+Only build-status documentation changed in this follow-up: `docs/runpod-service.md`, `docs/CHANGELOG.md` and this operation. Hash comparisons confirmed the Dockerfiles, application modules, requirements and tests remained byte-identical to the accepted implementation. The branch and HEAD remain unchanged, with all previous work uncommitted and preserved.
+
+### Technical reasoning and artifact identity
+
+The first successful retry used Podman's default OCI format, which emitted a warning and dropped Docker's `HEALTHCHECK` metadata. A second complete build with `--format docker` produced a Docker v2 image and preserved the healthcheck. The deployment guide now specifies that flag for Podman and explicitly omits it for Docker, whose build command does not accept it.
+
+The final local test artifact was:
+
+- Image ID: `19ce644e3037abfb7856f3777383752977a6da26d28c9252cd6afadffb95d591`.
+- Local manifest digest: `sha256:8e5f60a4a31e335d4f3d3a4fce9642df84f24eb6c66ba18d19532b9deee3ca84`. This is not a published GHCR digest.
+- Platform: `linux/amd64`; image format: `application/vnd.docker.distribution.manifest.v2+json`.
+- Local uncompressed image size: 6,592,638,364 bytes, approximately 6.14 GiB. Registry transfer size was not measured.
+- Model weights SHA-256: `b1e046e3aec52c3cd74eaf166b034644a4dac0c91128bf06803e1478657fcd9f`.
+- Runtime: Python 3.11.17, torch 2.13.0+cu130 with CUDA-build version 13.0, Transformers 5.14.1, Flask 3.1.3, PyMuPDF 1.28.2 and Gunicorn 26.2.0.
+
+The verification build used:
+
+```bash
+podman build --format docker --platform linux/amd64 --layers=false \
+  --rm --force-rm --memory 4g --cpu-period 100000 --cpu-quota 200000 \
+  -f Dockerfile.gpu -t localhost/envai-pii-runpod-buildtest-docker:20261022 .
+```
+
+Approximately 56 GB was free before the retry. This is observed capacity, not a minimum-space guarantee for another builder or a GitHub-hosted runner.
+
+### Independent validation
+
+- Inspected the actual image configuration, Docker manifest type, user, command, offline environment, exposed port and preserved healthcheck. No API token was embedded in the environment.
+- Compared SHA-256 of all 15 baked `src/app/*.py` files with the working tree; all matched.
+- Imported the actual ML, web and PDF dependencies and loaded the tokenizer offline in a non-root, read-only, network-isolated container. The model directory, config, tokenizer and weights are root-owned and not group/world writable; the process runs as UID 10001.
+- Loaded the real baked model offline and completed a synthetic EMAIL analysis through the existing v1 Flask endpoint using CPU explicitly in a test entrypoint. The placeholder, dictionary delta and response status matched expectations. This checks packaging and inference compatibility on CPU, not CUDA execution or a cloud CPU fallback.
+- Confirmed native MuPDF privacy capability in the final image. An in-memory PDF text round-trip also passed in the first successful OCI artifact.
+- Verified missing-token and unavailable-CUDA rejection through both the factory and the actual default Gunicorn command. Gunicorn exited with code 3 in both negative tests, with the expected fixed diagnostic and no synthetic token in its captured logs.
+- Ran the repository's full `python -m unittest discover -v tests` command inside the final built image: **575 tests passed, no skips**. The container was network-isolated, read-only, capability-free and resource-bounded, with repository source mounted read-only.
+- `git diff --check` and the pre-build executable-file checksum manifest passed. No executable changes were needed; the prior quality/security gate remains applicable. This documentation-only follow-up does not trigger new automatic quality or security reviews.
+
+Local evidence is recorded in `/tmp/envai-pii-runpod-build-20261022.log`, `/tmp/envai-pii-runpod-build-docker-20261022.log`, `/tmp/envai-pii-runpod-image-docker-20261022.json`, `/tmp/envai-pii-runpod-final-package-20261022.log`, `/tmp/envai-pii-runpod-image-tests-20261022.log` and the two `/tmp/envai-pii-runpod-no-{token,gpu}-20261022.log` files. These are ephemeral evidence, not repository dependencies.
+
+### Impact and remaining boundaries
+
+No NVIDIA GPU is available locally. Real GPU inference, GPU memory sizing and the RunPod HTTPS path still require a later Pod test. The successful build does not satisfy those separate checks. No registry push, real-document upload, provider deployment, training, commit or GitHub Actions workflow change occurred.
+
+Temporary containers and both local test images are removed at closure, together with the base image pulled only for these builds. No unrelated images or services are pruned. The next requested phase is GitHub Actions image building and GHCR storage; its runner disk budget and healthcheck-preserving output format must be addressed when that phase is implemented.
+
+## Update 2026-10-22: GitHub Actions and GHCR configuration
+
+### Summary of changes
+
+The user approved the previously deferred CI and registry phase. Added the mandatory Digitalygo bundle: reusable tests, Conventional Commit releases, release-triggered GPU image publishing, manual empty-chore trigger, Renovate, CODEOWNERS and the shared agent quality baseline. The resulting configuration targets `ghcr.io/digitalygo/envai-pii` and builds only `Dockerfile.gpu`; neither application behavior nor either Dockerfile changed in this phase.
+
+This is verified local configuration, not an activated or successfully executed hosted release chain. No commit, branch push, release creation, registry publication, secret mutation, package visibility change or RunPod deployment occurred.
+
+### Environment and scope decisions
+
+Read-only GitHub inspection confirmed a public repository, Actions enabled, read-only default workflow token permissions and no repository-level secrets. Organization-inherited secrets were not verified: the read-only request for the organization RELEASE_TOKEN metadata returned HTTP 403, and no additional token scopes were requested. The remote still has `main` and `feature/teams-pii-integration`, with no release tags or GitHub releases; `feature/runpod-service` remains local and uncommitted. Existing CLI credentials were not reused as a workflow secret.
+
+The company CI skill requires its complete bundle even for a container-publishing request. This expansion and the required `RELEASE_TOKEN` were disclosed to the user. Existing Python release and registry-validation patterns from trusted sibling repositories informed bounded, separately owned implementation tasks; no sibling repository was modified and no new Node package manifest was introduced.
+
+### Workflow behavior
+
+- The reusable test workflow keeps Python 3.11, 3.13 and 3.14. It installs only the Flask and PyMuPDF pins from the GPU requirements file, then runs unittest discovery. Inline workflow JavaScript tests use Node already present on GitHub-hosted Ubuntu. Its concurrency key includes the caller workflow and ref, preventing an independent main-branch test run from cancelling release validation.
+- Pushes to `dev`, `alpha`, `beta` and `main` run the reusable tests and Python release engine. Conventional Commit rules, highest cumulative bumps, prerelease channels, version collisions, tag-only recovery and same-SHA idempotence are covered. Release success requires observing a published, matching release and validating the tag's commit. Drafts and channel conflicts are never silently accepted as successful publication.
+- Release and trigger workflows require `RELEASE_TOKEN` and fail explicitly if absent. The default `GITHUB_TOKEN` is never a fallback for operations that must trigger downstream workflows. The manual trigger creates only one empty chore commit on the selected branch, without tests or a build in that job.
+- Published releases trigger the GPU publisher. It validates the exact tag/event SHA, builds one `linux/amd64` image and pushes it without tags using the ephemeral workflow token with `packages: write`. Provenance/SBOM indexes are disabled for this single-manifest path, and Docker media types preserve `HEALTHCHECK`.
+- Build metadata, raw remote manifest hash, platform and Trivy image-config identity are bound to the emitted digest. The pinned Trivy container reads the exact remote digest, scanning vulnerabilities and secrets. Any secret, fixable HIGH/CRITICAL finding, failed scan or malformed/incomplete/mismatched report blocks before any tag is created or moved. Unfixed vulnerabilities do not block.
+- Only a passed digest is promoted, without rebuilding. Stable aliases are version, major.minor, major, latest and version-short-SHA. Prereleases receive version, channel and version-short-SHA only. Immutable conflicts fail closed; older releases cannot roll back newer rolling aliases; written tags are checked against the scanned digest.
+- Runner cleanup is limited to fixed, unnecessary SDK directories on GitHub-hosted runners. A 30 GiB free-space preflight fails clearly if insufficient. This is a selected safety budget, not a measured hosted-runner capacity guarantee.
+- Optional kChat notifications begin with the required success/failure emoji and include repository, release, commit and outcome. Optional swarm dispatch occurs only after tag verification; missing or unavailable credentials/targets skip silently. No remote integration was exercised.
+- Renovate groups patch updates per active manager in the Wednesday 11:00-13:00 Europe/Rome window, with `build` package commits and `ci` action commits, CODEOWNERS reviewers and no automerge. The coupled CUDA torch pin is explicitly manual so an automated update cannot drop the cu130 suffix or disagree with the Dockerfile literal. Inline CPU pip pins remain manual.
+
+### Independent verification and review
+
+The orchestrator reviewed the actual workflow/helper files and independently ran:
+
+- Full unittest discovery with real Flask/PyMuPDF: **820 tests passed, no skips on each of Python 3.11.16, 3.13.5 and 3.14.7**. Branch-aware coverage of `.github/scripts` on Python 3.11 measures 99% for the release helper, 93% for the registry helper, 95% for the scan gate, and **97% aggregate**. Coverage includes API and registry fakes, temporary Git repositories, CLI errors, redirect rejection and executed JavaScript dispatch tests.
+- `actionlint` 1.7.12 on all four workflows: PASS.
+- YAML parsing, JSON parsing and full-commit-SHA checks for external actions: PASS.
+- Renovate 44.176.3 configuration validation with `--no-global --strict`: PASS.
+- The remote manifest/config validator against the actual public, digest-pinned Trivy image using Docker Buildx 0.37.0: PASS. This checks the CLI evidence format and digest binding; it is not a scan or publish of envai-pii.
+- Pre-existing executable-file SHA-256 checks and `git diff --check`: PASS. Training, CPU/GPU Dockerfiles, application modules and previous tests were preserved.
+
+Current action pins and Trivy 0.76.1 were researched from official sources, then action tag refs and the Trivy linux/amd64 manifest were independently resolved. No unverified action SHA was invented.
+
+Leader inspection corrected two issues before final review: reusable-workflow concurrency collisions and a release API recovery path that could otherwise mistake a tag for an observed published release. Tests were added rather than weakened. Optional swarm skips were made silent, scan-container isolation was tightened, and the repository baseline now distinguishes model-free unit tests from model-downloading image builds.
+
+A final test-only correction replaced fixed action-SHA and Trivy-version snapshots with immutable-pin and official-repository contracts. Two additional regressions permit valid future pin updates while rejecting mutable, short, malformed or unofficial references; this prevents Renovate updates from failing solely because a test duplicated the old version. All workflow and tool pins remained unchanged, and no test was deleted or skipped.
+
+Final `quality-gate-a` verdict, including the test-only follow-up: **PASS**. Focused `security-review-specialist-a` verdict: **PASS**, with no blocking findings in the CI delta. The security review did not substitute for a live hosted run. Non-blocking observations concern future-proofing output delimiters and deeper manifest-shape checks, not a demonstrated bypass of the bound single-platform scan.
+
+Evidence logs: `/tmp/envai-pii-ghcr-tests.log`, `/tmp/envai-pii-ghcr-tests313.log`, `/tmp/envai-pii-ghcr-tests314.log`, `/tmp/envai-pii-ghcr.coverage`, `/tmp/envai-pii-ghcr-renovate-validator.log`, `/tmp/envai-pii-ghcr-live-manifest.json`, `/tmp/envai-pii-ghcr-live-config.json` and `/tmp/envai-pii-ghcr-preexisting.sha256`. These are temporary local audit artifacts, not build dependencies.
+
+### Activation boundary and next action
+
+Configure a dedicated `RELEASE_TOKEN` with repository content write permission, or verify an appropriately scoped organization secret is inherited. Never paste its value in chat or automatically copy the local CLI token. Introduce the automation on a releasing branch with `[skip ci]` in the landing commit, verify that no accidental release is created, then intentionally trigger the first release. The branch itself must first be committed and pushed with user approval.
+
+GHCR uses `GITHUB_TOKEN`; an existing package may need repository Actions write access. Package visibility is not changed by this configuration. A private package requires separate read-only registry credentials in RunPod. Renovate app access also remains to be verified by an administrator.
+
+Live release triggering, GHCR authorization, remote scanning of the actual GPU image, tag promotion, hosted disk headroom, optional notifications/dispatch, Renovate app operation and RunPod GPU inference remain unverified until activation. No runtime or security outcome for those external systems is claimed here.

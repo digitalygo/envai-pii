@@ -1,6 +1,6 @@
 # envai-pii
 
-`envai-pii` is the [digitalygo fork](https://github.com/digitalygo/envai-pii) of [`rizzo-pii`](https://github.com/Rizzo-AI-Academy/rizzo-pii), the Italian legal PII anonymizer created upstream by Simone Rizzo and Rizzo AI Academy. This fork keeps training, the HTTP API service with its PDF workflows, and guardrail API v1. It removes desktop packaging and release targets, and the service no longer ships a browser UI. Supported deployments are Python from source and the container built from `Dockerfile`.
+`envai-pii` is the [digitalygo fork](https://github.com/digitalygo/envai-pii) of [`rizzo-pii`](https://github.com/Rizzo-AI-Academy/rizzo-pii), the Italian legal PII anonymizer created upstream by Simone Rizzo and Rizzo AI Academy. This fork keeps training, the HTTP API service with its PDF workflows, and guardrail API v1. It removes desktop packaging and release targets, and the service no longer ships a browser UI. Supported deployments are Python from source, the CPU container built from `Dockerfile`, and the GPU service container built from `Dockerfile.gpu`.
 
 The upstream [rizzo-pii:0.3B model](https://huggingface.co/rizzoaiacademy/rizzo-pii-0.3B) uses the multilingual [mmBERT-base backbone](https://huggingface.co/jhu-clsp/mmBERT-base). It predicts 22 categories; the application adds two regex-only categories. See the [tag taxonomy](docs/TASSONOMIA_TAG.md) for the complete list and mapping decisions.
 
@@ -24,6 +24,10 @@ podman rm -f envai-pii
 ```
 
 Replace `podman` with `docker` when using Docker. Bind the published port to loopback as shown: the service listens on `0.0.0.0` inside the container, so publishing `5005:5005` can expose it to the LAN. The image build needs network access to download dependencies and model weights. `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` are set at runtime. The checked-in `docker-compose.yml` is a legacy service deployment and does not pass `PII_API_TOKEN`.
+
+### Run on a GPU container (RunPod)
+
+`Dockerfile.gpu` builds a `linux/amd64` GPU service image with model revision v1.5.0 baked in (`HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` disable Hugging Face runtime fetches, not network egress), `torch==2.13.0+cu130`, `transformers==5.14.1`, and exact runtime pins from `src/app/requirements-gpu.txt` for NVIDIA hosts with CUDA 13 driver support. It starts Gunicorn on `src/app/cloud_service.py` (`cloud_service:create_app()`), which fails closed unless `PII_API_TOKEN` is set and the model loads on CUDA, sets `Cache-Control: no-store` on all responses, enforces Bearer authentication across all routes (including legacy routes) with only `GET`/`HEAD` on `/health` and `/healthz` exempt from authentication, and leaves local CPU entry points (`app.py`, `serve.py`, `Dockerfile`) unchanged. See the [CI, release, and GHCR publishing guide](docs/ci-release.md) for automated GHCR image publication and the [RunPod GPU service guide](docs/runpod-service.md) for manual GHCR publishing, RunPod Pod and secret setup, the synthetic remote check in `src/app/smoke_cloud.py`, and privacy and cost precautions.
 
 ### Run from source
 
@@ -202,7 +206,11 @@ Full runs write models to `models/rizzo-pii-0.3B-v{VERSION}/`, artifacts to `exp
 python -m unittest discover -v tests
 ```
 
-GitHub Actions runs discovery on Python 3.11, 3.13, and 3.14 without installing torch or model weights. Tests that need optional Flask or PyMuPDF are skipped when unavailable. CI tests logic and contracts, not model accuracy.
+GitHub Actions (`.github/workflows/tests.yml`) runs discovery on Python 3.11, 3.13, and 3.14, installing only the pinned `flask` and `pymupdf` wheels from `src/app/requirements-gpu.txt` so the API and PDF suites run against a mocked model without downloading PyTorch, model weights, or datasets. Tests that inspect the inline JavaScript in `.github/workflows/*.yml` also use `node` (preinstalled on `ubuntu-latest`). CI tests logic, contracts, and workflow helper behavior, not model accuracy.
+
+### CI, releases, and GHCR publishing
+
+Pushes to `dev`, `alpha`, `beta`, and `main` run `.github/workflows/release.yml`, which calls the reusable test suite and computes Semantic Versioning releases from Conventional Commits via `.github/scripts/release.py` (using `RELEASE_TOKEN`). Published releases trigger `.github/workflows/docker-publish.yml`, which builds `Dockerfile.gpu` (`linux/amd64`) for the exact release commit, pushes the untagged image by digest to `ghcr.io/digitalygo/envai-pii`, scans that remote digest with Trivy (`vuln,secret`), and promotes version and channel tags only after the scan gate passes. Manual builds can be triggered via `.github/workflows/trigger-build.yml`, and `.github/renovate.json` schedules weekly dependency updates. See the [CI, release, and GHCR guide](docs/ci-release.md) for secret setup, the `[skip ci]` bootstrap procedure, and GHCR package settings.
 
 ## Historical upstream results
 
@@ -245,6 +253,8 @@ Generated `dataset/`, `models/`, `experiments/`, and `wandb/` directories are ig
 - [Tag taxonomy](docs/TASSONOMIA_TAG.md)
 - [Dataset contribution format](docs/FORMATO_DATI.md)
 - [Guardrail API contract](docs/GUARDRAIL_API.md) and [OpenAPI schema](docs/guardrail-openapi.yaml)
+- [RunPod GPU service guide](docs/runpod-service.md)
+- [CI, release, and GHCR publishing guide](docs/ci-release.md)
 - [TARGA generation notes](docs/targa_generation_notes.md)
 - [Change log](docs/CHANGELOG.md)
 - [Historical upstream v2.0.0 notes](docs/releases/v2.0.0.md)

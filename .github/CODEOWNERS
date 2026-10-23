@@ -1,0 +1,32 @@
+# CODEOWNERS file - ordered from specific to general patterns
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default
+* @lorenzocamporesi
+
+# Markdown files
+*.md @lucanori @lorenzocamporesi
+
+# GitHub configuration
+.github/** @lucanori
+
+# Docker-related files
+Dockerfile @lucanori
+Dockerfile.gpu @lucanori
+docker* @lucanori
+.docker* @lucanori
+
+# Environment files
+.env* @lucanori
+
+# Markdownlint configuration
+.markdownlint* @lucanori
+
+# Release configuration
+.releaserc.json @lucanori
+
+# Documentation
+docs/** @lucanori
+substrate/directives/** @lucanori
+substrate/expectations/** @lucanori
+substrate/traces/**

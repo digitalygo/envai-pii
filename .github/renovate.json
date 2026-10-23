@@ -1,0 +1,109 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "enabledManagers": [
+    "pip_requirements",
+    "dockerfile",
+    "docker-compose",
+    "github-actions"
+  ],
+  "timezone": "Europe/Rome",
+  "schedule": [
+    "* 11-12 * * 3"
+  ],
+  "semanticCommits": "enabled",
+  "reviewersFromCodeOwners": true,
+  "automerge": false,
+  "platformAutomerge": false,
+  "pinDigests": true,
+  "pip_requirements": {
+    "managerFilePatterns": [
+      "/(^|\\/)requirements\\.txt$/",
+      "/(^|\\/)src\\/app\\/requirements-gpu\\.txt$/"
+    ]
+  },
+  "dockerfile": {
+    "managerFilePatterns": [
+      "/(^|\\/)Dockerfile(?:\\.[^/]+)?$/"
+    ]
+  },
+  "docker-compose": {
+    "managerFilePatterns": [
+      "/(^|\\/)docker-compose\\.ya?ml$/"
+    ]
+  },
+  "github-actions": {
+    "managerFilePatterns": [
+      "/(^|\\/)\\.github\\/workflows\\/[^/]+\\.ya?ml$/"
+    ]
+  },
+  "packageRules": [
+    {
+      "matchManagers": [
+        "pip_requirements"
+      ],
+      "matchUpdateTypes": [
+        "patch"
+      ],
+      "groupName": "pip requirements patch updates",
+      "groupSlug": "pip-requirements-patch"
+    },
+    {
+      "matchManagers": [
+        "dockerfile"
+      ],
+      "matchUpdateTypes": [
+        "patch"
+      ],
+      "groupName": "Dockerfile patch updates",
+      "groupSlug": "dockerfile-patch"
+    },
+    {
+      "matchManagers": [
+        "docker-compose"
+      ],
+      "matchUpdateTypes": [
+        "patch"
+      ],
+      "groupName": "Docker Compose patch updates",
+      "groupSlug": "docker-compose-patch"
+    },
+    {
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchUpdateTypes": [
+        "patch"
+      ],
+      "groupName": "GitHub Actions patch updates",
+      "groupSlug": "github-actions-patch"
+    },
+    {
+      "matchManagers": [
+        "pip_requirements",
+        "dockerfile",
+        "docker-compose"
+      ],
+      "semanticCommitType": "build",
+      "semanticCommitScope": "packages"
+    },
+    {
+      "matchManagers": [
+        "github-actions"
+      ],
+      "semanticCommitType": "ci",
+      "semanticCommitScope": "github-actions"
+    },
+    {
+      "matchManagers": [
+        "pip_requirements"
+      ],
+      "matchFileNames": [
+        "src/app/requirements-gpu.txt"
+      ],
+      "matchPackageNames": [
+        "torch"
+      ],
+      "enabled": false
+    }
+  ]
+}

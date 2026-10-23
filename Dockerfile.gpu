@@ -1,0 +1,90 @@
+# ============================================================================
+# Rizzo PII: API on NVIDIA GPUs (RunPod and compatible hosts).
+#
+# Build from the repository root so the pinned requirements and app files are
+# selected explicitly while .dockerignore keeps the context limited to src/app:
+#   podman build --platform linux/amd64 -f Dockerfile.gpu -t envai-pii:gpu .
+#
+# CUDA userspace dependencies come from the pinned cu130 PyTorch wheel and its
+# package dependencies. The NVIDIA host driver and its CUDA 13 support come
+# from the host; this image installs no NVIDIA driver.
+#
+# No SSH daemon is installed. RunPod HTTPS access needs an authenticated
+# wrapper or a tunnel: do not publish the Gunicorn port directly.
+#
+# PII_API_TOKEN is a runtime secret enforced by cloud_service:create_app().
+# It is never a build argument and never copied from a .env file.
+# ============================================================================
+# Digest resolved with podman manifest inspect: amd64 manifest of the
+# multi-arch python:3.11.17-slim-bookworm tag.
+FROM python:3.11.17-slim-bookworm@sha256:8fb0b110b022c70cbe09d3ff1fb313654f31f9c814abb0d48180af56d906a199
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HUB_DISABLE_TELEMETRY=1
+
+# libgomp1: OpenMP runtime used by the torch CPU kernels.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates libgomp1 \
+ && rm -rf /var/lib/apt/lists/*
+
+# Install CUDA torch from its official index only, then resolve the remaining
+# direct and transitive requirements from PyPI. pip check validates the result.
+COPY src/app/requirements-gpu.txt /tmp/requirements-gpu.txt
+RUN pip install --no-cache-dir --no-deps \
+      --index-url https://download.pytorch.org/whl/cu130 \
+      "torch==2.13.0+cu130" \
+ && pip install --no-cache-dir \
+      --index-url https://pypi.org/simple \
+      -r /tmp/requirements-gpu.txt \
+ && pip check \
+ && rm -f /tmp/requirements-gpu.txt
+
+# Model snapshot at a fixed path. The repository and revision are build
+# arguments, but the destination and runtime PII_MODEL_DIR stay fixed, so the
+# factory can find an overridden model without guessing its directory name.
+ARG MODEL_REPO=rizzoaiacademy/rizzo-pii-0.3B
+ARG MODEL_REVISION=v1.5.0
+ENV PII_MODEL_DIR=/app/models/rizzo-pii-0.3B-v1.5.0
+
+RUN mkdir -p "${PII_MODEL_DIR}" \
+ && MODEL_REPO="${MODEL_REPO}" \
+    MODEL_REVISION="${MODEL_REVISION}" \
+    MODEL_DIR="${PII_MODEL_DIR}" \
+    HF_HOME=/tmp/hf \
+    python -c "import os; from huggingface_hub import snapshot_download; snapshot_download(repo_id=os.environ['MODEL_REPO'], revision=os.environ['MODEL_REVISION'], local_dir=os.environ['MODEL_DIR'], allow_patterns=['*.json', '*.safetensors', '*.txt', '*.model'])" \
+ && rm -rf /tmp/hf
+
+# Build-time checks only. The builder has no GPU, so this must not call
+# torch.cuda.is_available() nor import the application factory: a CUDA build
+# and a complete model snapshot are the properties that can be verified here.
+RUN python -c "import json, os, pathlib, torch; d=pathlib.Path(os.environ['PII_MODEL_DIR']); assert (d / 'config.json').is_file(), d; json.loads((d / 'config.json').read_text(encoding='utf-8')); assert any(d.glob('*.safetensors')), d; assert torch.version.cuda and torch.version.cuda.startswith('13.'), torch.version.cuda"
+
+# Only src/app is copied. The model stays root-owned and readable: no
+# recursive chown over the multi-gigabyte model layer.
+WORKDIR /app
+RUN useradd --create-home --uid 10001 app
+COPY --chown=app:app src/app/*.py /app/src/app/
+
+USER app
+ENV HOME=/home/app \
+    PII_HOST=0.0.0.0 \
+    PII_PORT=5005 \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
+
+EXPOSE 5005
+
+# Readiness plus GPU: /health returns 200 only when the model is loaded, and
+# device must be cuda. Stdlib only, no curl or wget in the image.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+  CMD python -c "import json, os, sys, urllib.request; r=urllib.request.urlopen(f\"http://127.0.0.1:{os.environ['PII_PORT']}/health\", timeout=4); p=json.load(r); sys.exit(0 if r.status == 200 and p.get('model_loaded') is True and p.get('device') == 'cuda' else 1)"
+
+# One worker keeps one model copy on the GPU; four threads serve requests. No
+# --preload: the factory runs in the worker and can fail closed on token or GPU
+# errors. --timeout 600 is Gunicorn's worker liveness budget, not a hard
+# per-request deadline for gthread workers, so a proxy timeout must sit above
+# PII_ANALYSIS_TIMEOUT_SECONDS plus upload and native PDF margin. Access logs
+# are intentionally disabled because requests can carry personal data.
+CMD ["sh", "-c", "exec gunicorn --chdir /app/src/app --bind \"${PII_HOST}:${PII_PORT}\" --worker-class gthread --workers 1 --threads 4 --timeout 600 --graceful-timeout 30 --access-logfile /dev/null --error-logfile - 'cloud_service:create_app()'"]

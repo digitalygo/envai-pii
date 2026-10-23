@@ -7,18 +7,19 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: tests-${{ github.ref }}
+  group: tests-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   unittest:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -26,17 +27,45 @@ jobs:
         python-version: ["3.11", "3.13", "3.14"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: ${{ matrix.python-version }}
 
-      # Nessun pip install: la suite in tests/ gira sulla sola libreria
-      # standard. I generatori di dati (src/data_pipeline/) non hanno
-      # dipendenze e src/app/detectors.py non importa torch/transformers/fitz,
-      # quindi la rete regex+checksum e' verificabile senza il modello.
-      # Installare torch qui costerebbe minuti e gigabyte per zero copertura
-      # in piu': l'inferenza del modello non e' sotto test.
+      # La suite usa Flask e PyMuPDF veri e un modello finto: si installano solo
+      # i pin flask/pymupdf letti da src/app/requirements-gpu.txt. torch e
+      # transformers restano fuori perche' l'inferenza non e' sotto test.
+      - name: Install light runtime dependencies
+        run: |
+          python - "$RUNNER_TEMP/test-requirements.txt" <<'PY'
+          import pathlib
+          import sys
+
+          source = pathlib.Path("src/app/requirements-gpu.txt")
+          if not source.is_file():
+              raise SystemExit(
+                  "src/app/requirements-gpu.txt is missing: CI requires the approved GPU runtime manifest"
+              )
+          pins = {}
+          for line in source.read_text(encoding="utf-8").splitlines():
+              candidate = line.strip()
+              for package in ("flask", "pymupdf"):
+                  if candidate.startswith(f"{package}=="):
+                      pins[package] = candidate
+          if set(pins) != {"flask", "pymupdf"}:
+              raise SystemExit(
+                  "src/app/requirements-gpu.txt must pin flask and pymupdf"
+              )
+          pathlib.Path(sys.argv[1]).write_text(
+              "\n".join(pins[package] for package in ("flask", "pymupdf")) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          python -m pip install --disable-pip-version-check --no-cache-dir --only-binary=:all: -r "$RUNNER_TEMP/test-requirements.txt"
+
       - name: unittest discover
         run: python -m unittest discover -v tests

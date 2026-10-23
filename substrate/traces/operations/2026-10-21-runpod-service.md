@@ -1,5 +1,5 @@
 ---
-status: blocked
+status: completed
 created_at: 2026-10-21
 updated_at: 2026-10-23
 files_edited:
@@ -35,6 +35,7 @@ rationale:
   - Complete local image export after disk cleanup and verify the resulting artifact without claiming GPU inference.
   - Configure the approved Digitalygo release and GHCR automation bundle with scan-before-tag publication and explicit activation prerequisites.
   - Activate the authorized dev prerelease without changing main and preserve the security block before image tagging.
+  - Replace vulnerable setuptools-vendored dependencies in the GPU image and require independent build and remote scan verification before promotion.
 supporting_docs:
   - ../research/2026-10-21-runpod-readiness.md
   - ../../../docs/runpod-service.md
@@ -260,3 +261,50 @@ No dependency was upgraded, no scanner finding was ignored and no tag was manual
 The orchestrator watched both hosted runs through completion, inspected job/step conclusions and the gate log, and independently queried the GitHub release, registry version and branch SHAs. Expected negative unit tests emitted error annotations while their jobs still succeeded; the actual publisher failure is the two-finding scan gate, not those test annotations.
 
 Local evidence logs include `/tmp/envai-pii-dev-publish-failed.log` and `/tmp/envai-pii-dev-publish-full.log`. `docs/ci-release.md` and `docs/runpod-service.md` were updated locally to distinguish successful activation/build from blocked image approval. These documentation changes are not yet committed. No local test server or container was started in this activation step. A new source quality gate is not applicable to an unchanged Git tree and documentation-only updates; the image security gate remains **blocked**, not waived by the earlier source-review PASS.
+
+## Update 2026-10-23: GPU dependency remediation
+
+### Approved scope and implementation
+
+The user approved resolving the two blocking image findings and republishing from `dev`. Continued on the explicitly approved dev branch, preserved the three pre-existing documentation updates and synchronized with `git pull --ff-only`. Session baseline was `766cb1af8e567e3e9b9388ef4887fbef53461975`; the local status snapshot is `substrate/traces/status/2026-10-23-gpu-dependency-remediation-workspace-state.md`.
+
+Official PyPI wheel inspection independently confirmed that setuptools 79.0.1 contains jaraco.context 5.3.0 and wheel 0.45.1 under `setuptools/_vendor`. The pinned base image contains this same setuptools version. Setuptools 80.10.2 contains patched jaraco.context 6.1.0 and wheel 0.46.3, supports Python >=3.9 and retains `pkg_resources`. Updating unrelated standalone distributions would not replace these vendored copies, so the correction pins the parent distribution instead.
+
+A single backend member implemented the mechanical GPU-only pin and build verification, with a bounded follow-up strengthening vendor-specific negative tests. No race was warranted for this exact dependency bump. The primary provider was already known unavailable with a credit error in the preceding session, so available fallback members were used sequentially; no role was bypassed.
+
+- `src/app/requirements-gpu.txt`: added `setuptools==80.10.2`; all previous runtime and ML pins remain unchanged.
+- `Dockerfile.gpu`: reads installed vendor metadata and checks fixed minimum versions before `pip check`. Missing, stale or malformed metadata fails the build; no vendored archive-extraction code is imported or executed by this check.
+- `tests/test_gpu_image.py`: checks the exact-pin format and setuptools minimum, verifies installation/check ordering and executes the actual embedded build check against old, partial, separately stale vendors, missing vendors, malformed metadata, fixed and future-patch cases.
+- `docs/CHANGELOG.md`, `docs/ci-release.md`, `docs/runpod-service.md`: documented the correction and distinguished local source approval from the pending artifact scan.
+
+Training, the CPU Dockerfile, model source/version, application Python, workflow policies, secrets and main branch were not modified. No vulnerability suppression or manual release tagging was added.
+
+### Independent local verification and gates
+
+- Full unittest discovery passed with **821 tests, no skips** on Python 3.11.16, 3.13.5 and 3.14.7. Logs: `/tmp/envai-pii-remediation-tests-final.log`, `/tmp/envai-pii-remediation-tests313.log`, `/tmp/envai-pii-remediation-tests314.log`.
+- Branch-aware coverage for the changed test module is **98%**; all newly added executable test lines ran. Coverage file: `/tmp/envai-pii-remediation.coverage`. Requirements and Dockerfile instructions have no meaningful Python line-coverage percentage; their behavior is covered by the extracted-check tests and actual container execution, not a claim that test-file coverage measures the image runtime.
+- In a disposable Podman container from the exact pinned Python base, with no network, dropped capabilities and bounded memory/CPU, independently extracted and executed the exact Dockerfile check. It rejected the original setuptools 79.0.1. Offline installation of the official 80.10.2 wheel replaced it, the same check and `pip check` passed, and inspection confirmed the old vendor metadata directories were removed. Containers exited with `--rm`.
+- Inspected the actual diff and verified `git diff --check`; no unrelated executable files changed and no tests were removed or skipped.
+- Hybrid quality judgment: **PASS** from `quality-gate-b` after clarifying that the applicable contributing guide is root `CONTRIBUTING.md`, not the absent `.github/CONTRIBUTING.md`. The first response requested that path clarification and did not issue a verdict.
+- Focused security validation: **PASS** from `security-review-specialist-b` for the source correction only. This is not a clean-image claim and does not replace the hosted scan.
+
+### Successful publication and artifact identity
+
+Committed and pushed the approved correction as `6c9e4aeef964cf25a7ed40b0c0efaa732921b182`, `build(gpu): patch vulnerable setuptools vendored dependencies`, without a skip marker. The [Release run 39968680451](https://github.com/digitalygo/envai-pii/actions/runs/39968680451) passed and created [v1.0.0-dev.2](https://github.com/digitalygo/envai-pii/releases/tag/v1.0.0-dev.2) at that SHA. The automatic [publisher run 39968768255](https://github.com/digitalygo/envai-pii/actions/runs/39968768255) completed successfully, including all three Python test jobs, GPU build, remote identity verification, Trivy policy gate, tag promotion and final tag verification.
+
+- Approved registry manifest: `sha256:a0b25f412c3bcf5741a27cd2afddf4ad0ffe534a16bb3277fb7a0d78dee60733`.
+- Registry package version ID: `1435321891`.
+- Tags: `dev`, `1.0.0-dev.2`, `1.0.0-dev.2-6c9e4aeef964`.
+- Preferred RunPod test reference: `ghcr.io/digitalygo/envai-pii@sha256:a0b25f412c3bcf5741a27cd2afddf4ad0ffe534a16bb3277fb7a0d78dee60733`.
+
+The hosted installation log confirms setuptools 79.0.1 was removed and 80.10.2 installed. The actual Dockerfile vendor-floor check and `pip check` both passed, as did the existing CUDA-build/model-file checks. The remote Trivy result was exactly **`scan gate passed: 0 blocker(s), 63 unfixed ignored`**. The two fixable HIGH findings no longer block publication; 63 findings without a fix remain accepted by the unchanged policy. This is not a claim of zero vulnerabilities or unconditional safety.
+
+After CI completion, independently queried GitHub Packages and used read-only Docker Buildx remote inspection to verify that all three tags resolve to that exact manifest digest. Ran the repository's remote identity validator against the actual raw manifest and configuration; linux/amd64 identity, non-root user, release revision/version labels and absence of an embedded API token passed. Buildx was used only for registry metadata inspection, not to start a local Docker workload. The original blocked digest remains untagged and was not promoted or deleted.
+
+### Closure and remaining verification boundary
+
+Updated the three deployment documents and this operation to record actual publication, the residual findings and the next synthetic Pod test. A separate documentation-only commit does not change the released executable Git tree and does not warrant another image build. No new quality or security judgment is required for that documentation-only closure.
+
+Main remains at `30d6f9c675e245bc8494df959adaeaa9d8de35c7`; package visibility remains public, with no manual visibility or credential mutation. No RunPod Pod was provisioned, no real personal document was uploaded, no training ran and no GPU inference or RunPod proxy behavior was tested. Completion means the requested dependency remediation and approved GHCR publication, not production deployment or GPU runtime certification.
+
+Evidence logs are `/tmp/envai-pii-remediation-release-watch.log`, `/tmp/envai-pii-remediation-publish-watch.log` and `/tmp/envai-pii-remediation-publish-full.log`; raw remote metadata is `/tmp/envai-pii-remediation-remote-{manifest,config}.json`. Test environments, downloaded wheel fixtures and the task-only pinned base image are removed at closure. No task container or local server remains running, and no unrelated image or resource is pruned.

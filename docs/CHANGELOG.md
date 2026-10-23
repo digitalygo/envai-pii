@@ -12,7 +12,7 @@ Aggiornato `setuptools` nell'immagine GPU per correggere CVE-2026-23949 e CVE-20
 - `src/app/requirements-gpu.txt`: `setuptools==80.10.2` sostituisce `setuptools==79.0.1`. Questa versione vendorizza `jaraco.context` 6.1.0 e `wheel` 0.46.3, che contengono le correzioni; non servono quindi dipendenze autonome aggiuntive;
 - `Dockerfile.gpu`: prima di `pip check`, la build verifica i metadati vendorizzati rispetto alle versioni minime richieste e fallisce in modo fail-closed se risultano mancanti o piu' vecchi. Il controllo avviene a build time e non richiede alcuna GPU;
 - `tests/test_gpu_image.py`: aggiunti test di regressione per i casi vecchio, parziale, corrente, corretto, mancante e versione futura;
-- verifiche: suite completa di 821 test superata dal leader, controllo di packaging offline sulla base effettiva superato. La build ospitata finale e la scansione restano in attesa: la correzione non va considerata pubblicata finche' non sono confermate. La guida operativa sara' aggiornata con l'esito.
+- verifiche: suite completa di 821 test superata dal leader, controllo di packaging offline sulla base effettiva superato. La build ospitata e la scansione sono riuscite con la release `v1.0.0-dev.2` (commit `6c9e4aeef964`, 821 test su Python 3.11, 3.13 e 3.14, `setuptools` 79.0.1 sostituito da 80.10.2, gate Trivy con 0 blocchi e 63 vulnerabilita' non corrette ignorate, tag verificati sullo stesso digest). Nessun test su GPU reale ne' creazione di Pod RunPod: l'immagine e' utilizzabile per un test sintetico, ma inferenza CUDA e proxy non sono verificati. Dettagli e riferimento all'immagine in `docs/ci-release.md`.
 
 ---
 

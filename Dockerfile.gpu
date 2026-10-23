@@ -38,6 +38,7 @@ RUN pip install --no-cache-dir --no-deps \
  && pip install --no-cache-dir \
       --index-url https://pypi.org/simple \
       -r /tmp/requirements-gpu.txt \
+ && python -c "import importlib.metadata as m, pathlib as p; from email.parser import Parser; d=m.distribution('setuptools'); v=lambda s: tuple(map(int,s.split('.'))); a={'setuptools':v(d.version), **{x['Name'].lower().replace('_','-'):v(x['Version']) for f in p.Path(d.locate_file('setuptools/_vendor')).glob('*.dist-info/METADATA') for x in [Parser().parsestr(f.read_text(encoding='utf-8'))]}}; f={'jaraco.context':(6,1,0),'wheel':(0,46,2),'setuptools':(80,10,2)}; assert all(k in a and a[k]>=n for k,n in f.items()), a" \
  && pip check \
  && rm -f /tmp/requirements-gpu.txt
 

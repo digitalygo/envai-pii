@@ -11,8 +11,10 @@ and the absence of build-time secrets or an SSH daemon.
 import json
 import re
 import shlex
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "Dockerfile.gpu"
@@ -84,6 +86,13 @@ class GpuImageContract(unittest.TestCase):
         pins = dict(line.split("==", 1) for line in lines)
         self.assertEqual(pins["torch"], "2.13.0+cu130")
         self.assertEqual(pins["transformers"], "5.14.1")
+        setuptools_version = re.fullmatch(
+            r"(\d+)\.(\d+)\.(\d+)", pins["setuptools"]
+        )
+        self.assertIsNotNone(setuptools_version)
+        self.assertGreaterEqual(
+            tuple(map(int, setuptools_version.groups())), (80, 10, 2)
+        )
         self.assertEqual(pins["flask"], "3.1.3")
         self.assertEqual(pins["pymupdf"], "1.28.2")
         self.assertEqual(pins["gunicorn"], "26.2.0")
@@ -98,8 +107,79 @@ class GpuImageContract(unittest.TestCase):
         self.assertIn("--no-deps", run_text[:pypi_index])
         self.assertIn('"torch==2.13.0+cu130"', run_text[:pypi_index])
         self.assertIn("-r /tmp/requirements-gpu.txt", run_text[pypi_index:])
-        self.assertIn("pip check", run_text)
+        metadata_check_index = run_text.index("importlib.metadata")
+        pip_check_index = run_text.index("pip check")
+        self.assertLess(pypi_index, metadata_check_index)
+        self.assertLess(metadata_check_index, pip_check_index)
         self.assertNotIn("--extra-index-url", run_text)
+
+    def test_vendored_security_check_accepts_only_fixed_metadata(self):
+        run_line = next(
+            line for line in self.run_lines if "importlib.metadata" in line
+        )
+        match = re.search(r'python -c "([^"]+)"', run_line)
+        self.assertIsNotNone(match)
+        check_code = match.group(1)
+        self.assertIn("m.distribution('setuptools')", check_code)
+        self.assertIn("d.locate_file('setuptools/_vendor')", check_code)
+        self.assertIn("*.dist-info/METADATA", check_code)
+        self.assertNotIn("torch", check_code)
+        self.assertNotIn("import jaraco", check_code)
+        self.assertNotIn("import wheel", check_code)
+
+        def run_check(setuptools_version, vendors):
+            with tempfile.TemporaryDirectory() as directory:
+                vendor_root = Path(directory)
+                for name, version in vendors.items():
+                    metadata_dir = vendor_root / (
+                        f"{name.replace('.', '_')}-{version}.dist-info"
+                    )
+                    metadata_dir.mkdir()
+                    (metadata_dir / "METADATA").write_text(
+                        f"Name: {name}\nVersion: {version}\n",
+                        encoding="utf-8",
+                    )
+                distribution = type(
+                    "Distribution",
+                    (),
+                    {
+                        "version": setuptools_version,
+                        "locate_file": lambda _self, _path: vendor_root,
+                    },
+                )()
+                with patch(
+                    "importlib.metadata.distribution", return_value=distribution
+                ):
+                    exec(check_code, {})
+
+        with self.subTest(setuptools="79.0.1"):
+            with self.assertRaises(AssertionError):
+                run_check("79.0.1", {"jaraco.context": "5.3.0", "wheel": "0.45.1"})
+        with self.subTest(setuptools="80.10.1", case="partial vendor fix"):
+            with self.assertRaises(AssertionError):
+                run_check("80.10.1", {"jaraco.context": "6.1.0", "wheel": "0.46.1"})
+        with self.subTest(setuptools="80.10.2", case="old wheel"):
+            with self.assertRaises(AssertionError):
+                run_check("80.10.2", {"jaraco.context": "6.1.0", "wheel": "0.46.1"})
+        with self.subTest(setuptools="80.10.2", case="old jaraco.context"):
+            with self.assertRaises(AssertionError):
+                run_check("80.10.2", {"jaraco.context": "6.0.0", "wheel": "0.46.3"})
+        with self.subTest(setuptools="80.10.2", case="missing wheel"):
+            with self.assertRaises(AssertionError):
+                run_check("80.10.2", {"jaraco.context": "6.1.0"})
+        with self.subTest(setuptools="80.10.2"):
+            run_check("80.10.2", {"jaraco.context": "6.1.0", "wheel": "0.46.3"})
+        with self.subTest(case="older parent with fixed vendors"):
+            with self.assertRaises(AssertionError):
+                run_check("80.10.1", {"jaraco.context": "6.1.0", "wheel": "0.46.3"})
+        with self.subTest(case="future fixed versions"):
+            run_check("80.10.3", {"jaraco.context": "6.1.1", "wheel": "0.46.3"})
+        with self.subTest(case="missing vendored metadata"):
+            with self.assertRaises(AssertionError):
+                run_check("80.10.2", {"wheel": "0.46.3"})
+        with self.subTest(case="malformed vendored version"):
+            with self.assertRaises(ValueError):
+                run_check("80.10.2", {"jaraco.context": "6.1.0", "wheel": "invalid"})
 
     def test_gunicorn_single_worker_four_threads_factory_without_preload(self):
         commands = [line for line in self.instructions if line.startswith("CMD ")]

@@ -5,6 +5,17 @@ Le voci più recenti in alto. (Codice: `src/training/train_pii.py` salvo diverso
 
 ---
 
+## 2026-10-23 - Remediation CVE delle dipendenze vendorizzate nell'immagine GPU
+
+Aggiornato `setuptools` nell'immagine GPU per correggere CVE-2026-23949 e CVE-2026-24049, presenti nelle dipendenze vendorizzate dalla versione precedente. Le modifiche restano limitate all'immagine GPU: CPU, training, pin ML, policy di scansione e ramo `main` sono invariati.
+
+- `src/app/requirements-gpu.txt`: `setuptools==80.10.2` sostituisce `setuptools==79.0.1`. Questa versione vendorizza `jaraco.context` 6.1.0 e `wheel` 0.46.3, che contengono le correzioni; non servono quindi dipendenze autonome aggiuntive;
+- `Dockerfile.gpu`: prima di `pip check`, la build verifica i metadati vendorizzati rispetto alle versioni minime richieste e fallisce in modo fail-closed se risultano mancanti o piu' vecchi. Il controllo avviene a build time e non richiede alcuna GPU;
+- `tests/test_gpu_image.py`: aggiunti test di regressione per i casi vecchio, parziale, corrente, corretto, mancante e versione futura;
+- verifiche: suite completa di 821 test superata dal leader, controllo di packaging offline sulla base effettiva superato. La build ospitata finale e la scansione restano in attesa: la correzione non va considerata pubblicata finche' non sono confermate. La guida operativa sara' aggiornata con l'esito.
+
+---
+
 ## 2026-10-22 - Automazione CI, release semantiche e pubblicazione GHCR dell'immagine GPU
 
 Aggiunto il bundle CI/CD completo secondo la specifica `digitalygo-ci-templates` per automatizzare test, release da Conventional Commits, build e pubblicazione su GHCR dell'immagine GPU `Dockerfile.gpu` con scansione remota Trivy sul digest, trigger manuale e aggiornamenti Renovate, senza modificare `Dockerfile.gpu`, `Dockerfile` o il codice applicativo.

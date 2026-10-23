@@ -10,6 +10,7 @@
 torch==2.13.0+cu130
 transformers==5.14.1
 tokenizers==0.22.2
+setuptools==80.10.2
 safetensors==0.8.0
 numpy==2.4.6
 huggingface-hub==1.33.0

@@ -1,7 +1,7 @@
 ---
-status: completed
+status: blocked
 created_at: 2026-10-21
-updated_at: 2026-10-22
+updated_at: 2026-10-23
 files_edited:
   - Dockerfile.gpu
   - src/app/requirements-gpu.txt
@@ -34,6 +34,7 @@ rationale:
   - Provide reproducible direct dependency pins and a synthetic remote verification client.
   - Complete local image export after disk cleanup and verify the resulting artifact without claiming GPU inference.
   - Configure the approved Digitalygo release and GHCR automation bundle with scan-before-tag publication and explicit activation prerequisites.
+  - Activate the authorized dev prerelease without changing main and preserve the security block before image tagging.
 supporting_docs:
   - ../research/2026-10-21-runpod-readiness.md
   - ../../../docs/runpod-service.md
@@ -213,3 +214,49 @@ Configure a dedicated `RELEASE_TOKEN` with repository content write permission, 
 GHCR uses `GITHUB_TOKEN`; an existing package may need repository Actions write access. Package visibility is not changed by this configuration. A private package requires separate read-only registry credentials in RunPod. Renovate app access also remains to be verified by an administrator.
 
 Live release triggering, GHCR authorization, remote scanning of the actual GPU image, tag promotion, hosted disk headroom, optional notifications/dispatch, Renovate app operation and RunPod GPU inference remain unverified until activation. No runtime or security outcome for those external systems is claimed here.
+
+## Update 2026-10-23: dev activation blocked by image vulnerabilities
+
+### Summary of changes
+
+With explicit user approval, created and pushed `dev` from the published bootstrap commit `a4525db1ed67139621ba9d5dfbde89687b4c0396`. Verified that this initial `[skip ci]` landing produced no release. Then pushed the empty commit `766cb1af8e567e3e9b9388ef4887fbef53461975`, `chore: trigger dev image build`, and verified that its Git tree is identical to its parent.
+
+The [Release workflow](https://github.com/digitalygo/envai-pii/actions/runs/39957892878) succeeded and created the [v1.0.0-dev.1 prerelease](https://github.com/digitalygo/envai-pii/releases/tag/v1.0.0-dev.1) at that exact SHA. The subsequent [GPU publisher run](https://github.com/digitalygo/envai-pii/actions/runs/39957975454) built and uploaded the image, but the mandatory remote scan gate blocked tagging on two fixable HIGH vulnerabilities. The image is not approved for RunPod; this operation is blocked pending remediation.
+
+### Technical reasoning and impact
+
+No application, dependency, test or workflow source changed during activation. `main` remains at `30d6f9c675e245bc8494df959adaeaa9d8de35c7`; neither its contents, protection rules nor the repository default branch were changed. The user-approved dev branch and prerelease remain as the operational record. No RunPod service or other production resource was started.
+
+The manual workflow is not yet available on the default branch, so activation used the approved empty Git commit rather than relying on a `workflow_dispatch` UI button. The push-triggered release and release-published workflows both executed successfully from dev/tag source without promoting to main. GitHub's documented distinction is between [push/release events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows) and the default-branch requirement for [manual workflow dispatch](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow).
+
+`RELEASE_TOKEN` availability is now verified by the successful live preflight and release API operation, despite the repository-secret CLI list still returning empty. Its source, such as organization inheritance, was not determined. No secret value was read, copied, changed or logged, and the local CLI token was not reused as a workflow secret.
+
+The Packages API reports `ghcr.io/digitalygo/envai-pii` as **public**, linked to this repository. This observed result replaces the earlier documentation assumption that the new package would be private. No explicit package visibility change was made by the agent.
+
+### Verified publication boundary
+
+- Hosted tests succeeded on Python 3.11, 3.13 and 3.14 in both the release and publisher workflows, running the existing 820-test suite.
+- Publisher steps for source validation, runner disk cleanup/preflight, GHCR login, GPU build and digest-only push all succeeded.
+- Pushed digest: `sha256:01b0b97ba69682d200a636de35d2528ff9e13858bea07abe20930ae1d66758ab`.
+- Remote image config ID: `sha256:55b0837994dce29a097b54306832b6549a21678b1abdc4ea83e9b76b245a4cbd`.
+- Exact remote manifest/config validation and the Trivy scan completed successfully. The policy evaluation then failed on the findings below.
+- Registry package version ID `1434889853` is independently confirmed to reference that digest with `tags: []`.
+- Tag inspection, tag preflight, promotion, tag verification and swarm dispatch were all skipped after the blocked scan. The notification job completed, but that alone does not prove that an optional webhook was configured or sent.
+- The scan report was deleted by the workflow's privacy cleanup. Local evidence logs contain the fixed finding summaries, not original secret-scanner payloads.
+
+### Blocking findings and remediation boundary
+
+| Finding | Package identified by the advisory | Severity | First fixed version |
+|---|---|---|---|
+| CVE-2026-23949 | jaraco.context | HIGH | 6.1.0 |
+| CVE-2026-24049 | wheel | HIGH | 0.46.2 |
+
+Package identities and fixed versions were verified against [GHSA-58pv-8j8x-9vj2](https://github.com/advisories/GHSA-58pv-8j8x-9vj2) and [GHSA-8rrh-rw8j-w5fx](https://github.com/advisories/GHSA-8rrh-rw8j-w5fx). Both advisories also describe vendored copies in setuptools. The build log confirms `setuptools 79.0.1` is present, but the exact vulnerable file paths and installed copies were not recovered from the deleted Trivy report and must not be asserted from inference alone.
+
+No dependency was upgraded, no scanner finding was ignored and no tag was manually created to bypass the block. Remediation requires identifying and updating the affected copies, rebuilding, rerunning tests and obtaining a passing remote scan before release tags can be promoted. User approval for this dependency-remediation follow-up is pending.
+
+### Validation and remaining state
+
+The orchestrator watched both hosted runs through completion, inspected job/step conclusions and the gate log, and independently queried the GitHub release, registry version and branch SHAs. Expected negative unit tests emitted error annotations while their jobs still succeeded; the actual publisher failure is the two-finding scan gate, not those test annotations.
+
+Local evidence logs include `/tmp/envai-pii-dev-publish-failed.log` and `/tmp/envai-pii-dev-publish-full.log`. `docs/ci-release.md` and `docs/runpod-service.md` were updated locally to distinguish successful activation/build from blocked image approval. These documentation changes are not yet committed. No local test server or container was started in this activation step. A new source quality gate is not applicable to an unchanged Git tree and documentation-only updates; the image security gate remains **blocked**, not waived by the earlier source-review PASS.

@@ -3,16 +3,26 @@
 Questa guida descrive il bundle CI del repository `digitalygo/envai-pii`: suite di test su GitHub Actions, release semantiche automatiche da Conventional Commits, build e pubblicazione su GitHub Container Registry (GHCR) dell'immagine GPU `Dockerfile.gpu` con scansione remota Trivy sul digest, trigger manuale di build e aggiornamenti settimanali con Renovate.
 
 > [!warning]
-> **Stato operativo**: i workflow e gli helper Python sono presenti nel branch `feature/runpod-service`, non ancora pubblicato sul remoto. L'esecuzione end-to-end sui runner hosted di GitHub Actions, il primo rilascio su GitHub, il push su GHCR e il pull da RunPod richiedono la configurazione dei segreti e l'attivazione manuale descritta in fondo a questa guida. Nessuna di queste operazioni live viene dichiarata completata qui.
+> **Stato operativo attuale: l'immagine GPU non e' pronta per RunPod.** La CI e' attiva e la pre-release GitHub `v1.0.0-dev.1` e' stata pubblicata dal ramo `dev`, ma il workflow `docker-publish` e' fallito (vedi la [esecuzione fallita](https://github.com/digitalygo/envai-pii/actions/runs/39957975454)) perche' il gate di scansione ha bloccato 2 vulnerabilita' `HIGH` con fix disponibile. L'immagine esiste su GHCR solo come digest **senza tag** e **non approvato**: non usarla su RunPod finche' il gate non passa e i tag non vengono promossi. Nessun servizio e' stato avviato su RunPod.
 
 ## Stato verificato del repository
 
-Al momento della stesura sono stati verificati i seguenti dettagli di configurazione:
+Stato live rilevato durante l'attivazione sul ramo `dev`:
 
-- **Visibilita' e Actions**: il repository `digitalygo/envai-pii` e' pubblico, con GitHub Actions abilitato e permessi predefiniti del `GITHUB_TOKEN` impostati in sola lettura (`contents: read`).
-- **Branch e release**: sul remoto esistono attualmente solo `main` e `feature/teams-pii-integration`; il branch locale `feature/runpod-service` non e' ancora stato pushato. Non esistono tag o release GitHub pubblicate.
-- **Segreti e CODEOWNERS**: non risultano segreti configurati a livello di repository (eventuali segreti ereditati dall'organizzazione non sono verificabili senza visibilita' admin). I proprietari `@lorenzocamporesi` e `@lucanori` in `.github/CODEOWNERS` sono account GitHub validi.
-- **Immagine runtime invariata**: `Dockerfile.gpu`, `Dockerfile`, `src/app/requirements-gpu.txt` e il codice runtime non sono stati modificati da questa configurazione CI.
+- **Visibilita' e Actions**: il repository `digitalygo/envai-pii` e' pubblico, con GitHub Actions abilitato e permessi predefiniti del `GITHUB_TOKEN` in sola lettura (`contents: read`).
+- **Rami**: il ramo `feature/runpod-service` e' stato pubblicato (commit di bootstrap `a4525db`). Il ramo `dev` e' stato creato dallo stesso commit con `[skip ci]`, quindi non ha prodotto alcuna release iniziale. `main` e' **invariato** (`30d6f9c675e245bc8494df959adaeaa9d8de35c7`) e non e' stato promosso nessun contenuto su `main`.
+- **Release**: un commit vuoto `chore` (`766cb1af8e567e3e9b9388ef4887fbef53461975`) pushato su `dev` ha avviato la [esecuzione Release 39957892878](https://github.com/digitalygo/envai-pii/actions/runs/39957892878), conclusa con successo: 820 test superati su Python 3.11, 3.13 e 3.14 e creazione della pre-release [`v1.0.0-dev.1`](https://github.com/digitalygo/envai-pii/releases/tag/v1.0.0-dev.1) su quello SHA.
+- **Segreti**: `RELEASE_TOKEN` e' **disponibile**: la CI live ha superato il controllo `Require RELEASE_TOKEN` e la pubblicazione tramite API, anche se l'elenco dei segreti del repository via CLI risulta vuoto. L'origine del token (per esempio ereditarieta' dall'organizzazione) non e' verificata e non va dedotta.
+- **CODEOWNERS**: i proprietari `@lorenzocamporesi` e `@lucanori` in `.github/CODEOWNERS` sono account GitHub validi.
+- **Pacchetto GHCR pubblico**: l'API di GitHub Packages riporta il pacchetto `ghcr.io/digitalygo/envai-pii` come **pubblico**, collegato al repository `digitalygo/envai-pii`. La visibilita' non e' stata modificata manualmente. Non cambiare la politica di visibilita' senza approvazione esplicita.
+- **Pubblicazione immagine fallita al gate**: l'[esecuzione docker-publish 39957975454](https://github.com/digitalygo/envai-pii/actions/runs/39957975454) ha completato build, push per digest, validazione dell'identita' dei metadati e scansione remota, poi e' fallita al gate di scansione con esattamente 2 risultati bloccanti:
+  - `CVE-2026-23949` (`HIGH`, fix in `6.1.0`, `jaraco.context`, [GHSA-58pv-8j8x-9vj2](https://github.com/advisories/GHSA-58pv-8j8x-9vj2));
+  - `CVE-2026-24049` (`HIGH`, fix in `0.46.2`, `wheel`, [GHSA-8rrh-rw8j-w5fx](https://github.com/advisories/GHSA-8rrh-rw8j-w5fx)).
+
+  Il report di scansione e' stato eliminato per la politica di privacy della CI; nel report iniziale percorsi esatti e versioni installate non erano confermati. Le wheel ufficiali e la base effettiva ora confermano che `setuptools 79.0.1` vendorizza le vecchie versioni `jaraco.context 5.3.0` e `wheel 0.45.1`. L'immagine nel registro non ha tag (versione GHCR `1434889853`, `tags: []`); il digest esatto e' registrato nella traccia operativa.
+- **Correzione approvata e preparata**: `src/app/requirements-gpu.txt` fissa `setuptools 80.10.2` (che vendorizza `jaraco.context 6.1.0` e `wheel 0.46.3`, al posto della base `79.0.1`) e `Dockerfile.gpu` verifica queste soglie vendorizzate prima di `pip check`. Verifiche locali: 821 test superati, 98% di copertura del file di test, controllo offline del packaging della base effettiva superato (versione originale rifiutata, versione corretta accettata, vecchi metadati vendorizzati rimossi). Quality gate e revisione di sicurezza mirata sul sorgente superati, ma non sull'artefatto finale. Nessun bypass del gate.
+- **Prossimo passo**: correzione approvata e preparata; prossimo passo commit/push su `dev`, poi build e scansione obbligatorie con tag. La nuova scansione ospitata e' in attesa: nessuna nuova versione o digest e' stato prodotto, quindi l'immagine resta non pronta per RunPod e `v1.0.0-dev.1` resta evidenza storica del fallimento.
+- **Immagine runtime**: CPU, training, ML e modello sono invariati; cambia solo il controllo dei pin della toolchain GPU (`setuptools`, `Dockerfile.gpu`, `src/app/requirements-gpu.txt`).
 
 ## Architettura dei workflow
 
@@ -64,7 +74,7 @@ La pipeline separa i permessi di rilascio Git da quelli di pubblicazione sul reg
 
 ### 1. Segreto obbligatorio `RELEASE_TOKEN`
 
-`RELEASE_TOKEN` non e' attualmente presente tra i segreti del repository e **deve essere configurato dall'utente** in `Settings -> Secrets and variables -> Actions` (oppure reso disponibile come segreto di organizzazione con accesso concesso a `envai-pii`).
+`RELEASE_TOKEN` e' **gia' disponibile** per la CI live (verificato dal controllo `Require RELEASE_TOKEN` e dalla pubblicazione API riuscita), anche se `gh secret list` a livello di repository e' vuoto; l'origine non e' verificata. Per nuovi ambienti va configurato in `Settings -> Secrets and variables -> Actions` (oppure reso disponibile come segreto di organizzazione con accesso concesso a `envai-pii`). Non richiedere un nuovo token se quello esistente funziona.
 
 - **Perche' serve**: le release e i commit creati con il `GITHUB_TOKEN` predefinito non innescano altri workflow GitHub Actions (`docker-publish.yml` dopo `release.yml`, oppure `release.yml` dopo `trigger-build.yml`).
 - **Tipo e permessi consigliati**: creare un **Fine-grained Personal Access Token** dedicato, limitato al solo repository `digitalygo/envai-pii`, con permessi Repository **Contents: Read and write** e **Metadata: Read-only**. Questo copre sia la creazione di tag e release in `release.yml` sia il commit vuoto in `trigger-build.yml`.
@@ -76,7 +86,7 @@ La pipeline separa i permessi di rilascio Git da quelli di pubblicazione sul reg
 La pubblicazione su `ghcr.io/digitalygo/envai-pii` usa i permessi integrati del workflow:
 
 - **Nessun PAT per il push dell'immagine**: `docker-publish.yml` pubblica su GHCR usando esclusivamente il `GITHUB_TOKEN` automatico del job, che eleva i permessi a `packages: write` e `contents: read` senza modificare il default di sola lettura del repository.
-- **Visibilita' del pacchetto e RunPod**: anche se il repository Git e' pubblico, un nuovo pacchetto creato su GHCR in un'organizzazione nasce di default **privato**. Non rendere pubblico il pacchetto senza approvazione esplicita: verificare la visibilita' nelle impostazioni del pacchetto GHCR. Finche' il pacchetto resta privato, RunPod richiede nella propria sezione Container Registry Auth un token separato di sola lettura (`read:packages`) per eseguire il pull dell'immagine.
+- **Visibilita' del pacchetto e RunPod**: l'API di GitHub Packages riporta oggi il pacchetto come **pubblico** (misurato, non assunto privato), collegato al repository. Non modificare la visibilita' senza approvazione esplicita. Se in futuro il pacchetto diventasse privato, RunPod richiederebbe nella propria sezione Container Registry Auth un token separato di sola lettura (`read:packages`) per il pull.
 - **Collegamento al repository e risoluzione errori `403`**: l'immagine include la label `org.opencontainers.image.source=https://github.com/digitalygo/envai-pii` per associare il pacchetto al repository. Se il pacchetto `ghcr.io/digitalygo/envai-pii` esiste gia' sotto l'organizzazione (per esempio da un push manuale precedente) e il job `docker-publish` fallisce con `403 Forbidden`, aprire le impostazioni del pacchetto su GitHub (`Package settings -> Manage Actions access`) e concedere al repository `envai-pii` il ruolo **Write** o **Admin**, verificando anche i permessi dei pacchetti a livello di organizzazione. Non disattivare mai la scansione o le verifiche per aggirare un errore di permesso.
 
 ### 3. Segreti e variabili opzionali (notifiche e Swarm)
@@ -101,20 +111,23 @@ Il file `.github/renovate.json` configura l'aggiornamento delle dipendenze con q
 
 ## Procedura di bootstrap e prima attivazione
 
-Poiche' il repository non ha ancora alcuna release ne' tag Git, il primo arrivo di questa configurazione su un ramo di rilascio (`main`, `dev`, `alpha` o `beta`) deve rispettare la regola di bootstrap per evitare di pubblicare accidentalmente una prima release sul commit che introduce la CI:
+> [!note]
+> Procedura storica: l'attivazione iniziale e' gia' stata eseguita sul ramo `dev` (vedi stato verificato). Resta valida come riferimento per **nuovi** rami di rilascio o nuovi deployment del bundle.
 
-1. **Configurare `RELEASE_TOKEN`**: aggiungere il segreto `RELEASE_TOKEN` nelle impostazioni del repository (o abilitarne l'ereditarieta' dall'organizzazione) prima di fare push su un ramo di rilascio.
-2. **Includere `[skip ci]` nel commit di atterraggio**: quando si unisce `feature/runpod-service` su `main` (o su `dev`), assicurarsi che il messaggio del commit finale sul ramo di rilascio contenga `[skip ci]`, per esempio:
+Per evitare di pubblicare accidentalmente una prima release sul commit che introduce la CI, il primo arrivo della configurazione su un ramo di rilascio senza tag (`main`, `dev`, `alpha` o `beta`) deve rispettare questa regola:
+
+1. **Rendere disponibile `RELEASE_TOKEN`**: segreto del repository o ereditato dall'organizzazione, prima del push su un ramo di rilascio.
+2. **Includere `[skip ci]` nel commit di atterraggio**, per esempio:
 
    ```text
    ci: configure GPU releases and GHCR [skip ci]
    ```
 
-   Attenzione: se si usa un merge commit o uno squash merge da GitHub UI, `[skip ci]` deve comparire nel messaggio del **commit di merge/squash** che atterra su `main`, non solo nei commit intermedi del branch di feature.
-3. **Verificare l'assenza di release accidentali**: dopo il push su `main`, controllare nella scheda `Actions` e nella sezione `Releases` che non sia stata creata alcuna release `v1.0.0`.
-4. **Avviare la prima release intenzionale**: quando si e' pronti a pubblicare `1.0.0` e la relativa immagine GPU su GHCR, aprire `Actions -> Trigger image build -> Run workflow`, selezionare il branch di rilascio (es. `main` o `dev`) e avviare il job. Nota: eseguire `Trigger image build` su un branch di lavoro come `feature/runpod-service` aggiunge il commit vuoto `chore: trigger image build` a quel branch, ma **non** avvia `release.yml` ne' `docker-publish.yml` perche' il workflow di release ascolta solo `dev`, `alpha`, `beta` e `main`.
-5. **Controllare la catena live end-to-end**: prima di usare la nuova immagine su RunPod, verificare nell'ordine:
-   - esecuzione verde di `Release` e creazione della release GitHub `v1.0.0` (o `v1.0.0-<canale>.1`);
-   - avvio automatico di `docker-publish`, superamento del check di spazio disco (30 GiB) e push del digest su `ghcr.io/digitalygo/envai-pii`;
-   - superamento della scansione remota Trivy sul digest e promozione dei tag previsti;
-   - visibilita' del pacchetto GHCR e pull dell'immagine per digest (`ghcr.io/digitalygo/envai-pii@sha256:<digest>`) dal Pod RunPod, seguito dallo smoke test `src/app/smoke_cloud.py` documentato nella [guida del servizio RunPod](runpod-service.md).
+   Con merge commit o squash da GitHub UI, `[skip ci]` deve comparire nel messaggio del **commit di merge/squash** che atterra sul ramo, non solo nei commit intermedi.
+3. **Verificare l'assenza di release accidentali** nelle schede `Actions` e `Releases`.
+4. **Avviare la prima release intenzionale**. Il workflow `trigger-build.yml` non e' presente sul ramo predefinito `main`, quindi il pulsante `Run workflow` della UI non e' garantito. L'attivazione su `dev` e' avvenuta con un commit vuoto `chore` approvato, pushato direttamente su `dev`: non serve alcuna promozione su `main` ne' unire `main` per provare la pubblicazione; la release `v1.0.0-dev.1` e' partita dal ramo `dev` e `main` non e' mai stato modificato. Eseguire `Trigger image build` su un ramo di lavoro come `feature/runpod-service` aggiunge il commit vuoto `chore: trigger image build` ma **non** avvia la catena: `release.yml` ascolta solo i push su `dev`, `alpha`, `beta` e `main`, mentre `docker-publish.yml` si attiva alla pubblicazione della release.
+5. **Controllare la catena live end-to-end** prima di usare l'immagine su RunPod, nell'ordine:
+   - esecuzione verde di `Release` e creazione della release GitHub (`v1.0.0` oppure `v1.0.0-<canale>.1`): **completato** per `v1.0.0-dev.1`;
+   - avvio automatico di `docker-publish`, controllo spazio disco e push del digest: **completato**;
+   - superamento della scansione remota Trivy e promozione dei tag: **bloccato**, vedi lo stato verificato;
+   - pull per digest (`ghcr.io/digitalygo/envai-pii@sha256:<digest>`) dal Pod RunPod, seguito dallo smoke test `src/app/smoke_cloud.py` della [guida del servizio RunPod](runpod-service.md): **non eseguibile** finche' il gate non passa.

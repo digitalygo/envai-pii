@@ -1,7 +1,7 @@
 ---
-status: completed
+status: blocked
 created_at: 2026-10-21
-updated_at: 2026-10-23
+updated_at: 2026-10-25
 files_edited:
   - Dockerfile.gpu
   - src/app/requirements-gpu.txt
@@ -11,6 +11,7 @@ files_edited:
   - tests/test_gpu_image.py
   - tests/test_smoke_cloud.py
   - docs/runpod-service.md
+  - docs/runpod-diagnostic-command.md
   - README.md
   - docs/CHANGELOG.md
   - AGENTS.md
@@ -36,6 +37,9 @@ rationale:
   - Configure the approved Digitalygo release and GHCR automation bundle with scan-before-tag publication and explicit activation prerequisites.
   - Activate the authorized dev prerelease without changing main and preserve the security block before image tagging.
   - Replace vulnerable setuptools-vendored dependencies in the GPU image and require independent build and remote scan verification before promotion.
+  - Provision the explicitly requested GPU test Pod and verify its public CUDA readiness while preserving existing account secrets.
+  - Bind a user-approved dedicated test secret and prepare private client parameters without changing the original shared secret.
+  - Supply the host C compiler and libc headers required by Triton while preserving the model and GPU runtime pins.
 supporting_docs:
   - ../research/2026-10-21-runpod-readiness.md
   - ../../../docs/runpod-service.md
@@ -308,3 +312,153 @@ Updated the three deployment documents and this operation to record actual publi
 Main remains at `30d6f9c675e245bc8494df959adaeaa9d8de35c7`; package visibility remains public, with no manual visibility or credential mutation. No RunPod Pod was provisioned, no real personal document was uploaded, no training ran and no GPU inference or RunPod proxy behavior was tested. Completion means the requested dependency remediation and approved GHCR publication, not production deployment or GPU runtime certification.
 
 Evidence logs are `/tmp/envai-pii-remediation-release-watch.log`, `/tmp/envai-pii-remediation-publish-watch.log` and `/tmp/envai-pii-remediation-publish-full.log`; raw remote metadata is `/tmp/envai-pii-remediation-remote-{manifest,config}.json`. Test environments, downloaded wheel fixtures and the task-only pinned base image are removed at closure. No task container or local server remains running, and no unrelated image or resource is pruned.
+
+## Update 2026-10-24: GPU Pod provisioned, authenticated smoke blocked
+
+### Scope and preflight
+
+The user explicitly authorized publishing one running GPU Pod for their tests. Continued on the previously approved `dev` branch at `6dc431395e53432dee98f199ef4429d6f818233c`, clean and synchronized, without changing main, application code, dependencies, training or the image. Re-read repository rules and deployment guidance; directives and expectations directories remain absent. Native Runpod MCP OAuth was verified with an authenticated read; no provider API key was created or read.
+
+Revalidated the exact remote linux/amd64 manifest and configuration using the repository identity validator. The selected image remains `ghcr.io/digitalygo/envai-pii@sha256:a0b25f412c3bcf5741a27cd2afddf4ad0ffe534a16bb3277fb7a0d78dee60733`, release `v1.0.0-dev.2`, with the previously recorded 63 unfixed findings and no scan bypass.
+
+Live stock changed during preflight: the initial RTX 2000 Ada and then RTX 4000 Ada choices were unavailable before reservation. No Pod creation was attempted for those shapes. Before the actual mutation, quoted the available fallback A40 rate of USD 0.59/hour, plus disk charges, to the user. Fresh Secure Cloud catalog reads showed HIGH A40 availability in `EU-SE-1` and host CUDA 13.2. A single specialized backend member made exactly one successful Pod create call for that shape, then the leader independently read it back.
+
+### Resource identity and configuration
+
+- Pod ID: `30cjb6pzibilrh`.
+- Name: `envai-pii-test-20261024`.
+- State: `RUNNING`.
+- Cloud and location: Secure Cloud, `EU-SE-1`, Sweden.
+- GPU: one NVIDIA A40. The catalog identifies its GPU class; the pod response's `gpu.memory: 50` is host allocation metadata and is not a measured VRAM requirement.
+- Read-back cost: USD 0.59/hour, with disk billing treated separately.
+- Container disk: 20 GB; no persistent, network or global volume was created, and `mounts` is empty.
+- Configured ports: only `5005/http`; no direct public TCP, SSH or Jupyter was enabled.
+- Image CMD, entrypoint and arguments were not overridden.
+- `PII_ANALYSIS_TIMEOUT_SECONDS` is `60`.
+- `PII_API_TOKEN` references the pre-existing user account secret `pii_api_token` through the documented placeholder. Only secret metadata was read; no secret was created, read for its value, rotated or deleted. The Pod read-back retains the reference rather than a plaintext token.
+- HTTPS base URL: `https://30cjb6pzibilrh-5005.proxy.runpod.net`.
+
+The provider runtime also reports its own management mapping in addition to the requested service port. This was not an extra port requested by the agent. No unrelated Pod or account resource was changed.
+
+### Independent runtime verification
+
+- Boot/system logs confirmed the exact pulled digest. Later container logs showed Gunicorn listening on `0.0.0.0:5005`, `gthread`, and a booted worker.
+- Fresh Pod read-back populated the service runtime mapping for private port 5005 and retained RUNNING state.
+- External HTTPS `GET /health` returned 200 with `status: ok`, `model_loaded: true` and `device: cuda`. This verifies actual CUDA execution and GPU model readiness on this host, not merely a CUDA-built wheel. An earlier transient proxy 403 during boot cleared without a Pod replacement or configuration change.
+- The canonical synthetic smoke client passed health, unauthenticated analyses and unauthenticated settings. It then failed at the authenticated JSON EMAIL check. A bounded diagnostic confirmed HTTP 401, not a model accuracy or response-shape failure.
+- The previously generated, user-approved debug credential from the conversation does not authenticate against the existing account secret. It was supplied only in memory to the existing smoke client, not printed, stored in a file or passed as a process argument. No credential value is recorded in this trace.
+- A negative test using the literal secret-reference placeholder also returned 401; the service is not accepting that predictable configuration string as its credential. The token mismatch is not being bypassed.
+- Leader-owned local full unittest discovery passed: 821 tests, no skips, in a disposable Python 3.11 environment with the approved light dependencies. Log: `/tmp/envai-pii-pod-unit-tests.log`. No executable source lines changed; delta line coverage is N/A for the remote configuration.
+
+The six-check smoke has not passed, and PDF redaction has not been tested on this Pod. A read-only focused security review found no blocking issue in the deployed network/auth/reference configuration but explicitly required successful live smoke before a complete runtime-verification claim. The deterministic runtime gate remains blocked by the credential-dependent 401, so no final quality PASS or complete test-readiness claim is made.
+
+### Handoff and billing boundary
+
+The Pod is intentionally left running because the user asked to use it for tests. GPU and disk billing continue until it is stopped or terminated; no automatic termination was configured or promised. The existing shared secret was preserved rather than overwritten to make a test pass.
+
+The next action requires the user: either use the actual value they stored in `pii_api_token`, or explicitly authorize a dedicated test secret and rebinding/restarting only this conversation's Pod. Then rerun the entire synthetic smoke and finish the quality judgment before declaring authenticated end-to-end validation complete. The public health probe alone is not that validation. Real personal documents still require separate provider, region and retention approval.
+
+## Update 2026-10-24: dedicated secret and test file prepared, restart blocked by host capacity
+
+### Approved correction and preserved state
+
+The user approved creating a dedicated test secret with the previously generated debug value, rebinding only this Pod, and restarting it. They reported stopping the Pod beforehand and requested a file containing test parameters. Fresh MCP read-back confirmed `EXITED`, unlocked, with `start` allowed; image, A40 allocation request, Secure `EU-SE-1`, disk, ports and rate remained unchanged. The original user secret `pii_api_token`, ID `ofbngvmbbo`, was preserved.
+
+Created and independently verified the metadata for dedicated secret `envai_pii_test_30cjb6pzibilrh`, ID `yc09axtdyf`. Updated only Pod `30cjb6pzibilrh` to reference that secret, preserving its other environment keys. Fresh Pod read-back confirms the new reference and timeout 60. No secret value is included in this trace, Git or tool-result summaries.
+
+### Restart result
+
+The first start attempt did not restart the Pod. A subsequent read-only diagnostic could not recover its original error and encountered an API deadline on a log read; that deadline is not asserted as the cause of the start failure. After rechecking that the exact Pod remained EXITED, unlocked and eligible for start, authorized one bounded additional start attempt, with no replacement or retry loop.
+
+That attempt returned HTTP 400 with the explicit provider message: `There are not enough free GPUs on the host machine to start this pod.` The GPU released when the user stopped the Pod is not available on its bound host. The Pod remains EXITED. Data-center-wide stock does not prove capacity on that machine. No additional Pod was created, no rate was increased, and no existing Pod was terminated or migrated. Further recovery requires explicit authorization to recreate or migrate, not an unbounded start loop.
+
+### Private test artifact
+
+Prepared `/home/lorenzo/Documents/.secrets/envai-pii-runpod-test/envai-pii-runpod.postman_collection.json`, outside Git. The new dedicated directory is mode 0700; the file is mode 0600, owned by the user, and neither is a symlink. The collection contains the user-approved test credential, so it must remain local and unshared. Do not attach or commit its contents.
+
+Leader-owned JSON and request-contract verification confirmed the base URL, Bearer variable binding, unauthenticated health request, four request definitions, correct v1 `files` versus legacy `file` field names, no manual multipart Content-Type, and no scripts. A redacted review copy was created at `/tmp/envai-pii-postman-collection-redacted.json`; it contains no credential value.
+
+The review also found an unrequested EMAIL-only category filter and extra synthetic text in the multipart file request. This is narrower than the intended default full-category file analysis. A bounded delegated correction to remove those two fields was refused before touching the file because the member incorrectly selected an orchestration role and could not delegate further. The available backend member therefore produced no correction; the other backend members use the provider already excluded for its known HTTP 402 outage. No implementation was rerouted to another role or applied by the leader. The collection remains usable for its documented EMAIL-only example but is not approved as a general full-category upload test until corrected. Do not hide this limitation or mark the artifact quality gate passed.
+
+### Handoff
+
+The dedicated secret and binding are verified, but authenticated runtime smoke cannot run while the Pod is EXITED. The previously blocked live smoke remains unresolved; no new successful end-to-end or PDF claim is made. GPU compute is not running; storage, if any, follows the provider's stopped-resource billing rules. Source code, dependencies, workflows, main, the original account secret and all other resources remain unchanged. The earlier uncommitted audit update is preserved.
+
+The remaining actions are explicit permission to move or recreate the Pod on available infrastructure, followed by updating the client URL if its ID changes, correcting the file request's unintended filter through an available backend member, rerunning the full synthetic smoke and completing the focused security and quality judgments. The existing local collection path can be handed to the user now with its stopped-Pod and EMAIL-only limitations stated.
+
+## Update 2026-10-25: recreated Pod reaches CUDA readiness but inference returns 500
+
+### New user-supplied resource and scope
+
+The user recreated the Pod themselves and supplied `https://2glj7taobhnhvg-5005.proxy.runpod.net`, reporting `500 internal_error` from POST `/api/v1/analyses`. Native MCP read-back identifies Pod `2glj7taobhnhvg`, name `envai-pii-test-20261024-migration`, RUNNING on one A40 in Secure `EU-SE-1`, at the reported rate USD 0.59/hour. It uses the same approved immutable image, only port `5005/http`, no command override and the dedicated test-secret reference created earlier. This new Pod is user-created; diagnosis does not authorize deleting or replacing it.
+
+### Independently reproduced behavior
+
+Using only synthetic text and the credential read in memory from the private collection:
+
+- External GET `/health`: 200, `status: ok`, `model_loaded: true`, `device: cuda`.
+- Canonical smoke: health and both unauthenticated 401 checks pass; authenticated JSON EMAIL fails.
+- A separate minimal authenticated POST `/api/v1/analyses` confirms HTTP 500 with code `internal_error`.
+- The same synthetic text through legacy POST `/analyze` also returns HTTP 500, code `internal_server_error`.
+- Container logs show Gunicorn binding on 5005, the GPU model weights loading and `Modello pronto.`. They do not reveal the inference exception; the privacy boundary intentionally sanitizes error logging and responses.
+
+The failure is not reproduced by bad credentials or a multipart-only request. It affects the shared inference path on the GPU deployment; CUDA/model readiness alone is not a forward-pass guarantee.
+
+### Local falsification checks
+
+Ran the exact current application source read-only in a disposable network-isolated CPU image containing the real local model v1.5.0, Torch 2.13.0+cpu, Transformers 5.14.1 and NumPy 2.4.6. Direct model detection and both v1 and legacy synthetic HTTP calls return success (200 for the routes). This narrows the failure to the GPU execution environment or GPU-specific model path, but does not identify the actual exception.
+
+An initial diagnostic mount at `/src` produced a self-induced model-path resolution IndexError and was discarded. Repeated the experiment at the canonical `/app/src/app` path with the explicit baked model directory; no source change was involved. Containers exited with `--rm`; no local diagnostic workload remains.
+
+Local introspection identifies `ModernBertForTokenClassification`, float32 weights and SDPA attention. The checked modeling module contains no `reference_compile` or `torch.compile` call. Therefore a missing compiler or compilation setting is not asserted as the cause from guesswork. Read-only analyst hypotheses remain forward-pass failure, adapter output shape, or shared post-inference processing; none substitutes for the actual GPU exception.
+
+### Diagnostic boundary and next approval
+
+The connected Runpod MCP surface exposes metadata and bounded logs but no command execution or terminal tool. No hidden management endpoint, SSH installation, provider key, unsanitized debug mode or alternate-credential workaround was used. No Pod configuration, lifecycle action, source, image or private collection was modified during diagnosis; only the existing audit is extended.
+
+The next evidence required is the actual exception from a single known synthetic model forward pass on this GPU. Ask the user to authorize a temporary diagnostic restart of this exact new Pod, or to run a local console diagnostic themselves. Any diagnostic must run only the fixed synthetic input before serving requests, avoid logging real documents or credentials, and restore the reviewed startup configuration. Do not rebuild or change model/dependency settings speculatively, and do not claim that this 500 is fixed. There is no executable delivery delta to gate yet.
+
+### Authorized diagnostic restart blocked before execution
+
+The user approved the proposed temporary diagnostic restart. The delegated backend member was asked to prepare and locally test a bounded, synthetic-only runner before any Pod mutation, so privacy and startup restoration could be independently reviewed first. It stopped before creating any artifact, reporting that it had selected the orchestrator role and could not delegate from a child session. Its only remote action was a read-only Pod GET.
+
+The other backend members use the provider already excluded for its known HTTP 402 outage; no fallback probe was made against that excluded provider. No work was rerouted to another role and the leader did not implement the runner or mutate the Pod directly. Preparation and execution therefore remain blocked by implementation-agent availability, not by missing user approval.
+
+A fresh independent Pod read confirms RUNNING, the original empty `args` field, the same pinned image and reported USD 0.59/hour rate. No diagnostic restart occurred, no debug mode was enabled, no startup configuration needs restoration and no new local test resource or script exists. No new executable delta was delivered, so quality and security judgments were not invoked for a nonexistent change. The exact GPU inference exception and the underlying 500 remain unresolved at this checkpoint.
+
+The compatible next diagnostic is a read-only invocation of the existing `app.analyze` function on the fixed synthetic contact from the user's Pod terminal, ideally in a worker thread matching Gunicorn. That check does not require changing the public service configuration, but cannot be executed through the currently available Runpod MCP tools. Alternatively, restore an available backend member before resuming the approved diagnostic-startup workflow. Do not claim diagnosis or repair success while this evidence is missing.
+
+## Update 2026-10-25: confirmed Triton compiler dependency and verified source correction
+
+### Root cause established by the user's synthetic diagnostic
+
+The user supplied the real threaded diagnostic traceback from the GPU Pod. It reaches ModernBERT rotary positional matrix multiplication, then Torch's native `bmm_outer_product` Triton implementation, NVIDIA `CudaUtils`, `compile_module_from_src` and finally `triton/runtime/build.py`, which raises `RuntimeError: Failed to find C compiler`. This confirms the cause that could not safely be inferred from generic API 500 responses or the absence of `torch.compile` in the model module. The compiler is needed by Torch/Triton's own runtime host helper, not by an explicit model compilation setting.
+
+No credentials or real document contents appear in that supplied diagnostic; its input was the fixed synthetic contact. No temporary diagnostic startup or public debug route was applied to the user's Pod.
+
+### Minimal implementation and verification
+
+A backend member completed the now-mechanical source correction, separate from the earlier failed diagnostic-runner preparation:
+
+- `Dockerfile.gpu` adds `gcc` and `libc6-dev` to the existing official bookworm apt transaction, retaining `--no-install-recommends` and apt-list cleanup. Compiler and headers remain available for Triton under UID 10001.
+- A fail-closed build probe writes a trivial fixed C program including `Python.h` and `stdlib.h`, compiles it with the running Python's include flags, runs it and removes both fixtures before heavy pip/model downloads.
+- Two GPU image contract tests cover explicit package inclusion, headers, actual compilation, execution, cleanup and instruction ordering. No existing assertion was weakened or test removed.
+- The pinned base, Python and all ML requirements, model, CPU image, training, application, API contracts, authentication, offline flags and logging are unchanged. No fake CC path or Triton disabling workaround was introduced.
+
+Official package verification confirmed that bookworm's gcc defaults package only Recommends the libc development headers, so `libc6-dev` must be explicit with `--no-install-recommends`. The official Python image already supplies its own Python headers; no unrelated Debian interpreter/dev package or external apt repository was added.
+
+The leader independently ran the exact apt transaction and compiler probe in the digest-pinned Python base. The unchanged base failed for missing gcc; after installation the probe and fixture cleanup passed both as root and as UID 10001. Observed compiler: Debian GCC 12.2.0-14+deb12u1. Test containers were removed with `--rm`.
+
+Full light-dependency unittest discovery passed twice: **823 tests, no skips**. Branch-aware coverage of the modified test module is **99%**, with all added executable test lines covered; Docker configuration and the C probe are not assigned a misleading Python production line percentage. Logs: `/tmp/envai-pii-triton-tests-final.log`, `/tmp/envai-pii-triton-compiler-check.log`; coverage: `/tmp/envai-pii-triton.coverage`.
+
+The first hybrid quality judgment failed only because a changelog status still called the completed native compiler probe pending. A documentation-only correction reports its actual pass and qualifies the diagnostic command's future GPU success as expected, not guaranteed. The deterministic suite was rerun and the final independent quality judgment is **PASS**. Focused compiler-delta security review is **PASS**; runtime compiler availability is the intended dependency and the unchanged remote scan gate still governs publication.
+
+### Documentation and private test parameters
+
+Added `docs/runpod-diagnostic-command.md` with the exact already-provided read-only command, fulfilling the prior request for a copyable file. Updated deployment troubleshooting and changelog to distinguish confirmed root cause, verified source correction and pending artifact/GPU validation.
+
+A separate bounded backend task also corrected the private Postman collection at its existing non-Git path. It now targets the user-supplied Pod URL `https://2glj7taobhnhvg-5005.proxy.runpod.net`, and its multipart file request contains only the `files` upload: the unrequested synthetic text and EMAIL-only filter are removed, so all categories apply by default. The credential is unchanged, the file remains 0600 in a 0700 directory, and no scripts or redirect following were introduced. The leader verified those invariants and an authenticated GET `/settings` returned 200 using the file's opaque credential. Focused review of the redacted client delta is **PASS**. No credential appears in Git or this operation.
+
+### Publication boundary
+
+The source and private-client correction are accepted, but the running Pod still uses the old image and its inference error is not yet fixed there. Next is publishing the compiler-enabled GPU image through the existing dev release/build/remote-scan chain, then obtaining user authorization for applying it to their recreated Pod and proving the real GPU forward. No current Pod restart, new GPU, remote image replacement or inference-success claim has occurred in this source-correction phase.

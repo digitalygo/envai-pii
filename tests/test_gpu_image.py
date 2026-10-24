@@ -113,6 +113,46 @@ class GpuImageContract(unittest.TestCase):
         self.assertLess(metadata_check_index, pip_check_index)
         self.assertNotIn("--extra-index-url", run_text)
 
+    def test_compiler_packages_are_explicit_in_bookworm_apt_install(self):
+        apt_run = next(line for line in self.run_lines if "apt-get install" in line)
+        match = re.search(
+            r"apt-get install -y --no-install-recommends (.*?) && rm -rf /var/lib/apt/lists/\*",
+            apt_run,
+        )
+        self.assertIsNotNone(match)
+        self.assertCountEqual(
+            shlex.split(match.group(1)),
+            ["ca-certificates", "gcc", "libc6-dev", "libgomp1"],
+        )
+
+    def test_compiler_probe_compiles_python_and_libc_headers_before_downloads(self):
+        probe_runs = [
+            line for line in self.run_lines if "/tmp/compiler-probe.c" in line
+        ]
+        self.assertEqual(len(probe_runs), 1)
+        probe = probe_runs[0]
+        apt_run = next(line for line in self.run_lines if "apt-get install" in line)
+        pip_run = next(line for line in self.run_lines if "pip install" in line)
+        model_run = next(line for line in self.run_lines if "snapshot_download" in line)
+        self.assertLess(self.run_lines.index(apt_run), self.run_lines.index(probe))
+        self.assertLess(self.run_lines.index(probe), self.run_lines.index(pip_run))
+        self.assertLess(self.run_lines.index(probe), self.run_lines.index(model_run))
+
+        self.assertIn("'#include <Python.h>'", probe)
+        self.assertIn("'#include <stdlib.h>'", probe)
+        self.assertIn("PY_MAJOR_VERSION", probe)
+        self.assertRegex(
+            probe,
+            r"\bgcc\s+\$\(python3-config --includes\)\s+/tmp/compiler-probe\.c\s+-o\s+/tmp/compiler-probe(?:\s|$)",
+        )
+        compile_index = probe.index("gcc $(python3-config --includes)")
+        execute_index = probe.index("&& /tmp/compiler-probe", compile_index)
+        cleanup_index = probe.index("&& rm -f", execute_index)
+        self.assertLess(compile_index, execute_index)
+        self.assertLess(execute_index, cleanup_index)
+        self.assertIn("/tmp/compiler-probe.c", probe[cleanup_index:])
+        self.assertIn("/tmp/compiler-probe", probe[cleanup_index:])
+
     def test_vendored_security_check_accepts_only_fixed_metadata(self):
         run_line = next(
             line for line in self.run_lines if "importlib.metadata" in line

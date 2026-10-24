@@ -5,6 +5,17 @@ Le voci più recenti in alto. (Codice: `src/training/train_pii.py` salvo diverso
 
 ---
 
+## 2026-10-25 - Correzione sorgente del compilatore C mancante nell'immagine GPU (non ancora costruita)
+
+La traccia su GPU reale mostra che Torch 2.13 esegue `bmm_outer_product` nel matmul rotary di ModernBERT tramite Triton, il cui driver C (`compile_module_from_src`, `_build`) fallisce con `RuntimeError: Failed to find C compiler`. L'immagine `v1.0.0-dev.2` carica il modello su CUDA e `/health` risponde `200`, ma la prima inferenza autenticata risponde `500`. Non sono token, JSON o hardware.
+
+- `Dockerfile.gpu`: installa `gcc` e `libc6-dev` e, prima dei download pip, compila ed esegue una prova C con `Python.h` e `stdlib.h`, poi la rimuove. La base Python ufficiale ha gia' gli header, quindi non serve `python3-dev`; `CC` non sostituisce il compilatore;
+- `tests/test_gpu_image.py`: test sui pacchetti apt e sull'ordine e il contenuto della prova;
+- `docs/runpod-service.md`, `docs/runpod-diagnostic-command.md`: avviso sullo stato corrente, voce di troubleshooting e comando diagnostico di sola lettura;
+- stato e limiti: la prova indipendente sulla base effettiva, il container `python:3.11.17-slim-bookworm` fissato per digest, e' superata. La prova originale falliva per `gcc` mancante. Il nuovo APT con la prova ha avuto successo come root e poi come UID 10001, con `Python.h` e gli header di libc presenti e pulizia verificata; GCC 12.2.0 deb12u1. Suite completa del leader: 823 test senza skip e 99% di copertura del modulo di test, superati. Build e pubblicazione CI della nuova immagine e forward reale su GPU sono ancora in sospeso: non si dichiara alcuna immagine corretta, versione, digest o Pod aggiornato. Nessuna modifica a pin ML, base, CPU, training, API, log o sicurezza.
+
+---
+
 ## 2026-10-23 - Remediation CVE delle dipendenze vendorizzate nell'immagine GPU
 
 Aggiornato `setuptools` nell'immagine GPU per correggere CVE-2026-23949 e CVE-2026-24049, presenti nelle dipendenze vendorizzate dalla versione precedente. Le modifiche restano limitate all'immagine GPU: CPU, training, pin ML, policy di scansione e ramo `main` sono invariati.

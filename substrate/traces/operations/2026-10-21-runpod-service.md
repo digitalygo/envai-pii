@@ -462,3 +462,21 @@ A separate bounded backend task also corrected the private Postman collection at
 ### Publication boundary
 
 The source and private-client correction are accepted, but the running Pod still uses the old image and its inference error is not yet fixed there. Next is publishing the compiler-enabled GPU image through the existing dev release/build/remote-scan chain, then obtaining user authorization for applying it to their recreated Pod and proving the real GPU forward. No current Pod restart, new GPU, remote image replacement or inference-success claim has occurred in this source-correction phase.
+
+### Compiler-enabled artifact publication verified
+
+Committed and pushed the accepted source correction as `4d6037bfc0c5ba8220399afe58dde968ee4b74a4`, `build(gpu): add compiler for Triton runtime`. The [Release run 40140407527](https://github.com/digitalygo/envai-pii/actions/runs/40140407527) passed and created [v1.0.0-dev.3](https://github.com/digitalygo/envai-pii/releases/tag/v1.0.0-dev.3). The [publisher run 40140446020](https://github.com/digitalygo/envai-pii/actions/runs/40140446020) completed successfully, including all three Python jobs with 823 tests each, compiler installation, the actual C compilation/execution probe, image build, remote identity validation, Trivy gate and tag promotion/read-back.
+
+- Published manifest digest: `sha256:2b0324fe6e154eadc270b1accf157519abb5cac1663453579d5f76e1cf2f2f13`.
+- Remote config digest: `sha256:47bea1e9e0ad1293a3029f3ede8c858d35f73fb6bc82fd2e1a546debafb1b1d3`.
+- GHCR version ID: `1441208809`.
+- Tags: `dev`, `1.0.0-dev.3`, `1.0.0-dev.3-4d6037bfc0c5`.
+- Scan result: **`scan gate passed: 0 blocker(s), 247 unfixed ignored`**. The residual count increased with the compiler dependency closure; it is disclosed, not represented as zero vulnerabilities. No secret or fixable HIGH/CRITICAL finding passed the unchanged gate.
+
+The leader independently inspected all three remote tag references and confirmed each resolves to the published digest. Re-ran the repository remote manifest/config identity validator against actual registry bytes; linux/amd64, user `app`, source revision/version labels and absence of an embedded API token passed. Hosted logs show GCC 12.2.0-14+deb12u1, libc6-dev 2.36-9+deb12u14 and the compiler probe executing successfully before downloads. No manual image tag or gate bypass was used.
+
+Publication evidence is in `/tmp/envai-pii-triton-publish-full.log`, `/tmp/envai-pii-triton-publish-watch-final.log`, `/tmp/envai-pii-triton-remote-manifest.json` and `/tmp/envai-pii-triton-remote-config.json`. The disposable local verifier and task-only Python base image were removed; no unrelated image was pruned.
+
+Updated the deployment and CI guides and changelog to distinguish this verified new artifact from the still-running old image. These final edits are documentation-only and do not change the released executable tree. Main remains at `30d6f9c675e245bc8494df959adaeaa9d8de35c7`.
+
+The user-created Pod `2glj7taobhnhvg` has not been modified. Asked for explicit permission to apply the new image and restart only its container, preserving the GPU. That approval and the subsequent real GPU forward/full synthetic smoke remain pending. The operation therefore stays blocked rather than declaring the live 500 repaired.

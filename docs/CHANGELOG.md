@@ -5,14 +5,14 @@ Le voci più recenti in alto. (Codice: `src/training/train_pii.py` salvo diverso
 
 ---
 
-## 2026-10-25 - Correzione sorgente del compilatore C mancante nell'immagine GPU (non ancora costruita)
+## 2026-10-25 - Compilatore C nell'immagine GPU: artefatto `v1.0.0-dev.3` pubblicato, forward reale su GPU da verificare
 
 La traccia su GPU reale mostra che Torch 2.13 esegue `bmm_outer_product` nel matmul rotary di ModernBERT tramite Triton, il cui driver C (`compile_module_from_src`, `_build`) fallisce con `RuntimeError: Failed to find C compiler`. L'immagine `v1.0.0-dev.2` carica il modello su CUDA e `/health` risponde `200`, ma la prima inferenza autenticata risponde `500`. Non sono token, JSON o hardware.
 
 - `Dockerfile.gpu`: installa `gcc` e `libc6-dev` e, prima dei download pip, compila ed esegue una prova C con `Python.h` e `stdlib.h`, poi la rimuove. La base Python ufficiale ha gia' gli header, quindi non serve `python3-dev`; `CC` non sostituisce il compilatore;
 - `tests/test_gpu_image.py`: test sui pacchetti apt e sull'ordine e il contenuto della prova;
 - `docs/runpod-service.md`, `docs/runpod-diagnostic-command.md`: avviso sullo stato corrente, voce di troubleshooting e comando diagnostico di sola lettura;
-- stato e limiti: la prova indipendente sulla base effettiva, il container `python:3.11.17-slim-bookworm` fissato per digest, e' superata. La prova originale falliva per `gcc` mancante. Il nuovo APT con la prova ha avuto successo come root e poi come UID 10001, con `Python.h` e gli header di libc presenti e pulizia verificata; GCC 12.2.0 deb12u1. Suite completa del leader: 823 test senza skip e 99% di copertura del modulo di test, superati. Build e pubblicazione CI della nuova immagine e forward reale su GPU sono ancora in sospeso: non si dichiara alcuna immagine corretta, versione, digest o Pod aggiornato. Nessuna modifica a pin ML, base, CPU, training, API, log o sicurezza.
+- stato e limiti: la prova indipendente sulla base effettiva, il container `python:3.11.17-slim-bookworm` fissato per digest, e' superata. La prova originale falliva per `gcc` mancante. Il nuovo APT con la prova ha avuto successo come root e poi come UID 10001, con `Python.h` e gli header di libc presenti e pulizia verificata; GCC 12.2.0 deb12u1. Suite completa del leader: 823 test senza skip e 99% di copertura del modulo di test, superati. Build e pubblicazione CI superate con la release `v1.0.0-dev.3` (commit `4d6037bfc0c5`, Release 40140407527, docker-publish 40140446020, 823 test su Python 3.11, 3.13 e 3.14, prova C reale completata, gate Trivy `0 blocker(s), 247 unfixed ignored` con residuo non zero e policy invariata, tag verificati sullo stesso digest `sha256:2b0324fe6e15...`; dettagli in `docs/ci-release.md`). Il forward reale su GPU resta **in sospeso**: il Pod creato dall'utente usa ancora la vecchia immagine `v1.0.0-dev.2` e risponde `500`, nessun Pod e' stato modificato o riavviato e l'approvazione dell'utente e' in attesa. Non si dichiara corretto il `500` ne' superata l'inferenza live. Nessuna modifica a pin ML, base, CPU, training, API, log o sicurezza.
 
 ---
 

@@ -51,6 +51,7 @@ import unicodedata
 
 import fitz  # PyMuPDF
 import pdf_text
+import runtime_execution
 
 
 class PdfError(ValueError):
@@ -349,7 +350,7 @@ REDACT_FILL = (0.486, 0.227, 0.620)
 REDACT_TEXT = (1.0, 1.0, 1.0)
 
 
-def redact_pdf(pdf_bytes, mapping, fill=REDACT_FILL, text_color=REDACT_TEXT):
+def _redact_pdf_owned(pdf_bytes, mapping, fill=REDACT_FILL, text_color=REDACT_TEXT):
     """PDF originale -> PDF con redazione vera + placeholder al posto delle PII.
 
     mapping: {"[FULLNAME_1]": "Mario Rossi", ...} (il dizionario di analyze()).
@@ -446,6 +447,11 @@ def redact_pdf(pdf_bytes, mapping, fill=REDACT_FILL, text_color=REDACT_TEXT):
     }
 
 
+def redact_pdf(pdf_bytes, mapping, fill=REDACT_FILL, text_color=REDACT_TEXT):
+    return runtime_execution.PDF_LANE.run(
+        _redact_pdf_owned, pdf_bytes, mapping, fill, text_color)
+
+
 def _add_redact_annot(page, rect, text, fontsize, fill, text_color):
     """add_redact_annot con cross_out disattivato dove il binding lo supporta
     (le X diagonali sporcano il placeholder); fallback per le versioni vecchie."""
@@ -457,7 +463,7 @@ def _add_redact_annot(page, rect, text, fontsize, fill, text_color):
         return page.add_redact_annot(rect, **kw)
 
 
-def text_to_pdf(text, margin=56.0, fontsize=10.5, leading=15.5):
+def _text_to_pdf_owned(text, margin=56.0, fontsize=10.5, leading=15.5):
     """Testo (gia' anonimizzato) -> PDF A4 solo testo, impaginato da zero.
     Nessun contenuto del documento originale finisce nell'output."""
     text = unicodedata.normalize("NFKC", text or "").translate(_TRANSLATE)
@@ -538,3 +544,8 @@ def text_to_pdf(text, margin=56.0, fontsize=10.5, leading=15.5):
     out = doc.tobytes(deflate=True)
     doc.close()
     return out
+
+
+def text_to_pdf(text, margin=56.0, fontsize=10.5, leading=15.5):
+    return runtime_execution.PDF_LANE.run(
+        _text_to_pdf_owned, text, margin, fontsize, leading)

@@ -1,6 +1,7 @@
 # Guardrail PII API contract (ENVAS-23)
 
-> **Status: schema version 0.3.0, both arms implemented.** The 0.3.0 schema adds one optional
+> **Status: schema version 0.4.0, both arms implemented.** The 0.4.0 schema adds no wire field:
+> it describes the bounded admission semantics (see Concurrency). The 0.3.0 schema added one optional
 > request field, `categories`, to both arms. The JSON request and success-response schema and
 > body-validation codes and messages follow schema 0.1.0 except for that field; pre-body error
 > precedence is updated. When `categories` is absent or empty the historical default applies (all
@@ -14,9 +15,9 @@
 > `tests/test_pii_dictionary.py`, `tests/test_guardrail_api.py`,
 > `tests/test_guardrail_timeout.py` and `tests/test_guardrail_categories.py` (category
 > selection). Wire types are
-> version 0.3.0: the processing budget is server-side configuration and adds no request or
-> response field. Pre-body ordering is explicit:
-> token configuration, credentials, model readiness and lock checks return 503, 401, 503 or 429
+> version 0.3.0 and unchanged in 0.4.0: the processing budget and the admission settings are
+> server-side configuration and add no request or response field. Pre-body ordering is explicit:
+> token configuration, credentials, model readiness and admission checks return 503, 401, 503 or 429
 > before the body is read; media type and charset are validated and the body cap is chosen for that
 > media type before the bounded read. Combined-invalid requests can therefore have a different
 > outcome from historical error precedence, and not every historical invalid-request outcome is
@@ -26,7 +27,7 @@
 > preferences are unchanged. Other ENVAS-23 acceptance criteria beyond this endpoint are out of
 > scope and not claimed as complete.
 
-This document and [guardrail-openapi.yaml](guardrail-openapi.yaml) (schema version 0.3.0)
+This document and [guardrail-openapi.yaml](guardrail-openapi.yaml) (schema version 0.4.0)
 describe the same contract. The OpenAPI 3.1 file is the machine-readable reference for the wire
 schema; this document records the semantics, limits and decisions behind it.
 
@@ -38,7 +39,7 @@ schema; this document records the semantics, limits and decisions behind it.
 | Request | JSON: `text` (required) plus optional `dictionary` and `categories`; the 0.1.0 fields are preserved. Multipart: repeated `files` (max 10) plus optional `text`, `dictionary` and `categories` |
 | Response | JSON: exactly one result (`input_id: "text"`). Multipart: 1 to 11 results (`file_1` to `file_10` in part order, then `text`), plus one aggregate `dictionary_delta` |
 | Authentication | Bearer secret `PII_API_TOKEN`; 503 when unset, 401 when missing or wrong; evaluated before any body byte is read |
-| Readiness | Model readiness checked after credentials and before the per-process lock, still before any body read; 503 even when seed or placeholders cover the text. Guardrail readiness covers the model only; `/health` is unchanged and has no PDF-capability field |
+| Readiness | Model readiness checked after credentials and before admission, still before any body read; 503 even when seed or placeholders cover the text. Guardrail readiness covers the model only; `/health` is unchanged and has no PDF-capability field |
 | State | No cross-request mapping or file cache; request-scoped references are released after the response, with no secure-erasure guarantee |
 | Placeholders | Canonical `[LABEL_N]`; 24 `TAG_NAMES` labels; N from 1 to 999999999 |
 | Categories | Request-only whitelist `categories`: canonical `TAG_NAMES` labels; absent, `null`, `[]` or blank selects all 24; no server preference or environment fallback; only selected labels are anonymized, the others stay in clear |
@@ -46,11 +47,11 @@ schema; this document records the semantics, limits and decisions behind it.
 | New IDs | Reserved across every input of the request and the seed before any allocation |
 | Delta | New pairs only, selected categories only, first normalized-original binding wins across categories, value is its first surface form, and the request-local binding is reused in later inputs |
 | Limits | JSON defaults: body 8388608 bytes, seed 10000 entries, 4096 chars per original and 1048576 aggregate chars; hard ceilings: 16777216 bytes, 20000 entries, 65536 chars per original and 2097152 aggregate chars. Multipart: body 20 MiB, each file 5 MiB, max 10 files, max 13 parts, dictionary field follows the configured JSON-body cap, other value fields 1 MiB, 100000 aggregate text chars, 200 pages per PDF |
-| Deadline | Server-configured cooperative processing budget, default 60 s from `PII_ANALYSIS_TIMEOUT_SECONDS`, after the bounded body read and inside the owned lock; covers multipart parse, extraction, all inputs and allocation |
-| Concurrency | One analysis in flight per process; contention rejected with 429, without reading the body and without queueing |
+| Deadline | Server-configured cooperative processing budget, default 60 s from `PII_ANALYSIS_TIMEOUT_SECONDS`, after the bounded body read, while the admission lease is held; queue wait and upload time are not deducted; covers multipart parse, extraction, all inputs and allocation |
+| Concurrency | Per process, up to 4 active analyses and a FIFO queue of 4 waiting requests for at most 5 s (startup settings); a waiting request has its body unread while it is queued and, once admitted, reads the body and is processed normally (200 or the usual errors); only a full or disabled queue, or an expired wait, is rejected with 429 `busy` without reading the body |
 | Errors | Endpoint bodies are exactly `{error, code}`; JSON body-validation statuses, codes and messages are unchanged, but pre-body outcomes take precedence; multipart adds `unsupported_file_type` (415) and `empty_file`, `unreadable_file`, `no_extractable_text` (422) |
 | Caching | `Cache-Control: no-store` on every response at the endpoint path, including 405 and OPTIONS |
-| Implementation | Both arms implemented; the optional `categories` field is the 0.3.0 addition; with `categories` absent the success shape and category defaults match the 0.1.0 contract; JSON-body and dictionary limits use the bounded server defaults documented below |
+| Implementation | Both arms implemented; the optional `categories` field is the 0.3.0 addition and 0.4.0 changes only admission semantics; with `categories` absent the success shape and category defaults match the 0.1.0 contract; JSON-body and dictionary limits use the bounded server defaults documented below |
 | Out of scope | OCR, raster redaction, embedded attachments, PDF binary or ZIP output, JSON batch arrays, UI, training, AAAS changes |
 
 ## Scope and non-goals
@@ -97,7 +98,7 @@ The JSON arm of `/api/v1/analyses` keeps the schema 0.1.0 request fields and add
 body-validation statuses, codes and messages are preserved once pre-body checks pass. JSON body
 and dictionary capacities now have larger bounded defaults and server-configurable ceilings. A
 client that omits `categories` still sees the historical all-24-category behavior and the same
-success shape. Clients do not need to change their JSON request or success-response handling. Pre-body ordering is updated: configuration, credentials, model readiness and lock
+success shape. Clients do not need to change their JSON request or success-response handling. Pre-body ordering is updated: configuration, credentials, model readiness and admission
 checks run before the body is read, taking precedence in the documented 503, 401, 503 and 429
 order. A combined-invalid request can therefore receive a different result from the historical
 body-read precedence.
@@ -137,7 +138,7 @@ built only for the duration of the request. Legacy request fields such as `exclu
   token is never logged or echoed.
 - Configuration state is evaluated before credentials: a disabled endpoint answers `503`
   regardless of the credential presented.
-- After credentials, model readiness is checked before the per-process lock; an unavailable model
+- After credentials, model readiness is checked before admission; an unavailable model
   answers `503` with code `unavailable` even when the text could be resolved from the seed or
   from placeholders already present.
 - No other authentication mode is accepted.
@@ -145,16 +146,19 @@ built only for the duration of the request. Legacy request fields such as `exclu
 ### Request ordering and the body read
 
 - The endpoint evaluates, in order: token configured (`503` `unavailable`), credentials (`401`
-  `unauthorized`), model readiness (`503` `unavailable`), per-process lock (`429` `busy`), media
+  `unauthorized`), model readiness (`503` `unavailable`), admission (`429` `busy`), media
   type and charset validation (`415` `unsupported_media_type` for an unsupported overall media
   type or charset), raw body cap selection by media type, bounded body read, processing clock
   start with the timeout read once per request before the deadline snapshot, parse and
   extraction, anonymization. The media-type and charset check and the cap choice
   happen before the read, so an unsupported type is rejected without reading the body; the body
   cap is applied to the bytes actually read.
-- Authentication, readiness and lock acquisition happen before any body byte is read or parsed.
-  An unauthenticated request is answered `401` without touching or parsing the payload; a busy
-  request is answered `429` without reading the body and without queueing work.
+- Authentication, readiness and admission happen before any body byte is read or parsed.
+  An unauthenticated request is answered `401` without touching or parsing the payload. No body
+  byte is read while a request waits in the queue, but a waiting request that is admitted then reads
+  the body and is processed normally, with a `200` or the usual errors. No body byte is read when a
+  request is rejected because the queue is full or disabled, or when its wait expires; only those
+  two outcomes are answered `429`.
 - Typed read and validation errors keep this precedence: an authentication outcome cannot be
   displaced by a body-size, media-type or charset error, and errors produced in or after the read
   keep their documented codes (`413` for configured or fixed caps, `415` for media type and charset, `400`
@@ -166,7 +170,7 @@ built only for the duration of the request. Legacy request fields such as `exclu
 - The body cap is enforced on the bytes actually read, never on a declared `Content-Length`.
   A read failure after authentication is sanitized to `400` `invalid_request` and never exposes
   framework exception text.
-- The per-process lock is held for the whole authenticated request, from before the body read
+- The admission lease is held for the whole authenticated request, from before the body read
   through processing and response assembly, and is released on every outcome, including every
   error.
 
@@ -180,9 +184,14 @@ built only for the duration of the request. Legacy request fields such as `exclu
   in the server environment (for example `PII_ANALYSIS_TIMEOUT_SECONDS=120`), independently of the
   `PII_API_TOKEN` secret. The value is read once per request before the deadline snapshot, and
   clients cannot override it.
+- Admission is also server configuration, read once at startup (see Concurrency). The container
+  commands of both images load `src/app/gunicorn_config.py`, which sets one `gthread` worker,
+  no `--preload` and `threads = active + queue + 2` (10 by default).
 - Any worker or proxy in front of the service needs a timeout longer than the configured budget
-  plus the upload and native-work margin. Increasing a client or Postman timeout alone does not
-  change the server-side budget.
+  plus the queue wait, the upload and the native-work margin. Increasing a client or Postman
+  timeout alone does not change the server-side budget. The RunPod HTTPS proxy enforces a fixed
+  timeout of about 100 seconds per request that neither the client timeout nor the Gunicorn
+  `--timeout 600` worker heartbeat can raise.
 
 ## Media types and request envelopes
 
@@ -915,7 +924,7 @@ Stable codes:
 | 422 | `unreadable_file` | A multipart PDF is corrupt, encrypted or otherwise unreadable; message `Unable to read file.` |
 | 422 | `no_extractable_text` | A multipart PDF is valid but has no non-blank extractable text; message `File has no extractable text. OCR is not available.` |
 | 401 | `unauthorized` | Missing or wrong Bearer credential |
-| 429 | `busy` | Another analysis request is already in flight in the process |
+| 429 | `busy` | All active slots are taken and the queue is full or disabled, or the queue wait expired |
 | 503 | `unavailable` | `PII_API_TOKEN` unset or blank (endpoint disabled), model not ready, detector unavailable mid-request, service unavailable, or native MuPDF privacy controls unavailable for guardrail PDF extraction |
 | 504 | `deadline_exceeded` | The configured cooperative processing budget was reached |
 | 500 | `internal_error` | Unexpected processing failure |
@@ -939,9 +948,10 @@ messages; the new file codes use exactly the messages quoted in the table.
   (non-numeric text, zero, negative, NaN, infinity or an overflow) safely fall back to 60. The new
   default deliberately changes the previous 30-second default with user approval; raising or
   lowering it is a server restart configuration, not a wire change.
-- The budget starts after the bounded body read, inside the owned lock, before multipart parsing
-  and JSON validation. Authentication, readiness and lock checks happen before the read and are
-  not counted; the body read itself is not counted either, so a slow upload can take longer than
+- The budget starts after the bounded body read, while the admission lease is held, before multipart
+  parsing and JSON validation. Authentication, readiness and admission (including any queue wait,
+  which is a separate budget of its own) happen before the read and are not counted; the body read
+  itself is not counted either, so a slow upload can take longer than
   the configured budget before the budget starts. The read is bounded by the configured JSON or fixed multipart cap, and
   the timeout value does not change any fixed wire limit.
 - For the multipart arm the budget covers multipart parsing, extraction of every file, processing
@@ -950,19 +960,45 @@ messages; the new file codes use exactly the messages quoted in the table.
   parsing, validation, extraction, page loops, seed location, model chunks, allocation and output
   assembly) and between model chunks. It is not a hard cancellation or completion guarantee: it
   cannot interrupt a native PDF operation or an in-flight model call, and a request that crosses
-  it fails with `504` only at the next check.
+  it fails with `504` only at the next check. Time spent waiting for the native owner thread during
+  processing does consume the budget and can interrupt the wait, but not a native PDF or model
+  call that is already running.
 - Deployment must therefore impose a hard worker or proxy timeout that is longer than the
   configured budget plus the expected upload and native-work margin, because the cooperative
   budget alone neither bounds the body read nor stops an in-flight model call.
 
 ### Concurrency
 
-- At most one analysis may be in flight per process on this endpoint. A concurrent request is
-  rejected immediately with `429` and code `busy`; it is not queued and its body is not read.
-- The lock is acquired before the body read and held for the whole authenticated request,
+- Admission is a per-process controller with a bounded FIFO queue, configured once at startup from
+  non-secret environment variables. Invalid values fall back to the default and values above the
+  ceiling are clamped; no request field can override them.
+
+  | Variable | Default | Minimum | Maximum | Meaning |
+  |---|---|---|---|---|
+  | `PII_MAX_CONCURRENT_ANALYSES` | 4 | 1 | 16 | Analyses holding a lease at once |
+  | `PII_MAX_QUEUED_ANALYSES` | 4 | 0 | 32 | Waiting requests; 0 disables the queue |
+  | `PII_QUEUE_TIMEOUT_SECONDS` | 5 | above 0, finite | 30 | Longest queue wait per request |
+
+- A request that finds a free slot and no waiters is admitted at once; otherwise it waits in FIFO
+  order. It is rejected with `429` and code `busy` when the queue is full or disabled, or when its
+  wait expires, in both cases without reading the body. A queued request does not read its body
+  while it waits; once admitted it reads the body and is processed normally. The human message
+  stays `Another analysis is in progress.` for compatibility; error shapes and codes are unchanged.
+  The body is read only after admission.
+- The lease is acquired before the body read and held for the whole authenticated request,
   including parsing, extraction and anonymization, and is released on every outcome, error
   included.
-- The legacy routes are not affected by this gate.
+- The queue wait is a separate budget: it is not deducted from the analysis deadline, which still
+  starts after the body read. Upload time is likewise excluded.
+- Native work is serialized by two dedicated single-owner threads, one for PDF and one for model
+  calls. A submission gate is held until the previous future completes, so the internal executor
+  backlog stays bounded; recursive PDF calls run inline and no native object is returned across
+  threads. The model cache stays one shared instance per process and model forwards are
+  intentionally serialized, so four active analyses do not mean four parallel GPU forwards or four
+  times the throughput. CPU-side request phases (body read, parsing, validation, anonymization)
+  run concurrently.
+- Legacy PDF operations use the same PDF owner thread. The other legacy routes are not subject to
+  the admission gate.
 
 ### Privacy and caching
 

@@ -69,6 +69,7 @@ import guardrail_inputs
 import pdf_export
 import pdf_text
 import pii_dictionary
+import runtime_execution
 import server_config
 # Rete REGEX + CHECKSUM: modulo a parte, senza dipendenze dal modello. I nomi
 # restano importabili da qui (`app.detect_regex`) per non rompere chi li usa.
@@ -103,7 +104,7 @@ def _mupdf_tool(name):
     return tool if callable(tool) else None
 
 
-def _silence_native_mupdf_diagnostics():
+def _silence_native_mupdf_diagnostics_owned():
     """Verifica il controllo privacy nativo di MuPDF una volta all'avvio.
 
     Ogni API e' necessaria: i setter devono accettare False, i getter devono
@@ -142,7 +143,12 @@ def _silence_native_mupdf_diagnostics():
     return ok
 
 
-def _reset_native_mupdf_warnings():
+def _silence_native_mupdf_diagnostics():
+    return runtime_execution.PDF_LANE.run(
+        _silence_native_mupdf_diagnostics_owned)
+
+
+def _reset_native_mupdf_warnings_owned():
     """Svuota il buffer nativo e segnala se la privacy resta verificata."""
     global MUPDF_PRIVACY_OK
     reset = _mupdf_tool("mupdf_warnings")
@@ -155,6 +161,10 @@ def _reset_native_mupdf_warnings():
         MUPDF_PRIVACY_OK = False
         return False
     return True
+
+
+def _reset_native_mupdf_warnings():
+    return runtime_execution.PDF_LANE.run(_reset_native_mupdf_warnings_owned)
 
 
 # Le diagnostiche native possono contenere parti dei documenti. Il controllo e'
@@ -265,7 +275,7 @@ def _safe_name(name, default="documento.pdf"):
     return base or default
 
 
-def _store_doc(data, name="documento.pdf"):
+def _store_doc_owned(data, name="documento.pdf"):
     """Mette un PDF nello store dell'anteprima. Ritorna (doc_id, n_pages)."""
     with fitz.open(stream=data, filetype="pdf") as doc:
         n_pages = doc.page_count
@@ -278,6 +288,10 @@ def _store_doc(data, name="documento.pdf"):
     return doc_id, n_pages
 
 
+def _store_doc(data, name="documento.pdf"):
+    return runtime_execution.PDF_LANE.run(_store_doc_owned, data, name)
+
+
 def _get_doc(doc_id):
     with _DOCS_LOCK:
         d = _DOCS.get(doc_id)
@@ -286,7 +300,7 @@ def _get_doc(doc_id):
     return d
 
 
-def _page_png(d, n, dpi=PREVIEW_DPI):
+def _page_png_owned(d, n, dpi=PREVIEW_DPI):
     """PNG della pagina n (0-based) del documento, con cache. None se fuori range."""
     if not (0 <= n < d["n_pages"]):
         return None
@@ -299,6 +313,10 @@ def _page_png(d, n, dpi=PREVIEW_DPI):
         with _DOCS_LOCK:
             d["pages"][key] = png
     return png
+
+
+def _page_png(d, n, dpi=PREVIEW_DPI):
+    return runtime_execution.PDF_LANE.run(_page_png_owned, d, n, dpi)
 
 
 # --------------------------------------------------------------------------- #
@@ -391,8 +409,10 @@ def detect_model(text):
     """Entita' trovate dal modello mmBERT su tutti i chunk, su offset globali."""
     chunks = chunk_text(text)
     ents = []
+    model = nlp
     if chunks:
-        results = nlp([c for c, _ in chunks])
+        results = runtime_execution.MODEL_LANE.run(
+            model, [c for c, _ in chunks])
         if isinstance(results, dict):                 # singolo chunk -> normalizza
             results = [results]
         for (_, off), res in zip(chunks, results):
@@ -570,13 +590,14 @@ def _guardrail_detect(text, check_deadline, categories=None):
     (None = tutte): una regex di una categoria inattiva non deve sopprimere un
     candidato attivo del modello nella fusione.
     """
-    if nlp is None:
+    model = nlp
+    if model is None:
         raise guardrail_api.ModelUnavailable()
     ents = []
     for chunk, offset in chunk_text(text):
         check_deadline()
-        results = nlp([chunk])                 # stessa forma batch, un chunk per call
-        check_deadline()
+        results = runtime_execution.MODEL_LANE.run(
+            model, [chunk], check_deadline=check_deadline)  # stessa forma batch, un chunk per call
         if isinstance(results, dict):
             results = [results]
         res = (results[0] if len(results) == 1 and isinstance(results[0], (list, tuple))
@@ -618,7 +639,7 @@ def _guardrail_detect_for_categories(categories):
     return detect_active
 
 
-def _guardrail_extract(name, data, remaining_chars, check_deadline):
+def _guardrail_extract_owned(name, data, remaining_chars, check_deadline):
     """Testo di un file della guardrail v1 (multipart): nome -> estrattore.
 
     L'estensione accettata sceglie la famiglia di input; il contenuto PDF viene
@@ -690,6 +711,15 @@ def _guardrail_extract(name, data, remaining_chars, check_deadline):
     if not text.strip():
         raise guardrail_inputs.InputError(422, "empty_file")
     return text
+
+
+def _guardrail_extract(name, data, remaining_chars, check_deadline):
+    ext = os.path.splitext((name or "").lower())[1]
+    if ext in guardrail_inputs.ACCEPTED_EXTS and _is_pdf(name, data):
+        return runtime_execution.PDF_LANE.run(
+            _guardrail_extract_owned, name, data, remaining_chars, check_deadline,
+            check_deadline=check_deadline)
+    return _guardrail_extract_owned(name, data, remaining_chars, check_deadline)
 
 
 guardrail_api.register_app(app, tags=TAG_NAMES, detect=_guardrail_detect,
@@ -765,10 +795,13 @@ def _text_from_bytes(name, data):
     name = (name or "").lower()
     ext = os.path.splitext(name)[1]
     if _is_pdf(name, data):
-        with fitz.open(stream=data, filetype="pdf") as doc:
-            # Non solo page.get_text(): nei PDF fillable il valore sta nei
-            # widget AcroForm (issue #85). Stesso contratto di pdf_export.
-            return pdf_text.collect_readable_text(doc)
+        def extract_pdf_text():
+            with fitz.open(stream=data, filetype="pdf") as doc:
+                # Non solo page.get_text(): nei PDF fillable il valore sta nei
+                # widget AcroForm (issue #85). Stesso contratto di pdf_export.
+                return pdf_text.collect_readable_text(doc)
+
+        return runtime_execution.PDF_LANE.run(extract_pdf_text)
     if ext in TEXT_EXTS or not ext:
         # utf-16 solo col BOM: senza, il codec accetta qualunque sequenza di lunghezza pari
         # e si mangia i .txt a 8 bit. cp1252 prima di latin-1: e' quello che scrivono Word

@@ -19,10 +19,15 @@ Tutti i valori sono SINTETICI.
 import ast
 import os
 import re
+import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src" / "app"))
+
+import runtime_execution
+
 APP = ROOT / "src" / "app" / "app.py"
 
 CF = "RSSMRA80A01H501U"
@@ -35,7 +40,7 @@ ACCENTI = "Perizia: la proprietà è accertata, perché così risulta.\n" + ATTO
 def _carica():
     """`_text_from_bytes` e le sue dipendenze, senza importare tutto app.py."""
     albero = ast.parse(APP.read_text(encoding="utf-8"))
-    ns = {"os": os, "re": re}
+    ns = {"os": os, "re": re, "runtime_execution": runtime_execution}
     for nodo in albero.body:
         if isinstance(nodo, ast.Assign) and any(
                 getattr(t, "id", "") in ("TEXT_EXTS", "PDF_MAGIC") for t in nodo.targets):

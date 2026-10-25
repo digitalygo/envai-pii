@@ -29,6 +29,7 @@ sys.path.insert(0, str(ROOT / "src" / "app"))
 
 import guardrail_api  # noqa: E402
 import guardrail_inputs  # noqa: E402
+import runtime_execution
 
 try:
     from flask import Flask
@@ -104,7 +105,7 @@ def _load_adapter():
                     None)
     if function is None:
         raise AssertionError("_guardrail_detect non trovata in app.py")
-    namespace = {}
+    namespace = {"runtime_execution": runtime_execution}
     exec(compile(ast.Module([function], []), "app.py", "exec"), namespace)
     return namespace
 
@@ -188,7 +189,7 @@ class AppAdapter(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             self.ns["_guardrail_detect"]("x", check)
-        self.assertEqual(events, ["check", "nlp", "check"])
+        self.assertEqual(events, ["check", "check", "nlp", "check"])
 
     def test_risultato_flat_di_un_singolo_chunk(self):
         def nlp(_inputs):

@@ -74,4 +74,4 @@ sys.exit(0 if urllib.request.urlopen(f\"http://127.0.0.1:{os.environ['PII_PORT']
 # 1 worker: il modello sta in memoria una volta sola (ogni worker sarebbe una
 # copia da ~1.2 GB). Il parallelismo lo danno i thread. timeout alto perche' un
 # PDF lungo e' minuti di inferenza CPU, non secondi.
-CMD ["sh", "-c", "exec gunicorn --chdir /app/src/app --bind ${PII_HOST}:${PII_PORT} --workers 1 --threads 4 --timeout 600 --graceful-timeout 30 --access-logfile - --error-logfile - app:app"]
+CMD ["sh", "-c", "exec gunicorn --config /app/src/app/gunicorn_config.py --chdir /app/src/app --bind ${PII_HOST}:${PII_PORT} --workers 1 --timeout 600 --graceful-timeout 30 --access-logfile - --error-logfile - app:app"]

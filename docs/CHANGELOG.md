@@ -5,6 +5,31 @@ Le voci più recenti in alto. (Codice: `src/training/train_pii.py` salvo diverso
 
 ---
 
+## 2026-10-25 - Concorrenza limitata con coda FIFO (solo sorgente, in attesa di rilascio)
+
+Approvato dall'utente come comportamento, senza nuovi campi nel payload. Il sorgente sostituisce il lock "una sola analisi per processo" di `POST /api/v1/analyses` con un'ammissione per processo: fino a 4 analisi attive, coda FIFO di 4 richieste e attesa massima di 5 s. Il contratto passa alla versione schema `0.4.0` (nessun campo nuovo; le categorie `0.3` restano un fatto storico).
+
+- impostazioni all'avvio: `PII_MAX_CONCURRENT_ANALYSES` (predefinito 4, da 1 a 16), `PII_MAX_QUEUED_ANALYSES` (predefinito 4, da 0 a 32, 0 disabilita la coda), `PII_QUEUE_TIMEOUT_SECONDS` (predefinito 5, positivo e finito, massimo 30). Valori non validi tornano al predefinito, quelli sopra il massimo sono ridotti, nessun override dal client;
+- ordine: autenticazione, configurazione e prontezza del modello prima dell'ammissione, e questa prima del body. Una richiesta in coda non legge il body finche' attende; una volta ammessa lo legge e viene elaborata normalmente (`200` o i soliti errori). Coda piena o disabilitata e attesa scaduta rispondono `429 busy` senza leggere il body, con il messaggio `Another analysis is in progress.` invariato, e forme e codici d'errore invariati. Il lease copre body ed elaborazione e viene rilasciato in ogni esito;
+- tempi: l'attesa in coda (5 s) e' separata e non riduce il budget di analisi da 60 s, che parte dopo la lettura del body; anche l'upload resta escluso. L'attesa del proprietario nativo durante l'elaborazione consuma il budget e puo' interrompere l'attesa, non una chiamata PDF o GPU gia' in corso. Il limite di circa 100 s del proxy HTTPS di RunPod e' fisso: non lo alzano il timeout del client ne' l'heartbeat 600 del worker, contano coda, upload, budget e margine nativo;
+- sicurezza nativa: due thread dedicati con un solo proprietario (PDF e modello), con gate di sottomissione tenuto fino al completamento del future per non accumulare backlog interno; chiamate PDF ricorsive inline, nessun oggetto nativo restituito. Cache del modello unica per processo; i forward del modello restano serializzati di proposito, quindi non sono 4 forward GPU paralleli ne' 4 volte il throughput, mentre le fasi CPU delle richieste sono concorrenti. Le operazioni PDF native restano su un solo proprietario anche nelle funzioni legacy;
+- Gunicorn: un solo worker, nessun `--preload`, thread = attive + coda + 2 (predefinito 10), tramite `src/app/gunicorn_config.py` caricato dai comandi di `Dockerfile` e `Dockerfile.gpu`. Nessuna nuova dipendenza, nessun pin ML, nessuna modifica a training o payload JSON;
+- stato: **solo sorgente, rilascio e distribuzione in sospeso**. L'immagine pubblicata e il Pod `v1.0.0-dev.3` hanno ancora il comportamento a una richiesta per volta; l'utente ha fermato il Pod durante la notte e non e' stato riavviato. La gestione di quattro richieste contemporanee sulla GPU reale resta da verificare; non e' ancora stato pubblicato un nuovo artefatto. Verifica del leader sul sorgente corrente: suite completa 856 test superati senza skip; produzione modificata 236/236 righe al 100%; helper nativo 61 istruzioni al 100% di ramo; ammissione 110 righe tutte coperte, 99% di ramo; Gunicorn 9 righe al 100%; i nuovi test di cancellazione sono inclusi. La QA del sorgente ha richiesto solo correzioni alla documentazione; il controllo di sicurezza mirato di follow-up e' superato, senza rilievi bloccanti, e il rilievo consultivo sull'invio orfano e' chiuso dal codice. La successiva revisione di qualita' e il controllo di sicurezza mirato sono superati. Restano **in sospeso** nuova immagine, build e concorrenza reale su GPU: lo smoke test v3 esistente prova solo il funzionamento, non la nuova concorrenza. La voce sotto sul test su GPU reale con `v1.0.0-dev.3` resta valida per quell'artefatto;
+- documentazione: `docs/GUARDRAIL_API.md`, `README.md`, `docs/runpod-service.md`. Gli esempi pubblici sul wire restano validi (autenticazione, immagine e configurazione legacy; casi base dell'app v2 invariati).
+
+---
+
+## 2026-10-25 - Verifica su GPU reale: Pod aggiornato a `v1.0.0-dev.3`, `500` risolto per i casi sintetici
+
+Con il consenso esplicito dell'utente, il Pod esistente `2glj7taobhnhvg` e' stato aggiornato sul posto al digest `sha256:2b0324fe6e154eadc270b1accf157519abb5cac1663453579d5f76e1cf2f2f13` con un solo `PATCH` nativo dell'immagine e un solo riavvio del container, mantenendo la GPU A40 (EU-SE-1, `0.59` USD/h da lettura fresca). Il confronto completo di variabili, argomenti, cloud, costo, data center, disco, mount, registry, rete, nome, porte e template non ha rilevato differenze; nessuna credenziale ruotata. I log mostrano avvio alle 23:46:23Z e modello pronto su GPU alle 23:46:30Z.
+
+- test: `src/app/smoke_cloud.py` completo via proxy RunPod, 6 su 6 superati in 2,52 s (misura, non benchmark); inoltre JSON con email e IBAN (`200`, entrambi mascherati), PDF sintetico su `/api/v1/analyses` (`200`) e `POST /pdf` legacy (`200`, PDF valido, email e IBAN originali assenti). Tutti i dati sono sintetici;
+- limiti: il `500` precedente (compilatore C mancante in `v1.0.0-dev.2`) e' risolto solo per questi casi verificati, senza garanzia di accuratezza o di copertura GDPR. Nessun fallback su CPU, pin ML invariati, nessun file sorgente o test modificato. Suite unitaria completa: 823 test superati senza skip. Il residuo Trivy noto (247, non zero) resta invariato e non va letto come assenza di vulnerabilita'. `main` resta `30d6f9c...`;
+- stato: al momento di quella verifica il Pod era acceso per i test remoti dell'utente (storico: l'utente ha poi riferito di averlo fermato, stato attuale non interrogato). La voce precedente descrive lo stato in sospeso di quel momento ed e' storica;
+- documentazione: `docs/runpod-service.md`, `docs/ci-release.md`. I parametri di test senza segreti sono in un file privato fuori dal repository.
+
+---
+
 ## 2026-10-25 - Compilatore C nell'immagine GPU: artefatto `v1.0.0-dev.3` pubblicato, forward reale su GPU da verificare
 
 La traccia su GPU reale mostra che Torch 2.13 esegue `bmm_outer_product` nel matmul rotary di ModernBERT tramite Triton, il cui driver C (`compile_module_from_src`, `_build`) fallisce con `RuntimeError: Failed to find C compiler`. L'immagine `v1.0.0-dev.2` carica il modello su CUDA e `/health` risponde `200`, ma la prima inferenza autenticata risponde `500`. Non sono token, JSON o hardware.
@@ -455,7 +480,7 @@ Scelte che contano:
   minuti, non secondi;
 - **bind `0.0.0.0` dentro, `127.0.0.1:5005:5005` fuori**: il confine di rete lo mette docker,
   documentato nel README perché un `-p 5005:5005` distratto esporrebbe l'anonimizzatore alla LAN;
-- `HEALTHCHECK` su `/health`, che è readiness senza inferenza (503 finché il modello carica).
+- `HEALTHCHECK` su `/health`, che è readiness senza inferenza (503 finche' il modello carica).
 
 `Dockerfile.linux` resta quello che era: l'ambiente di **build** dei bundle .deb/AppImage, non
 un modo di far girare l'app. Il `.dockerignore` ora riammette `src/app/` (era `*`, pensato per

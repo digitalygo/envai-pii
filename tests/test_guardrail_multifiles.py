@@ -1371,10 +1371,21 @@ class GuardrailExtractUnit(unittest.TestCase):
 
         document = Uninspectable()
         fake_fitz = MagicMock()
-        fake_fitz.open.return_value = document
+        opened = False
+        deadline_raised = False
+        current_document = document
+
+        def open_document(*_args, **_kwargs):
+            nonlocal opened
+            opened = True
+            return current_document
+
+        fake_fitz.open.side_effect = open_document
         with patch.object(self.APP, "fitz", fake_fitz):
             def check_deadline():
-                if fake_fitz.open.called:
+                nonlocal deadline_raised
+                if opened and not deadline_raised:
+                    deadline_raised = True
                     raise pii_dictionary.DeadlineExceeded()
 
             with self.assertRaises(pii_dictionary.DeadlineExceeded):
@@ -1390,7 +1401,9 @@ class GuardrailExtractUnit(unittest.TestCase):
             raise RuntimeError("close failed")
 
         failed_close.close = close_with_error
-        fake_fitz.open.return_value = failed_close
+        current_document = failed_close
+        opened = False
+        deadline_raised = False
         with patch.object(self.APP, "fitz", fake_fitz):
             with self.assertRaises(pii_dictionary.DeadlineExceeded):
                 self.APP._guardrail_extract(
@@ -1404,11 +1417,15 @@ class GuardrailExtractUnit(unittest.TestCase):
             def __exit__(self, *_exc):
                 return False
 
-        fake_fitz.open.return_value = NoClose()
+        no_close = NoClose()
+        current_document = no_close
+        opened = False
+        deadline_raised = False
         with patch.object(self.APP, "fitz", fake_fitz):
             with self.assertRaises(pii_dictionary.DeadlineExceeded):
                 self.APP._guardrail_extract(
                     "misnamed.txt", b"%PDF-valid", 100, check_deadline)
+        self.assertEqual(fake_fitz.open.call_count, 3)
 
     def test_deadline_immediata_dopo_get_text_precede_blank_check(self):
         class Page:

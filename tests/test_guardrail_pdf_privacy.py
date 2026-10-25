@@ -594,14 +594,46 @@ class ExtractFinallyReset(unittest.TestCase):
 
     def test_deadline_dopo_open_chiude_documento_e_reset(self):
         document = _FakeDoc()
+        opened = False
+        deadline_raised = False
+        fake = self._patched(document=document)
+
+        def open_document(*_args, **_kwargs):
+            nonlocal opened
+            opened = True
+            return document
+
+        fake.open.side_effect = open_document
 
         def check_deadline():
-            raise self.APP.pii_dictionary.DeadlineExceeded()
+            nonlocal deadline_raised
+            if opened and not deadline_raised:
+                deadline_raised = True
+                raise self.APP.pii_dictionary.DeadlineExceeded()
 
-        self._patched(document=document)
         with self.assertRaises(self.APP.pii_dictionary.DeadlineExceeded):
             self.APP._guardrail_extract("a.pdf", b"%PDF-", 100, check_deadline)
+        fake.open.assert_called_once()
         self.assertTrue(document.closed)
+        self._assert_reset_once()
+
+    def test_deadline_prima_di_open_recupera_pdf_lane(self):
+        document = _FakeDoc()
+        fake = self._patched(
+            document=document, collect=lambda *_args, **_kwargs: "Hello")
+
+        def expired():
+            raise self.APP.pii_dictionary.DeadlineExceeded()
+
+        with self.assertRaises(self.APP.pii_dictionary.DeadlineExceeded):
+            self.APP._guardrail_extract("a.pdf", b"%PDF-", 100, expired)
+        fake.open.assert_not_called()
+        fake.TOOLS.mupdf_warnings.assert_not_called()
+        self.assertTrue(self.APP.MUPDF_PRIVACY_OK)
+
+        self.assertEqual(self.APP._guardrail_extract(
+            "a.pdf", b"%PDF-", 100, lambda: None), "Hello")
+        fake.open.assert_called_once()
         self._assert_reset_once()
 
     def test_reset_rotto_non_sostituisce_errore_e_blocca_i_pdf_successivi(self):

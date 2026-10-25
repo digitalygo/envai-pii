@@ -1,5 +1,5 @@
 ---
-status: blocked
+status: in_progress
 created_at: 2026-10-21
 updated_at: 2026-10-25
 files_edited:
@@ -29,6 +29,23 @@ files_edited:
   - tests/test_ci_publish.py
   - tests/test_ci_scan.py
   - docs/ci-release.md
+  - src/app/request_admission.py
+  - src/app/runtime_execution.py
+  - src/app/gunicorn_config.py
+  - src/app/guardrail_api.py
+  - src/app/app.py
+  - src/app/pdf_export.py
+  - Dockerfile
+  - tests/test_request_admission.py
+  - tests/test_guardrail_concurrency.py
+  - tests/test_runtime_execution.py
+  - tests/test_codifiche.py
+  - tests/test_guardrail_api.py
+  - tests/test_guardrail_categories.py
+  - tests/test_guardrail_multifiles.py
+  - tests/test_guardrail_pdf_privacy.py
+  - docs/GUARDRAIL_API.md
+  - docs/guardrail-openapi.yaml
 rationale:
   - Prepare GPU execution of the existing HTTP service without changing training or the CPU deployment.
   - Require working CUDA and authenticate the entire cloud API before request bodies or legacy routes are reached.
@@ -480,3 +497,51 @@ Publication evidence is in `/tmp/envai-pii-triton-publish-full.log`, `/tmp/envai
 Updated the deployment and CI guides and changelog to distinguish this verified new artifact from the still-running old image. These final edits are documentation-only and do not change the released executable tree. Main remains at `30d6f9c675e245bc8494df959adaeaa9d8de35c7`.
 
 The user-created Pod `2glj7taobhnhvg` has not been modified. Asked for explicit permission to apply the new image and restart only its container, preserving the GPU. That approval and the subsequent real GPU forward/full synthetic smoke remain pending. The operation therefore stays blocked rather than declaring the live 500 repaired.
+
+## Update 2026-10-25: verified v3 GPU serving and later user shutdown
+
+The user subsequently explicitly approved the v3 image update and in-place container restart. Backend operations were delegated; a transient member log-read failure caused no mutation, and the leader independently obtained a fresh successful native log read before resuming. Applied only the image field to Pod `2glj7taobhnhvg`, then restarted its container once. No stop/start, GPU resize, migration, recreation or other resource mutation occurred.
+
+Independent before/after native reads confirmed `RUNNING`, the exact v3 digest, A40 x1, EU-SE-1 and the same configuration: env mapping byte-for-byte, args, GPU, disk, mounts, ports, cloud, cost, registry, template, lock and networking. System logs confirmed download of the exact approved digest and container start at 23:46:23Z on 2026-10-24; container logs confirmed `Listening at: http://0.0.0.0:5005`, gthread, model loading on GPU and `Modello pronto.` at 23:46:30.806776880Z. No secret values were printed or copied.
+
+The leader then executed the entire six-check remote synthetic smoke through the HTTPS proxy: CUDA health, unauthenticated guardrail/legacy rejection, actual JSON inference, seed reuse and multipart aggregate all passed. Additional default-category JSON and real synthetic PDF extraction/anonymization plus legacy redacted PDF returned 200; originals were absent from the tested anonymized text/PDF. Recorded request times were 0.51, 0.32 and 0.34 seconds, and the six-check smoke took 2.52 seconds total. These are functional observations, not load-capacity or accuracy benchmarks. Independent unit discovery also passed all 823 tests without skips. Evidence: `/tmp/envai-pii-runpod-v3-unit.log` and `/tmp/envai-pii-runpod-v3-live-checks.json`.
+
+The earlier compiler-related 500 is therefore resolved for those verified real-GPU synthetic cases. Afterward, the user reported stopping the Pod for the night. That later statement supersedes the historical running state and observed $0.59/h rate; the current control-plane state was not queried during the following source-development phase and no restart was performed there. Local parameters remain outside Git, without a literal token in their Markdown file; the existing private Postman collection was not changed by the deployment.
+
+## Update 2026-10-25: approved bounded concurrent admission
+
+### Decision and scope
+
+Before load testing, the user explicitly requested removal of the one-in-flight HTTP restriction and approved four configurable active analyses with a short finite queue. The old lock was deliberate backpressure, but rejected the second overlapping request regardless of available HTTP capacity. Its behavior is replaced by bounded FIFO admission; a one-line lock removal or adding GPU workers was rejected because shared Transformers state, PyMuPDF thread safety and the process-local preview cache require separate treatment.
+
+The standard library resolves this feature without a new dependency or application stack. Implementation was split into disjoint admission/server and native-runtime slices. Only backend-dev-b was eligible: the other backend members' shared OpenRouter provider was already unavailable with HTTP 402 in this session, so a same-task race was not possible. Training, model and dependency pins, auth, category semantics, payload field sets, sensitive-data logging policy and main remain unchanged.
+
+### Implemented behavior
+
+- `PII_MAX_CONCURRENT_ANALYSES`: startup default 4, valid minimum 1 and hard maximum 16.
+- `PII_MAX_QUEUED_ANALYSES`: startup default 4, valid minimum 0 and hard maximum 32. Zero disables queuing.
+- `PII_QUEUE_TIMEOUT_SECONDS`: startup default 5 seconds, positive finite values, hard maximum 30 seconds. Invalid values use safe defaults and values above ceilings are clamped.
+- Configuration/token, credential and model-readiness gates run before admission. Waiting requests do not read or parse the body. Admitted waiters read and process it normally; only an unavailable/full queue or an expired admission wait produces the existing 429 busy envelope before body access.
+- FIFO controller state retains waiter tokens rather than payloads. Leases release once on every processing exit; cancellation, clock errors, timed-out waiters and error paths are covered. Explicit legacy lock injection remains available for internal callers and tests; the real default blueprint uses the new controller.
+- Queue wait is bounded separately from the existing cooperative analysis budget, which still starts after the bounded body read. Waiting for native execution during analysis consumes that processing budget. Already-running native calls remain non-preemptible; neither a client timeout nor Gunicorn heartbeat changes the RunPod proxy limit.
+- Two dedicated single-owner threads protect native operations, one for the single shared model and one for every service PyMuPDF entrypoint, including startup diagnostics, reset, extraction, rendering and export. Native PDF objects do not cross thread boundaries. Reentrant PDF helper calls execute inline on their owner.
+- A submission gate remains owned until scheduled native work completes, avoiding a hidden executor backlog. If submit fails after queuing, the lane closes, cancels queued jobs and waits for running work before freeing the gate; repeated failures cannot accumulate orphan payloads. Expired native waiters do not start work.
+- Both container commands load a shared pure Gunicorn config: one gthread worker, no preload, and active plus queued capacity plus two service threads, default 10. It imports no Torch, app or native executor before worker fork. The preview cache remains in the same process.
+
+Four admitted HTTP analyses do not mean four parallel GPU forwards or four times throughput: model calls remain intentionally serialized for safety while other request phases can overlap. Real GPU concurrency and load capacity must be measured with the new artifact, not inferred from the previous v3 functional smoke.
+
+### Independent verification and corrections
+
+The orchestrator independently ran the declared full suite with real Flask/PyMuPDF and mocked model: **856 tests passed, no skips**. All **236/236 modified or added production executable lines are covered, 100%**. The native helper has 100% branch coverage, admission has all lines covered with 99% branch coverage, and Gunicorn config has 100% statement coverage. Actual Gunicorn 26.2 config parsing confirmed default 10 threads, mixed setting 11, maximum 50 and queue-disabled 3, always one gthread worker and no preload. YAML validation confirmed OpenAPI 0.4.0 and unchanged JSON request/response field sets. `git diff --check` passed.
+
+Tests exercise four active requests, four FIFO waiters, ninth-request rejection without body access, auth/readiness precedence, timeout/cancellation/permit recovery, mixed JSON and real synthetic PDF requests with independent nonempty dictionary deltas, owner-thread identity, bounded native submission, nested calls, deadlines and interrupted/failed submissions. Existing AST fixtures use the actual runtime helper; no dummy execution path or test skip was introduced.
+
+Three old deadline fixtures needed a justified update: the new owner-before-native checkpoint preserves the existing immediate post-model check, and PDF fixtures now expire after the actual open event rather than counting callbacks. All close/reset/error-precedence assertions remain, with an extra pre-open-expired/no-open recovery regression. No test was deleted or weakened. An initial parallel local matrix attempt stalled on pre-existing Node workflow tests under host resource pressure; sequential full runs passed, with no unrelated host process killed or repository test altered to hide that signal.
+
+Initial source review found only documentation inconsistencies: wording conflated waiting with rejection, final test status was stale, and historical Pod-running observations conflicted with the later shutdown. Those were corrected and the deterministic suite rerun. Final independent hybrid quality judgment: **PASS**. Focused core-API security review and the native-submit cleanup follow-up: **PASS**; the orphan-retention advisory was closed by actual code and regression tests, not waived.
+
+Evidence: `/tmp/envai-pii-concurrency-tests-final.log`, `/tmp/envai-pii-concurrency-coverage.json`, `/tmp/envai-pii-concurrency-delta-coverage.txt`, `/tmp/envai-pii-concurrency-baseline.sha256` and `/tmp/envai-pii-concurrency-preexisting-docs.diff`. Source implementation, test fixture changes, contracts and documentation have been independently inspected. The pre-existing three documentation additions are preserved, with historical state labeled explicitly.
+
+### Release and live-validation boundary
+
+The accepted source is ready for CI image publication. No new artifact, GPU concurrency result, throughput claim, Pod restart or provider configuration mutation is yet asserted for this concurrency phase. The user-reported shutdown remains respected. Publication and subsequent real-device testing are separate from the completed local implementation and review gates.

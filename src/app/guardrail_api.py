@@ -21,7 +21,7 @@ Sicurezze coperte qui:
     canonici, mai prefs/EXCLUDED_TAGS/env/CLI; assente o vuota = catalogo intero;
   - autenticazione Bearer con secrets.compare_digest su bytes (token Unicode compreso),
     fail-closed 503 se PII_API_TOKEN manca o e' vuoto, 401 se assente o sbagliato;
-  - un solo processo alla volta per endpoint (lock non bloccante, rilascio in finally);
+  - admissione FIFO per processo con concorrenza e coda finite, rilascio in finally;
   - deadline cooperativa (default 60 s, override server PII_ANALYSIS_TIMEOUT_SECONDS)
     controllata ai confini di fase;
   - errori sanificati {error, code}, nessun valore della richiesta o eccezione;
@@ -32,12 +32,12 @@ import json
 import math
 import os
 import secrets
-import threading
 import time
 
 import guardrail_inputs
 import guardrail_limits
 import pii_dictionary
+import request_admission
 from pii_dictionary import MAX_TEXT_CHARS
 
 try:                                             # il guscio HTTP serve solo in produzione
@@ -440,20 +440,18 @@ def _handle_multipart(raw_body, params, *, tags, detect, detect_for_categories,
 
 
 def process_request(headers, raw_body, *, token, tags, detect, extract=None,
-                    clock=time.monotonic, lock, readiness=None,
-                    detect_for_categories=None):
+                    clock=time.monotonic, lock=None, admission=None,
+                    readiness=None, detect_for_categories=None):
     """Cuore della richiesta, indipendente da Flask. Ritorna (status, corpo).
 
     Ordine di valutazione: configurazione (503 se il token manca o e' vuoto),
-    credenziali (401), disponibilita' del modello (503), poi lock per-request (429).
-    Autenticazione, readiness e lock precedono la lettura del body: una richiesta
-    non autorizzata o respinta perche' un'altra analisi e' in corso non
-    materializza mai il payload. `raw_body` puo' essere bytes (gia' letto) oppure
-    una callable `reader(cap)` che legge il body GREZZO bounded dentro il lock;
-    `extract` e' la callback che estrae un file multipart; `detect_for_categories`
-    e' il binder opzionale che, SOLO per una selezione attiva, restituisce il
-    rilevatore request-local filtrato. Il lock viene SEMPRE rilasciato, su ogni
-    uscita, grazie al finally.
+    credenziali (401), disponibilita' del modello (503), poi admissione o lock (429).
+    Autenticazione, readiness e admissione precedono la lettura del body: una
+    richiesta non autorizzata, in coda o respinta non materializza il payload.
+    `raw_body` puo' essere bytes (gia' letto) oppure una callable `reader(cap)` che
+    legge il body GREZZO bounded dopo l'acquisizione. `extract` estrae un file
+    multipart; `detect_for_categories` lega un rilevatore request-local. Le risorse
+    acquisite vengono SEMPRE rilasciate, su ogni uscita, grazie al finally.
     """
     if token is None or not str(token).strip():
         return _error(503, "unavailable")
@@ -470,8 +468,18 @@ def process_request(headers, raw_body, *, token, tags, detect, extract=None,
         except Exception:
             return _error(500, "internal_error")
 
-    if not lock.acquire(blocking=False):
-        return _error(429, "busy")
+    lease = None
+    lock_acquired = False
+    if admission is not None:
+        lease = admission.acquire()
+        if lease is None:
+            return _error(429, "busy")
+    else:
+        if lock is None:
+            raise TypeError("process_request requires a lock or admission controller")
+        if not lock.acquire(blocking=False):
+            return _error(429, "busy")
+        lock_acquired = True
     try:
         try:
             return _handle_locked(headers, raw_body, tags=tags, detect=detect,
@@ -494,7 +502,10 @@ def process_request(headers, raw_body, *, token, tags, detect, extract=None,
             # richiesta, il token o testo del documento. Niente log, niente traceback.
             return _error(500, "internal_error")
     finally:
-        lock.release()
+        if lease is not None:
+            lease.release()
+        elif lock_acquired:
+            lock.release()
 
 
 # --------------------------------------------------------------------------- #
@@ -540,8 +551,8 @@ def _flask_response(status, body):
 
 
 def create_blueprint(tags, detect, clock=time.monotonic, lock=None, readiness=None,
-                     extract=None, detect_for_categories=None):
-    """Blueprint con l'endpoint versionato. `lock` e' iniettabile per i test.
+                     extract=None, detect_for_categories=None, admission=None):
+    """Blueprint versionato con admissione di processo o lock legacy iniettabile.
 
     `extract` e' la callback che estrae un file della richiesta multipart
     (firma: `extract(name, data, remaining_chars, check_deadline)`); JSON e
@@ -549,23 +560,25 @@ def create_blueprint(tags, detect, clock=time.monotonic, lock=None, readiness=No
     """
     if Blueprint is None:
         raise RuntimeError("Flask non e' disponibile: impossibile creare l'endpoint guardrail.")
-    if lock is None:
-        lock = threading.Lock()
+    if lock is not None and admission is not None:
+        raise ValueError("provide either lock or admission, not both")
+    if lock is None and admission is None:
+        admission = request_admission.RequestAdmission()
     tags = tuple(tags)
 
     blueprint = Blueprint("guardrail_api", __name__, url_prefix="/api/v1")
+    blueprint.request_admission = admission
 
     @blueprint.route("/analyses", methods=["POST"])
     def create_analysis():
-        # Il body non viene letto qui: process_request valuta token, credenziali,
-        # readiness e lock prima, e legge il body GREZZO bounded dentro il lock.
-        # Gli errori di lettura (413 del framework, stream rotto) sono sanificati
-        # li' dentro.
+        # Il body non viene letto qui: process_request valuta token, credenziali e
+        # readiness prima dell'admissione, poi legge il body GREZZO bounded.
         status, body = process_request(
             request.headers, _read_body,
             token=os.environ.get("PII_API_TOKEN"),
             tags=tags, detect=detect, extract=extract, clock=clock, lock=lock,
-            readiness=readiness, detect_for_categories=detect_for_categories,
+            admission=admission, readiness=readiness,
+            detect_for_categories=detect_for_categories,
         )
         return _flask_response(status, body)
 

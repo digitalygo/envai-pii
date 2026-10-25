@@ -2,14 +2,16 @@ openapi: 3.1.0
 
 info:
   title: envai-pii guardrail API (ENVAS-23)
-  version: 0.3.0
+  version: 0.4.0
   summary: Stateless PII guardrail with a caller-supplied dictionary seed
   description: |
-    Contract for the ENVAS-23 guardrail API, schema version 0.3.0. The 0.3.0 schema adds
-    one optional request field, `categories`, to both arms. When `categories` is absent
-    or empty the historical default applies (all 24 categories), the success-response
-    shape is unchanged. JSON body and dictionary capacities now have larger bounded
-    defaults and server-configurable hard ceilings; text and file limits remain unchanged.
+    Contract for the ENVAS-23 guardrail API, version 0.4.0. This behavioral revision
+    documents bounded HTTP admission and server configuration; it does not change the
+    request or response schemas. The 0.3.0 schema added one optional request field,
+    `categories`, to both arms. When `categories` is absent or empty the historical
+    default applies (all 24 categories), and the success-response shape is unchanged.
+    JSON body and dictionary capacities now have larger bounded defaults and
+    server-configurable hard ceilings; text and file limits remain unchanged.
 
     Implementation status: both request arms are implemented in this repository. The JSON
     arm uses the dependency-free engine in `src/app/pii_dictionary.py`, the HTTP shell in
@@ -21,9 +23,14 @@ info:
     `tests/test_guardrail_multifiles.py` and `tests/test_guardrail_pdf_privacy.py`, with
     the bounded collector in `tests/test_pdf_text_limits.py`; category selection has
     dedicated coverage in `tests/test_guardrail_categories.py`. Pre-body ordering is
-    explicit: token configuration, credentials, model readiness and lock checks yield
-    503, 401, 503 or 429 before the body is read; media type and charset are validated
-    and the body cap is chosen for the media type before the bounded read. In
+    explicit: token configuration, credentials and model readiness yield 503, 401 and
+    503 before admission. Admission is a bounded per-process active limit with a finite
+    FIFO queue. When all active slots are occupied, a full or disabled queue yields
+    429 immediately and a queued request whose wait expires also yields 429; neither
+    outcome reads or parses the body. An admission lease is held through the bounded
+    body read and all processing, then released on every outcome. After admission,
+    media type and charset are validated and the body cap is chosen before the bounded
+    read. In
     combined-invalid cases these pre-body outcomes take precedence over body-level
     errors, so historical JSON error precedence is not preserved. The guardrail PDF
     branch requires native MuPDF privacy controls: when they are missing or broken only
@@ -56,9 +63,10 @@ info:
     Authentication is a server-only Bearer secret from the `PII_API_TOKEN` environment
     variable. The value is never documented, logged or echoed. When the secret is unset
     or blank the endpoint is disabled and answers 503; missing or wrong credentials
-    answer 401. Authentication, model readiness and the per-process lock are evaluated
-    before any body byte is read, so an unauthenticated or busy request is answered
-    without touching the payload. POST errors are sanitized to `{error, code}` with
+    answer 401. Authentication and model readiness are evaluated before admission, and
+    the body is read only after an admission lease is acquired. Authentication failures,
+    unavailable readiness, a full or disabled queue, and expired queue waits therefore
+    do not read or parse body bytes. POST errors are sanitized to `{error, code}` with
     stable codes and never echo request values, filenames, authorization headers or the
     token. Successful responses intentionally contain input-derived `anonymized_text` and
     newly allocated original values in `dictionary_delta`; text not detected as PII stays
@@ -85,17 +93,35 @@ info:
     extracted inputs remain 100000 Unicode characters and one PDF remains capped at 200
     pages. The effective seed plus new delta must satisfy the same dictionary limits
     before success. Size and count caps answer 413 `payload_too_large`; the `categories`
-    raw-item cap is a value validation answered with 400 `invalid_request`. The processing deadline is a server-configured cooperative
-    budget: the non-secret `PII_ANALYSIS_TIMEOUT_SECONDS` environment variable holds a
-    positive finite float in seconds, defaults to 60 when unset or blank, and falls back
-    safely to 60 for invalid values (non-numeric text, zero, negative, NaN, infinity or
-    overflow). It is read once per request before the deadline snapshot, is not a
-    request field, and a longer client or Postman timeout cannot override it. The
-    budget starts after the bounded body read inside the owned lock and is global over
-    parsing, extraction, all inputs and allocation for both arms. It is not a hard
-    cancellation or completion guarantee: it cannot interrupt a native PDF operation or
-    an in-flight model call. One analysis in flight per process; contention answers 429
-    without queueing and without reading the body.
+    raw-item cap is a value validation answered with 400 `invalid_request`. The
+    processing deadline is a server-configured cooperative budget: the non-secret
+    `PII_ANALYSIS_TIMEOUT_SECONDS` environment variable holds a positive finite float in
+    seconds, defaults to 60 when unset or blank, and falls back safely to 60 for invalid
+    values (non-numeric text, zero, negative, NaN, infinity or overflow). It is resolved
+    once per admitted request after the bounded body read, is not a request field, and a
+    longer client or Postman timeout cannot override it. The budget covers parsing,
+    extraction, all inputs and allocation for both arms; queue wait is separate and does
+    not consume this processing budget. Time spent waiting for serialized native
+    execution is part of the processing budget. The deadline is cooperative, not a hard
+    cancellation or completion guarantee: it cannot interrupt an in-flight model call or
+    native PDF operation.
+
+    HTTP admission is configured only by server environment variables.
+    `PII_MAX_CONCURRENT_ANALYSES` accepts integers from 1 to 16 (default 4); invalid
+    values or values below 1 use the
+    default and values above 16 are clamped. `PII_MAX_QUEUED_ANALYSES` accepts integers
+    from 0 to 32 (default 4); invalid values or values below 0 use the default, values
+    above 32 are clamped, and 0 disables queueing. `PII_QUEUE_TIMEOUT_SECONDS` accepts
+    a positive finite float up to 30 seconds (default 5); invalid, non-positive or
+    non-finite values use the default and values above 30 are clamped. These settings are
+    resolved at process startup and remain frozen until restart; they are not request
+    properties. Admission limits are per process. The provided Gunicorn configuration
+    uses one worker, sets `preload_app` to false, and sizes the request thread pool to
+    active capacity plus queue capacity plus two (10 threads with defaults). More HTTP
+    admission capacity does not make native model forwards concurrent or guarantee
+    throughput improvement: model
+    execution remains serialized in its native lane, PDF work uses a separate
+    single-thread lane, and native objects do not cross those lanes.
 
     `categories` is a request-only whitelist of canonical `TAG_NAMES` labels that selects
     which labels are anonymized on every file and on the optional `text`. Absent, `null`,
@@ -144,7 +170,13 @@ paths:
         returns one result per file in part order (`file_1`..`file_10`), then `text`;
         `dictionary_delta` is one aggregate map for the whole request. The cooperative
         processing budget is server-configured (`PII_ANALYSIS_TIMEOUT_SECONDS`, positive
-        finite float seconds, default 60) and is never taken from the request.
+        finite float seconds, default 60) and is never taken from the request. HTTP
+        admission uses server-only `PII_MAX_CONCURRENT_ANALYSES` (1..16, default 4),
+        `PII_MAX_QUEUED_ANALYSES` (0..32, default 4; 0 disables queueing), and
+        `PII_QUEUE_TIMEOUT_SECONDS` (positive finite float up to 30, default 5). Invalid
+        values use safe defaults, values above each ceiling are clamped, and settings are
+        frozen at process startup. Queue wait is separate from the processing budget;
+        after admission, a lease covers the bounded body read and entire processing.
 
         `categories` is an optional request-only whitelist of canonical `TAG_NAMES`
         labels, for example `["FULLNAME", "EMAIL"]`. Absent, `null`, `[]` and
@@ -178,12 +210,14 @@ paths:
         statuses, codes and messages once the pre-body checks pass, and adds only the
         optional `categories` field to the request schema. JSON-body and dictionary
         capacities use the bounded server defaults and hard ceilings above. Request-order
-        outcomes can differ when multiple conditions are invalid: configuration, credentials,
-        readiness and lock are checked before reading the body, then the overall media type
-        and charset are validated and the body cap is chosen before the bounded read, so
-        503, 401, 503 or 429 takes precedence, and an unsupported type or charset answers
-        415 without reading the body. This does not preserve every historical JSON error
-        outcome.
+        outcomes can differ when multiple conditions are invalid: configuration,
+        credentials and readiness are checked first; then admission is acquired, possibly
+        after a bounded FIFO queue wait. Only after admission are the overall media type
+        and charset validated and the body cap chosen before the bounded read. Thus
+        configuration, authorization, readiness and admission outcomes take precedence
+        over body errors; a full or disabled queue and an expired queue wait answer 429
+        without reading or parsing the body, while an unsupported type or charset answers
+        415 without reading it. This does not preserve every historical JSON error outcome.
 
         Multipart file errors are all-or-nothing: the accepted-extension whitelist is
         checked first, so an unsupported extension answers 415 `unsupported_file_type`
@@ -436,8 +470,11 @@ components:
             $ref: '#/components/schemas/Error'
     Busy:
       description: |
-        Another analysis is already in flight in this process. The request is rejected
-        immediately, not queued, and its body is not read. Code: `busy`.
+        No admission slot was available: all active slots and the finite FIFO queue were
+        full, queueing was disabled while active slots were occupied, or the queue wait
+        expired. Every case uses the existing 429 envelope and message `Another analysis
+        is in progress.` with code `busy`; it adds no response fields or error codes.
+        Rejected requests do not read, decode or parse body bytes.
       headers:
         Cache-Control:
           $ref: '#/components/headers/NoStore'
@@ -460,8 +497,8 @@ components:
     Unavailable:
       description: |
         `PII_API_TOKEN` is unset or blank, so the endpoint is disabled; the model is not
-        ready (readiness is checked before the per-process lock, even when the text could
-        be resolved entirely from the seed or from placeholders already present); the
+        ready (readiness is checked before admission, even when the text could be resolved
+        entirely from the seed or from placeholders already present); the
         detector became unavailable mid-request; the native MuPDF privacy controls
         required by the guardrail PDF branch are missing or broken; or the service is
         unavailable. Code: `unavailable`. The PDF condition blocks only PDF extraction:
@@ -478,12 +515,14 @@ components:
       description: |
         The configured cooperative processing budget was reached: the non-secret
         `PII_ANALYSIS_TIMEOUT_SECONDS` positive finite float in seconds, default 60 when
-        unset, blank or invalid. The budget starts after the bounded body read, inside
-        the owned lock, is read once per request before the deadline snapshot, cannot be
-        set by the client, and cannot interrupt an in-flight model call or a native PDF
-        operation, so it is not a cancellation or completion guarantee: deployments must
-        also set a hard worker or proxy timeout longer than the configured budget plus
-        the upload and native-work margin. Code: `deadline_exceeded`.
+        unset, blank or invalid. It is resolved once per admitted request after the
+        bounded body read, is independent of and does not include the queue-wait timeout,
+        and cannot be set by the client. Time spent waiting for a serialized native
+        execution lane counts toward this budget. It cannot interrupt an in-flight model
+        call or a native PDF operation, so it is not a cancellation or completion
+        guarantee: deployments must also set a hard worker or proxy timeout longer than
+        the configured budget plus upload and native-work margin. Code:
+        `deadline_exceeded`.
       headers:
         Cache-Control:
           $ref: '#/components/headers/NoStore'

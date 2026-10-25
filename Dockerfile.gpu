@@ -87,10 +87,11 @@ EXPOSE 5005
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
   CMD python -c "import json, os, sys, urllib.request; r=urllib.request.urlopen(f\"http://127.0.0.1:{os.environ['PII_PORT']}/health\", timeout=4); p=json.load(r); sys.exit(0 if r.status == 200 and p.get('model_loaded') is True and p.get('device') == 'cuda' else 1)"
 
-# One worker keeps one model copy on the GPU; four threads serve requests. No
-# --preload: the factory runs in the worker and can fail closed on token or GPU
+# One worker keeps one model copy on the GPU; the config derives threads from
+# admission capacity plus two service threads. No --preload: the factory runs in
+# the worker and can fail closed on token or GPU
 # errors. --timeout 600 is Gunicorn's worker liveness budget, not a hard
 # per-request deadline for gthread workers, so a proxy timeout must sit above
 # PII_ANALYSIS_TIMEOUT_SECONDS plus upload and native PDF margin. Access logs
 # are intentionally disabled because requests can carry personal data.
-CMD ["sh", "-c", "exec gunicorn --chdir /app/src/app --bind \"${PII_HOST}:${PII_PORT}\" --worker-class gthread --workers 1 --threads 4 --timeout 600 --graceful-timeout 30 --access-logfile /dev/null --error-logfile - 'cloud_service:create_app()'"]
+CMD ["sh", "-c", "exec gunicorn --config /app/src/app/gunicorn_config.py --chdir /app/src/app --bind \"${PII_HOST}:${PII_PORT}\" --worker-class gthread --workers 1 --timeout 600 --graceful-timeout 30 --access-logfile /dev/null --error-logfile - 'cloud_service:create_app()'"]

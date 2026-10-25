@@ -221,7 +221,7 @@ class GpuImageContract(unittest.TestCase):
             with self.assertRaises(ValueError):
                 run_check("80.10.2", {"jaraco.context": "6.1.0", "wheel": "invalid"})
 
-    def test_gunicorn_single_worker_four_threads_factory_without_preload(self):
+    def test_gunicorn_single_worker_derived_threads_factory_without_preload(self):
         commands = [line for line in self.instructions if line.startswith("CMD ")]
         self.assertEqual(len(commands), 1)
         command = commands[0]
@@ -231,8 +231,9 @@ class GpuImageContract(unittest.TestCase):
         self.assertIn("exec gunicorn", command)
         self.assertIn("cloud_service:create_app()", command)
         self.assertIn("--worker-class gthread", command)
+        self.assertIn("--config /app/src/app/gunicorn_config.py", command)
         self.assertRegex(command, r"--workers\s+1(?:\s|$)")
-        self.assertRegex(command, r"--threads\s+4(?:\s|$)")
+        self.assertNotRegex(command, r"--threads(?:\s|=)")
         self.assertRegex(command, r"--timeout\s+600(?:\s|$)")
         self.assertRegex(command, r"--graceful-timeout\s+30(?:\s|$)")
         self.assertIn("${PII_HOST}:${PII_PORT}", command)

@@ -545,3 +545,21 @@ Evidence: `/tmp/envai-pii-concurrency-tests-final.log`, `/tmp/envai-pii-concurre
 ### Release and live-validation boundary
 
 The accepted source is ready for CI image publication. No new artifact, GPU concurrency result, throughput claim, Pod restart or provider configuration mutation is yet asserted for this concurrency phase. The user-reported shutdown remains respected. Publication and subsequent real-device testing are separate from the completed local implementation and review gates.
+
+### Bounded-concurrency artifact published
+
+Committed and pushed the reviewed feature as `0f161021b03b630ecf03556b6bf3cfe2f074cf75`, `feat(api): add bounded concurrent analysis queue`. [Release run 40194500271](https://github.com/digitalygo/envai-pii/actions/runs/40194500271) succeeded on Python 3.11, 3.13 and 3.14 and created [v1.0.0-dev.4](https://github.com/digitalygo/envai-pii/releases/tag/v1.0.0-dev.4). [Publisher run 40194544097](https://github.com/digitalygo/envai-pii/actions/runs/40194544097) completed all tests, build, remote identity, scan, promotion and tag-readback steps.
+
+- Published digest: `sha256:c71a392411ab14aed2d4b28bb8e84e5e727f32df6e24e5238b11715d3fbaf9ef`.
+- Config digest: `sha256:5bc8d0974a646e01ad9358813a79acf02c7be52cc8e454b0612dfb309ac1bb2b`.
+- GitHub Packages version ID: `1443057951`.
+- Verified tags: `dev`, `1.0.0-dev.4`, `1.0.0-dev.4-0f161021b03b`.
+- Actual scan result: **`scan gate passed: 0 blocker(s), 247 unfixed ignored`**. The residual is not zero; policy is unchanged, with no finding suppression introduced.
+
+The leader independently confirmed all three tag digests and the registry manifest/config identity. Revision/version labels, user `app`, the new shared Gunicorn config command and absence of a baked API token passed. Docker-specific Healthcheck is omitted by Buildx's typed `.Image` projection, not necessarily by the actual artifact; fetching the raw public config blob and checking its SHA against the manifest proved that the real Docker Healthcheck is preserved. The short-lived anonymous public-registry read token was held only in memory and never printed or persisted. No application or provider secret was used for that verification.
+
+An additional local check used the pre-existing CPU runtime image with the reviewed source mounted read-only, network disabled, capabilities dropped and resource limits. Four simultaneous Flask request handlers completed real CPU model inference with independent nonempty deltas, followed by actual PDF extraction and real model inference through both native-owner lanes. This is stronger packaging/compatibility evidence than mocked inference, but is **not** GPU concurrency or capacity evidence. An earlier optional bounded probe did not finish within its timeout; separate baseline and candidate startup checks and the final unbuffered command completed successfully without further source changes. Every task-specific container was removed.
+
+Evidence: `/tmp/envai-pii-concurrency-publish-full.log`, `/tmp/envai-pii-concurrency-remote-manifest.json`, `/tmp/envai-pii-concurrency-remote-config.json`, `/tmp/envai-pii-concurrency-raw-config.json` and `/tmp/envai-pii-concurrency-real-cpu-final.log`. Deployment/CI guides and changelog were updated to call v4 a published candidate, keep v3's real-GPU tests historical, and retain the pending application and real-GPU-concurrency boundary. These post-publication changes are documentation-only.
+
+No RunPod control-plane read or write, start, restart, new allocation or live load run occurred in this concurrency implementation. The endpoint does not gain v4 merely because the `dev` registry alias moved; its immutable image must be explicitly updated. User approval to apply the new artifact and run the real-device concurrency check is the remaining operational boundary. Main remains unchanged at `30d6f9c675e245bc8494df959adaeaa9d8de35c7`.

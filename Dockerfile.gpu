@@ -5,8 +5,8 @@
 # selected explicitly while .dockerignore keeps the context limited to src/app:
 #   podman build --platform linux/amd64 -f Dockerfile.gpu -t envai-pii:gpu .
 #
-# CUDA userspace dependencies come from the pinned cu130 PyTorch wheel and its
-# package dependencies. The NVIDIA host driver and its CUDA 13 support come
+# CUDA userspace dependencies come from the pinned cu126 PyTorch wheel and its
+# package dependencies. The NVIDIA host driver and its CUDA 12.6 support come
 # from the host; this image installs no NVIDIA driver.
 #
 # No SSH daemon is installed. RunPod HTTPS access needs an authenticated
@@ -38,8 +38,8 @@ RUN printf '%s\n' '#include <Python.h>' '#include <stdlib.h>' 'int main(void) { 
 # direct and transitive requirements from PyPI. pip check validates the result.
 COPY src/app/requirements-gpu.txt /tmp/requirements-gpu.txt
 RUN pip install --no-cache-dir --no-deps \
-      --index-url https://download.pytorch.org/whl/cu130 \
-      "torch==2.13.0+cu130" \
+      --index-url https://download.pytorch.org/whl/cu126 \
+      "torch==2.13.0+cu126" \
  && pip install --no-cache-dir \
       --index-url https://pypi.org/simple \
       -r /tmp/requirements-gpu.txt \
@@ -65,7 +65,7 @@ RUN mkdir -p "${PII_MODEL_DIR}" \
 # Build-time checks only. The builder has no GPU, so this must not call
 # torch.cuda.is_available() nor import the application factory: a CUDA build
 # and a complete model snapshot are the properties that can be verified here.
-RUN python -c "import json, os, pathlib, torch; d=pathlib.Path(os.environ['PII_MODEL_DIR']); assert (d / 'config.json').is_file(), d; json.loads((d / 'config.json').read_text(encoding='utf-8')); assert any(d.glob('*.safetensors')), d; assert torch.version.cuda and torch.version.cuda.startswith('13.'), torch.version.cuda"
+RUN python -c "import json, os, pathlib, torch; d=pathlib.Path(os.environ['PII_MODEL_DIR']); assert (d / 'config.json').is_file(), d; json.loads((d / 'config.json').read_text(encoding='utf-8')); assert any(d.glob('*.safetensors')), d; assert torch.version.cuda == '12.6', torch.version.cuda"
 
 # Only src/app is copied. The model stays root-owned and readable: no
 # recursive chown over the multi-gigabyte model layer.

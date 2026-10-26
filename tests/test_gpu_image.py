@@ -9,9 +9,12 @@ and the absence of build-time secrets or an SSH daemon.
 """
 
 import json
+import os
 import re
 import shlex
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -84,7 +87,7 @@ class GpuImageContract(unittest.TestCase):
                              f"not an exact pin: {line}")
 
         pins = dict(line.split("==", 1) for line in lines)
-        self.assertEqual(pins["torch"], "2.13.0+cu130")
+        self.assertEqual(pins["torch"], "2.13.0+cu126")
         self.assertEqual(pins["transformers"], "5.14.1")
         setuptools_version = re.fullmatch(
             r"(\d+)\.(\d+)\.(\d+)", pins["setuptools"]
@@ -101,11 +104,11 @@ class GpuImageContract(unittest.TestCase):
 
     def test_install_uses_separate_cuda_and_pypi_indexes(self):
         run_text = "\n".join(self.run_lines)
-        torch_index = run_text.index("https://download.pytorch.org/whl/cu130")
+        torch_index = run_text.index("https://download.pytorch.org/whl/cu126")
         pypi_index = run_text.index("https://pypi.org/simple")
         self.assertLess(torch_index, pypi_index)
         self.assertIn("--no-deps", run_text[:pypi_index])
-        self.assertIn('"torch==2.13.0+cu130"', run_text[:pypi_index])
+        self.assertIn('"torch==2.13.0+cu126"', run_text[:pypi_index])
         self.assertIn("-r /tmp/requirements-gpu.txt", run_text[pypi_index:])
         metadata_check_index = run_text.index("importlib.metadata")
         pip_check_index = run_text.index("pip check")
@@ -312,13 +315,77 @@ class GpuImageContract(unittest.TestCase):
         self.assertNotIn("$MODEL_REVISION", python_code)
         self.assertNotIn("$MODEL_DIR", python_code)
 
+    def test_cuda_wheel_channel_is_coupled_and_cu130_is_absent(self):
+        requirements_text = REQUIREMENTS.read_text(encoding="utf-8")
+        self.assertIn("torch==2.13.0+cu126", requirements_text)
+        self.assertIn(
+            "--index-url https://download.pytorch.org/whl/cu126",
+            self.instruction_text,
+        )
+        self.assertIn('"torch==2.13.0+cu126"', self.instruction_text)
+        self.assertNotIn("cu130", requirements_text)
+        self.assertNotIn("cu130", self.text)
+
     def test_build_verifies_cuda_build_and_model_snapshot_without_gpu_probe(self):
-        run_text = "\n".join(self.run_lines)
-        self.assertIn("config.json", run_text)
-        self.assertIn("torch.version.cuda", run_text)
-        self.assertIn("startswith('13.')", run_text)
+        build_runs = [
+            line for line in self.run_lines if "torch.version.cuda" in line
+        ]
+        self.assertEqual(len(build_runs), 1)
+        build_run = build_runs[0]
+        self.assertIn("config.json", build_run)
+        self.assertIn("torch.version.cuda == '12.6'", build_run)
+        self.assertNotIn("startswith(", build_run)
         self.assertNotIn("torch.cuda.is_available", self.instruction_text)
-        self.assertNotIn("cloud_service", run_text)
+        self.assertNotIn("cloud_service", "\n".join(self.run_lines))
+
+    def test_build_cuda_assertion_accepts_only_cuda_12_6_with_a_valid_snapshot(self):
+        build_run = next(
+            line for line in self.run_lines if "torch.version.cuda" in line
+        )
+        shell_words = shlex.split(build_run)
+        self.assertEqual(shell_words[:3], ["RUN", "python", "-c"])
+        self.assertEqual(len(shell_words), 4)
+        check_code = shell_words[3]
+
+        def run_build_check(
+            cuda_version,
+            *,
+            with_config=True,
+            config_text='{"model_type": "pii"}',
+            with_weights=True,
+        ):
+            with tempfile.TemporaryDirectory() as directory:
+                snapshot = Path(directory)
+                if with_config:
+                    (snapshot / "config.json").write_text(
+                        config_text, encoding="utf-8"
+                    )
+                if with_weights:
+                    (snapshot / "model.safetensors").write_bytes(b"")
+                fake_torch = types.SimpleNamespace(
+                    version=types.SimpleNamespace(cuda=cuda_version)
+                )
+                with patch.dict(sys.modules, {"torch": fake_torch}), \
+                        patch.dict(
+                            os.environ, {"PII_MODEL_DIR": str(snapshot)}
+                        ):
+                    exec(check_code, {})
+
+        with self.subTest(cuda="12.6"):
+            run_build_check("12.6")
+        for rejected in (None, "", "12.8", "13.0", "12.60"):
+            with self.subTest(cuda=rejected):
+                with self.assertRaises(AssertionError):
+                    run_build_check(rejected)
+        with self.subTest(case="missing config"):
+            with self.assertRaises(AssertionError):
+                run_build_check("12.6", with_config=False)
+        with self.subTest(case="invalid config"):
+            with self.assertRaises(json.JSONDecodeError):
+                run_build_check("12.6", config_text="not json")
+        with self.subTest(case="missing weights"):
+            with self.assertRaises(AssertionError):
+                run_build_check("12.6", with_weights=False)
 
     def test_runs_as_uid_10001_without_chowning_the_model_layer(self):
         user_lines = [line for line in self.instructions if line.startswith("USER ")]

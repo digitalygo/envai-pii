@@ -5,6 +5,19 @@ Le voci più recenti in alto. (Codice: `src/training/train_pii.py` salvo diverso
 
 ---
 
+## 2026-10-26 - Immagine GPU CUDA 12.6 con PyTorch invariato
+
+Dopo che l'host Verda ha esposto l'API CUDA 12.8 (`12080`) e ha rifiutato l'immagine `cu130`, l'utente ha approvato (`ok, procedi`) il passaggio del packaging a `cu126` mantenendo PyTorch 2.13.0 e il modello v1.5.0. Il sorgente (`Dockerfile.gpu`, `src/app/requirements-gpu.txt`, test) e' gia' aggiornato; questa voce aggiorna la documentazione corrente.
+
+- motivazione: ridurre il requisito del driver host da CUDA 13 a CUDA 12.6; pin accoppiato `torch==2.13.0+cu126` dall'[indice ufficiale cu126](https://download.pytorch.org/whl/cu126/torch/);
+- verifica: suite locale con 901 test superati, senza skip. Configurazione e packaging: copertura di produzione N/A, nessun codice applicativo modificato;
+- invariati: tutti gli altri pin, il modello v1.5.0 e il comportamento dell'API;
+- giudizio di qualita' e revisione di sicurezza mirata del sorgente superati; restano in sospeso pubblicazione dell'immagine e prova dal vivo su GPU. Le immagini pubblicate `dev.3`, `dev.4` e `dev.6` e le misure storiche, inclusi i 6,14 GiB, restano `cu130` e richiedono CUDA 13. Nessuna azione RunPod o Verda e' stata eseguita; il deployment Verda resta su `dev.6`, in pausa.
+
+Dettagli: [guida Verda](verda-service.md#risultati-e-limiti-verificati), [requisiti host RunPod](runpod-service.md#immagine-gpu-e-requisiti-host).
+
+---
+
 ## 2026-10-26 - Aggiornamento OpenSSL richiesto dal gate dell'immagine GPU
 
 La pubblicazione `v1.0.0-dev.5` ha costruito il container ma il gate Trivy ha bloccato due rilevamenti `HIGH` correggibili di `CVE-2026-84782`. I pacchetti `openssl` e `libssl3` ereditati dalla base non venivano aggiornati dalla sola installazione delle dipendenze applicative.

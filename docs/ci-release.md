@@ -70,7 +70,7 @@ Il workflow `docker-publish.yml` si attiva esclusivamente all'evento `release` d
    - **Release stabile `X.Y.Z` (da `main`)**: `X.Y.Z`, `X.Y`, `X`, `latest`, `X.Y.Z-<short-sha12>`.
    - **Pre-release `X.Y.Z-<canale>.N` (da `dev`, `alpha`, `beta`)**: `X.Y.Z-<canale>.N`, `<canale>`, `X.Y.Z-<canale>.N-<short-sha12>` (nessun alias numerico mobile `X` o `X.Y`).
 
-5. **Nessun deploy automatico su RunPod**: il workflow pubblica l'immagine su GHCR ma non avvia ne' aggiorna Pod su RunPod. La compatibilita' con driver host CUDA 13+ e l'inferenza reale su GPU NVIDIA restano da validare sul Pod secondo [`docs/runpod-service.md`](runpod-service.md).
+5. **Nessun deploy automatico su RunPod**: il workflow pubblica l'immagine su GHCR ma non avvia ne' aggiorna Pod su RunPod. Il requisito corrente dell'host e' un driver NVIDIA compatibile con CUDA 12.6 (ricetta `cu126`); le immagini gia' pubblicate, come `dev.6`, restano `cu130` e richiedono CUDA 13. La compatibilita' del nuovo host e l'inferenza reale su GPU NVIDIA restano da validare sul Pod secondo [`docs/runpod-service.md`](runpod-service.md).
 
 ## Segreti, permessi GHCR e integrazioni opzionali
 
@@ -110,7 +110,7 @@ Il file `.github/renovate.json` configura l'aggiornamento delle dipendenze con q
 - **Pianificazione**: finestra settimanale ogni mercoledi' tra le `11:00` e le `13:00` (`Europe/Rome`, espressione `* 11-12 * * 3`), con `automerge: false`, `platformAutomerge: false`, `pinDigests: true` e revisori assegnati automaticamente da `.github/CODEOWNERS` (`@lorenzocamporesi` e `@lucanori`).
 - **Manager abilitati e raggruppamento**: sono attivi solo `pip_requirements` (`requirements.txt` e `src/app/requirements-gpu.txt`), `dockerfile` (`Dockerfile` e `Dockerfile.gpu`), `docker-compose` (`docker-compose.yml`) e `github-actions` (`.github/workflows/*.yml`). Gli aggiornamenti `patch` sono raggruppati in una singola PR per ciascun manager.
 - **Tipi di commit semantici**: gli aggiornamenti di `pip_requirements`, `dockerfile` e `docker-compose` usano il prefisso `build(packages): ...` (che una volta uniti su un ramo di rilascio producono una release **patch**), mentre gli aggiornamenti di `github-actions` usano `ci(github-actions): ...` (che **non** produce release).
-- **Eccezioni manuali per PyTorch e Dockerfile CPU**: una `packageRule` disabilita Renovate esclusivamente per il pacchetto `torch` in `src/app/requirements-gpu.txt` (`torch==2.13.0+cu130`). Quel pin e il pin corrispondente in `Dockerfile.gpu` dipendono dall'indice wheel ufficiale PyTorch `cu130` e vanno aggiornati insieme a mano. Anche i pin `pip install` inline nel `Dockerfile` CPU non sono letti dal manager `dockerfile` (che aggiorna solo il digest dell'immagine `FROM`) e restano a gestione manuale.
+- **Eccezioni manuali per PyTorch e Dockerfile CPU**: una `packageRule` disabilita Renovate esclusivamente per il pacchetto `torch` in `src/app/requirements-gpu.txt` (`torch==2.13.0+cu126`). Quel pin e il pin corrispondente in `Dockerfile.gpu` dipendono dall'indice wheel ufficiale PyTorch `cu126` e vanno aggiornati insieme a mano. Anche i pin `pip install` inline nel `Dockerfile` CPU non sono letti dal manager `dockerfile` (che aggiorna solo il digest dell'immagine `FROM`) e restano a gestione manuale.
 - **Installazione della GitHub App**: il file di configurazione e' nel repository, ma l'accesso effettivo della GitHub App **Renovate** al repository `digitalygo/envai-pii` dipende dall'installazione a livello di organizzazione e va verificato da un amministratore.
 
 ## Procedura di bootstrap e prima attivazione

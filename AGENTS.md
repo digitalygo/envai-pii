@@ -32,6 +32,6 @@ Keep coverage at or above 80 percent of the executable lines added or changed by
 
 The "Never write code comments" quality rule applies to new files. Docstrings are allowed. Do not rewrite existing comments in untouched code.
 
-Renovate manages the Python, Docker, Compose, and GitHub Actions manifests weekly. The CUDA PyTorch pins in `src/app/requirements-gpu.txt` and the matching literal pin in `Dockerfile.gpu` are coupled to the official cu130 wheel index and must be upgraded together by hand. The inline pip pins in `Dockerfile` are also manual.
+Renovate manages the Python, Docker, Compose, and GitHub Actions manifests weekly. The CUDA PyTorch pins in `src/app/requirements-gpu.txt` and the matching literal pin in `Dockerfile.gpu` are coupled to the official cu126 wheel index and must be upgraded together by hand. The inline pip pins in `Dockerfile` are also manual.
 
 When these workflows first land on a releasing branch with no release tags, the landing commit must contain `[skip ci]`; verify that it creates no accidental first release. Follow the [CI activation and bootstrap guide](docs/ci-release.md) before enabling publication. Never reuse local CLI credentials as `RELEASE_TOKEN` automatically.

@@ -1,13 +1,13 @@
 # GPU-only runtime requirements for Dockerfile.gpu.
 #
-# CUDA userspace libraries come from the cu130 PyTorch wheel; the NVIDIA driver
-# and CUDA 13 support are supplied by the host. Do not add torchvision or
+# CUDA userspace libraries come from the cu126 PyTorch wheel; the NVIDIA driver
+# and CUDA 12.6 support are supplied by the host. Do not add torchvision or
 # torchaudio: they are unused here and can break the transformers import.
 #
 # Exact pins for the selected direct dependencies. Update them only after
 # rebuilding and re-running the GPU smoke test.
 
-torch==2.13.0+cu130
+torch==2.13.0+cu126
 transformers==5.14.1
 tokenizers==0.22.2
 setuptools==80.10.2

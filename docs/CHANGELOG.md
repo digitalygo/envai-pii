@@ -5,6 +5,34 @@ Le voci più recenti in alto. (Codice: `src/training/train_pii.py` salvo diverso
 
 ---
 
+## 2026-10-26 - Verda CUDA 12.6 verificata su GPU e scale-to-zero
+
+L'immagine `1.0.0-dev.7` (`cu126`, sorgente `4c4db76ee1712283ba8f5778da70871b2b43e169`, [pubblicazione 40402660173](https://github.com/digitalygo/envai-pii/actions/runs/40402660173)) e' stata distribuita sul deployment Verda `envai-pii-test` e provata su GPU reale con dati sintetici.
+
+- riferimento distribuito: `ghcr.io/digitalygo/envai-pii@sha256:c1d9d9c089047f7c1e4b7b0815e91a12cd810c963ddb58ba1f0da1233e961714`; un solo PATCH `200` ha cambiato solo l'immagine, tutti gli altri parametri invariati (una L40S, min 0, max 1, concorrenza 1, porta 5005, `/health`, comando predefinito, solo `PII_AUTH_MODE=upstream` e timeout 60, nessuna chiave provider, token locale o mount);
+- verifiche: salute GPU reale, JSON con email, riuso del seed, TXT, guardrail testo/PDF mascherati, route legacy `analyze` e `preview/pdf` tutti `200`; maschera JSON reale, delta esatto e `no-store` verificati in modo indipendente; 30 sonde negative su 15 route con `404` testuale del provider di 19 byte, route applicative note `200` con chiave valida; percorsi sconosciuti con `404` applicativi distinti dal rifiuto del provider e `healthz` `200`;
+- il `404` e' il rifiuto osservato del provider, non piu' un difetto di routing. La prima esecuzione si era fermata perche' il client classificava come errore un `404` atteso; chiusura limitata con attese per route corrette;
+- scale-down naturale: ultimo traffico `22:17:08.419Z`, `ReplicaDeleted`/`ScaledToZero` alle `22:19:14Z` (circa 125,6 s; scale-down configurato 60 s, non garantito); stato finale `HEALTHY`, non in pausa, 0 repliche. Il prossimo invio puo' avviare a freddo una GPU (osservato: prontezza al primo avvio con download 237,8 s, con immagine in cache 37,7 s, non SLA);
+- endpoint [Verda](https://containers.datacrunch.io/envai-pii-test/) con Bearer di inferenza dedicata, non il client secret cloud; nessuna chiave pubblicata;
+- CI: 901 test su Python 3.11, 3.13 e 3.14; scansione 0 bloccanti e 287 non corretti ignorati (non zero). Copertura di produzione N/A (solo configurazione). Revisioni di sorgente e configurazione e giudizio di sicurezza mirato sulle evidenze live superati per il perimetro verificato. Nessuna certificazione di accuratezza, GDPR, anonimizzazione completa dei PDF o capacita'. Le voci `dev.6`/`CUDA 13`/`12080` restano storiche.
+
+Dettagli: [guida Verda](verda-service.md), [CI e release](ci-release.md).
+
+---
+
+## 2026-10-26 - Immagine CUDA 12.6 pubblicata, aggiornamento Verda ancora in sospeso
+
+La [pipeline immagine 40402660173](https://github.com/digitalygo/envai-pii/actions/runs/40402660173) ha pubblicato `1.0.0-dev.7` dal sorgente `4c4db76ee1712283ba8f5778da70871b2b43e169`. Installazione reale di `torch==2.13.0+cu126`, controllo CUDA 12.6 e `pip check` superati. Suite CI su Python 3.11, 3.13 e 3.14 riuscita; 901 test locali senza skip. Modello e release PyTorch invariati.
+
+- manifest verificato: `sha256:c1d9d9c089047f7c1e4b7b0815e91a12cd810c963ddb58ba1f0da1233e961714`; configurazione `sha256:feb376bc156db28f44f81a3864fcb3c98a9391daa33f1908e34c85061b5f5de0`, label del sorgente coerente, utente non root e healthcheck conservati, nessun opt-out di autenticazione incorporato;
+- scansione con policy invariata: zero rilievi bloccanti e 287 vulnerabilita' non corrette ignorate. Non e' un risultato di zero vulnerabilita';
+- deployment Verda ancora su `dev.6`, in pausa con zero repliche. PATCH della nuova immagine, inferenza CUDA e verifica esterna dell'autenticazione non ancora completati;
+- copertura di produzione non applicabile per il cambio di packaging e configurazione. Nessun nuovo codice applicativo o modello, nessuna operazione RunPod.
+
+Dettagli: [stato e limiti Verda](verda-service.md#risultati-e-limiti-verificati).
+
+---
+
 ## 2026-10-26 - Immagine GPU CUDA 12.6 con PyTorch invariato
 
 Dopo che l'host Verda ha esposto l'API CUDA 12.8 (`12080`) e ha rifiutato l'immagine `cu130`, l'utente ha approvato (`ok, procedi`) il passaggio del packaging a `cu126` mantenendo PyTorch 2.13.0 e il modello v1.5.0. Il sorgente (`Dockerfile.gpu`, `src/app/requirements-gpu.txt`, test) e' gia' aggiornato; questa voce aggiorna la documentazione corrente.
@@ -12,7 +40,7 @@ Dopo che l'host Verda ha esposto l'API CUDA 12.8 (`12080`) e ha rifiutato l'imma
 - motivazione: ridurre il requisito del driver host da CUDA 13 a CUDA 12.6; pin accoppiato `torch==2.13.0+cu126` dall'[indice ufficiale cu126](https://download.pytorch.org/whl/cu126/torch/);
 - verifica: suite locale con 901 test superati, senza skip. Configurazione e packaging: copertura di produzione N/A, nessun codice applicativo modificato;
 - invariati: tutti gli altri pin, il modello v1.5.0 e il comportamento dell'API;
-- giudizio di qualita' e revisione di sicurezza mirata del sorgente superati; restano in sospeso pubblicazione dell'immagine e prova dal vivo su GPU. Le immagini pubblicate `dev.3`, `dev.4` e `dev.6` e le misure storiche, inclusi i 6,14 GiB, restano `cu130` e richiedono CUDA 13. Nessuna azione RunPod o Verda e' stata eseguita; il deployment Verda resta su `dev.6`, in pausa.
+- stato storico prima della pubblicazione: giudizio di qualita' e revisione di sicurezza mirata del sorgente superati; pubblicazione dell'immagine e prova dal vivo su GPU erano ancora in sospeso (la pubblicazione e' ora completata, vedi voce successiva sopra). Le immagini pubblicate `dev.3`, `dev.4` e `dev.6` e le misure storiche, inclusi i 6,14 GiB, restano `cu130` e richiedono CUDA 13. Nessuna azione RunPod o Verda e' stata eseguita; il deployment Verda resta su `dev.6`, in pausa.
 
 Dettagli: [guida Verda](verda-service.md#risultati-e-limiti-verificati), [requisiti host RunPod](runpod-service.md#immagine-gpu-e-requisiti-host).
 

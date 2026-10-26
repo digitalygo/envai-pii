@@ -26,7 +26,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 # libgomp1: OpenMP runtime used by the torch CPU kernels.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates gcc libc6-dev libgomp1 \
+ && apt-get install -y --no-install-recommends ca-certificates gcc libc6-dev libgomp1 libssl3 openssl \
  && rm -rf /var/lib/apt/lists/*
 
 RUN printf '%s\n' '#include <Python.h>' '#include <stdlib.h>' 'int main(void) { return PY_MAJOR_VERSION != 3 || getenv("PATH") == NULL; }' > /tmp/compiler-probe.c \

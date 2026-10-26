@@ -113,7 +113,7 @@ class GpuImageContract(unittest.TestCase):
         self.assertLess(metadata_check_index, pip_check_index)
         self.assertNotIn("--extra-index-url", run_text)
 
-    def test_compiler_packages_are_explicit_in_bookworm_apt_install(self):
+    def test_base_packages_are_explicit_in_bookworm_apt_install(self):
         apt_run = next(line for line in self.run_lines if "apt-get install" in line)
         match = re.search(
             r"apt-get install -y --no-install-recommends (.*?) && rm -rf /var/lib/apt/lists/\*",
@@ -122,7 +122,44 @@ class GpuImageContract(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertCountEqual(
             shlex.split(match.group(1)),
-            ["ca-certificates", "gcc", "libc6-dev", "libgomp1"],
+            [
+                "ca-certificates",
+                "gcc",
+                "libc6-dev",
+                "libgomp1",
+                "libssl3",
+                "openssl",
+            ],
+        )
+
+    def test_apt_update_install_and_cleanup_share_one_run(self):
+        apt_runs = [
+            line for line in self.run_lines if re.search(r"\bapt-get\b", line)
+        ]
+        self.assertEqual(len(apt_runs), 1, apt_runs)
+        apt_run = apt_runs[0]
+        update = apt_run.index("apt-get update")
+        install = apt_run.index("apt-get install -y --no-install-recommends")
+        cleanup = apt_run.index("rm -rf /var/lib/apt/lists/*")
+        self.assertLess(update, install)
+        self.assertLess(install, cleanup)
+        self.assertEqual(
+            apt_run[cleanup:].strip(), "rm -rf /var/lib/apt/lists/*"
+        )
+        for package in ("libssl3", "openssl"):
+            package_runs = [
+                line for line in self.run_lines if re.search(rf"\b{package}\b", line)
+            ]
+            self.assertEqual(package_runs, [apt_run], package)
+        self.assertNotRegex(
+            apt_run,
+            r"apt-get\s+(?:dist-upgrade|full-upgrade|upgrade|remove|purge|autoremove)\b",
+        )
+        self.assertNotRegex(apt_run, r"\bapt\s+")
+        self.assertNotRegex(
+            apt_run,
+            r"--force-yes|--allow-unauthenticated|--allow-downgrades|"
+            r"--allow-change-held-packages",
         )
 
     def test_compiler_probe_compiles_python_and_libc_headers_before_downloads(self):

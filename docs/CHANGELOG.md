@@ -5,6 +5,19 @@ Le voci più recenti in alto. (Codice: `src/training/train_pii.py` salvo diverso
 
 ---
 
+## 2026-10-26 - Aggiornamento OpenSSL richiesto dal gate dell'immagine GPU
+
+La pubblicazione `v1.0.0-dev.5` ha costruito il container ma il gate Trivy ha bloccato due rilevamenti `HIGH` correggibili di `CVE-2026-84782`. I pacchetti `openssl` e `libssl3` ereditati dalla base non venivano aggiornati dalla sola installazione delle dipendenze applicative.
+
+- `Dockerfile.gpu` richiede ora esplicitamente entrambi i pacchetti nello stesso blocco `apt-get update`, installazione e pulizia, per ottenere la correzione Debian bookworm `3.0.22-1~deb12u2` o successiva;
+- nessun aggiornamento esteso del sistema, modifica ai pin CUDA o ML, al modello, alla base fissata per digest o alla policy della scansione;
+- test statici verificano pacchetti, ordine delle operazioni e assenza di opzioni apt non sicure. Copertura del delta di produzione non applicabile: configurazione Docker, non nuove righe Python eseguibili;
+- la prima immagine bloccata non e' stata distribuita. La pubblicazione sostitutiva e la verifica su Verda restano da completare.
+
+Fonte: [registro di sicurezza Debian per OpenSSL](https://security-tracker.debian.org/tracker/source-package/openssl).
+
+---
+
 ## 2026-10-26 - Autenticazione a monte opzionale (`PII_AUTH_MODE=upstream`)
 
 Modifica del sorgente per provider che autenticano i chiamanti prima del container. Solo il valore esatto `PII_AUTH_MODE=upstream` nell'ambiente del server salta il token locale nella factory, nel probe di salute, nel wrapper globale e nel guscio guardrail; qualsiasi altro valore (assente, vuoto o diverso) mantiene il Bearer locale `PII_API_TOKEN`. Le impostazioni predefinite dell'immagine non cambiano.

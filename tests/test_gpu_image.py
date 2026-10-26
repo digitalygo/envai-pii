@@ -337,6 +337,9 @@ class GpuImageContract(unittest.TestCase):
             if line.startswith(("COPY ", "ADD ")):
                 self.assertNotIn(".env", line)
 
+    def test_upstream_auth_mode_is_not_baked_into_the_image(self):
+        self.assertNotIn("PII_AUTH_MODE", self.instruction_text)
+
     def test_build_context_is_repository_root_with_explicit_app_copies(self):
         self.assertIn(
             "podman build --platform linux/amd64 -f Dockerfile.gpu -t envai-pii:gpu .",

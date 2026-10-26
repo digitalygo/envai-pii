@@ -19,8 +19,11 @@ Sicurezze coperte qui:
     annidamento eccessivo, UTF-8 non valido, campi sconosciuti;
   - whitelist opzionale `categories` (JSON o campo multipart): array di TAG_NAMES
     canonici, mai prefs/EXCLUDED_TAGS/env/CLI; assente o vuota = catalogo intero;
-  - autenticazione Bearer con secrets.compare_digest su bytes (token Unicode compreso),
-    fail-closed 503 se PII_API_TOKEN manca o e' vuoto, 401 se assente o sbagliato;
+  - autenticazione locale Bearer con secrets.compare_digest su bytes (token Unicode
+    compreso), fail-closed 503 se PII_API_TOKEN manca o e' vuoto, 401 se assente o
+    sbagliato; solo l'esatto PII_AUTH_MODE=upstream della env del server disattiva
+    questo controllo locale, per deployment autenticati a monte. Il modo non arriva
+    mai da header, query o body del client;
   - admissione FIFO per processo con concorrenza e coda finite, rilascio in finally;
   - deadline cooperativa (default 60 s, override server PII_ANALYSIS_TIMEOUT_SECONDS)
     controllata ai confini di fase;
@@ -56,6 +59,8 @@ MAX_BODY_BYTES = guardrail_limits.DEFAULT_JSON_BODY_BYTES
 MAX_CATEGORIES = 24             # voci GREZZE ammesse nel campo `categories`
 DEFAULT_DEADLINE_SECONDS = 60.0  # budget cooperativo per richiesta (env: PII_ANALYSIS_TIMEOUT_SECONDS)
 TIMEOUT_SECONDS_ENV = "PII_ANALYSIS_TIMEOUT_SECONDS"
+AUTH_MODE_ENV = "PII_AUTH_MODE"
+UPSTREAM_AUTH_MODE = "upstream"
 
 ERROR_MESSAGES = {
     "invalid_request": "Invalid request.",
@@ -134,6 +139,15 @@ def parse_content_type(value):
             key, raw = part.split("=", 1)
             params[key.strip().lower()] = raw.strip().strip('"')
     return (mime or None), params
+
+
+def _upstream_auth_mode():
+    """True solo per l'esatto valore server ``PII_AUTH_MODE=upstream``.
+
+    Assente, blank o qualunque altro valore mantiene il default locale
+    fail-closed: il client non puo' selezionare il modo con header, query o body.
+    """
+    return os.environ.get(AUTH_MODE_ENV) == UPSTREAM_AUTH_MODE
 
 
 def _authorized(headers, token):
@@ -439,24 +453,28 @@ def _handle_multipart(raw_body, params, *, tags, detect, detect_for_categories,
     }
 
 
-def process_request(headers, raw_body, *, token, tags, detect, extract=None,
-                    clock=time.monotonic, lock=None, admission=None,
+def process_request(headers, raw_body, *, token, require_token=True, tags, detect,
+                    extract=None, clock=time.monotonic, lock=None, admission=None,
                     readiness=None, detect_for_categories=None):
     """Cuore della richiesta, indipendente da Flask. Ritorna (status, corpo).
 
-    Ordine di valutazione: configurazione (503 se il token manca o e' vuoto),
-    credenziali (401), disponibilita' del modello (503), poi admissione o lock (429).
-    Autenticazione, readiness e admissione precedono la lettura del body: una
-    richiesta non autorizzata, in coda o respinta non materializza il payload.
+    Ordine di valutazione: con `require_token` vero, configurazione locale (503 se
+    il token manca o e' vuoto) e credenziali (401); poi disponibilita' del modello
+    (503), poi admissione o lock (429). Il guscio Flask passa `require_token=False`
+    solo quando l'esatto `PII_AUTH_MODE=upstream` della env del server seleziona
+    l'autenticazione a monte. Il controllo locale richiesto, readiness e admissione
+    precedono la lettura del body: una richiesta non autorizzata, in coda o respinta
+    non materializza il payload.
     `raw_body` puo' essere bytes (gia' letto) oppure una callable `reader(cap)` che
     legge il body GREZZO bounded dopo l'acquisizione. `extract` estrae un file
     multipart; `detect_for_categories` lega un rilevatore request-local. Le risorse
     acquisite vengono SEMPRE rilasciate, su ogni uscita, grazie al finally.
     """
-    if token is None or not str(token).strip():
-        return _error(503, "unavailable")
-    if not _authorized(headers, token):
-        return _error(401, "unauthorized")
+    if require_token:
+        if token is None or not str(token).strip():
+            return _error(503, "unavailable")
+        if not _authorized(headers, token):
+            return _error(401, "unauthorized")
     if detect is None:
         return _error(503, "unavailable")
     if readiness is not None:
@@ -576,6 +594,7 @@ def create_blueprint(tags, detect, clock=time.monotonic, lock=None, readiness=No
         status, body = process_request(
             request.headers, _read_body,
             token=os.environ.get("PII_API_TOKEN"),
+            require_token=not _upstream_auth_mode(),
             tags=tags, detect=detect, extract=extract, clock=clock, lock=lock,
             admission=admission, readiness=readiness,
             detect_for_categories=detect_for_categories,

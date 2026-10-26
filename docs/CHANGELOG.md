@@ -5,6 +5,19 @@ Le voci più recenti in alto. (Codice: `src/training/train_pii.py` salvo diverso
 
 ---
 
+## 2026-10-26 - Autenticazione a monte opzionale (`PII_AUTH_MODE=upstream`)
+
+Modifica del sorgente per provider che autenticano i chiamanti prima del container. Solo il valore esatto `PII_AUTH_MODE=upstream` nell'ambiente del server salta il token locale nella factory, nel probe di salute, nel wrapper globale e nel guscio guardrail; qualsiasi altro valore (assente, vuoto o diverso) mantiene il Bearer locale `PII_API_TOKEN`. Le impostazioni predefinite dell'immagine non cambiano.
+
+- invariati: CUDA obbligatoria, prontezza del modello, limiti, ammissione, `Cache-Control: no-store` e campi wire (nessun cambio di schema);
+- rischio: in modalita' upstream il servizio non autentica da solo, quindi e' sicuro solo se il provider protegge ogni route e nessun chiamante non fidato raggiunge il container; non usarla sul proxy pubblico di RunPod;
+- verifiche del leader: suite completa di 898 test senza skip, copertura del delta 24/26 (92.31%); giudizio di qualita' e revisione di sicurezza mirata del sorgente superati;
+- nessuna distribuzione verificata: l'utente ha approvato dev e deploy su Verda, ma tag pubblicato e URL non sono ancora pronti e nulla e' stato applicato o provato.
+
+Dettagli: [guida di test Verda](verda-service.md), [guida del servizio RunPod](runpod-service.md) e [contratto API](GUARDRAIL_API.md#authentication).
+
+---
+
 ## 2026-10-25 - Artefatto `v1.0.0-dev.4` pubblicato, distribuzione e concorrenza reale in sospeso
 
 Controllo post-pubblicazione del sorgente `0f161021b03b630ecf03556b6bf3cfe2f074cf75`: [Release 40194500271](https://github.com/digitalygo/envai-pii/actions/runs/40194500271) riuscita (test 3.11, 3.13, 3.14) con [release `v1.0.0-dev.4`](https://github.com/digitalygo/envai-pii/releases/tag/v1.0.0-dev.4); [docker-publish 40194544097](https://github.com/digitalygo/envai-pii/actions/runs/40194544097) riuscito in tutti i job.

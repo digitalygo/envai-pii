@@ -1,16 +1,25 @@
 # -*- coding: utf-8 -*-
 """Cloud service boundary for the existing Flask API (additive, WSGI-only).
 
-Gunicorn entry point: ``cloud_service:create_app()``. The factory requires a
-non-blank ``PII_API_TOKEN`` and a working CUDA device, imports ``app`` only
+Gunicorn entry point: ``cloud_service:create_app()``. Local Bearer
+authentication is the default: the factory requires a non-blank
+``PII_API_TOKEN`` and the middleware checks it before Flask sees a request.
+Only the exact server environment value ``PII_AUTH_MODE=upstream`` removes that
+local token prerequisite and check, for deployments whose upstream provider
+authenticates callers. Absent, blank, or any other value keeps the local token
+semantics. The mode is read only from the server environment, never from
+request headers, query, or body.
+
+In every mode the factory requires a working CUDA device, imports ``app`` only
 after those checks, verifies the model is loaded on GPU, sanitizes the Flask
 error logger, and returns a tiny WSGI middleware around ``app.app``.
 
-The middleware authenticates every request before Flask sees it, except exact
-``GET``/``HEAD`` probes on ``/health`` and ``/healthz``. It never reads the
-request body, never redirects before authentication, serves a minimal health
-payload itself, and forces ``Cache-Control: no-store`` on every response while
-leaving authorized response bodies untouched.
+The middleware authenticates every protected request before Flask sees it,
+except exact ``GET``/``HEAD`` probes on ``/health`` and ``/healthz``, and except
+when the exact upstream mode is selected. It never reads the request body,
+never redirects before authentication, serves a minimal health payload itself,
+and forces ``Cache-Control: no-store`` on every response while leaving
+authorized response bodies untouched.
 
 No torch, Flask, transformers or ``app`` import happens at module import time.
 """
@@ -24,6 +33,8 @@ from collections.abc import Callable, Iterable
 from http import HTTPStatus
 
 TOKEN_ENV = "PII_API_TOKEN"
+AUTH_MODE_ENV = "PII_AUTH_MODE"
+UPSTREAM_AUTH_MODE = "upstream"
 HEALTH_PATHS = frozenset({"/health", "/healthz"})
 
 _MISSING_TOKEN = "PII_API_TOKEN is required."
@@ -39,6 +50,11 @@ _INTERNAL = (500, "internal_error", _INTERNAL_ERROR)
 
 def _token_configured(token: str | None) -> bool:
     return token is not None and bool(str(token).strip())
+
+
+def _upstream_auth_mode() -> bool:
+    """True only for the exact server environment value ``PII_AUTH_MODE=upstream``."""
+    return os.environ.get(AUTH_MODE_ENV) == UPSTREAM_AUTH_MODE
 
 
 def _authorized(environ: dict, token: str | None) -> bool:
@@ -149,18 +165,20 @@ class _Stream:
 
 
 class CloudService:
-    """WSGI middleware: per-request token, health, no-store, generic errors."""
+    """WSGI middleware: conditional local token, health, no-store, generic errors."""
 
     def __init__(self, application, module):
         self.application = application
         self.module = module
 
     def health(self, environ: dict, start_response: Callable) -> list[bytes]:
+        """Minimal readiness probe; the local token prerequisite is conditional."""
         configured = False
         loaded = False
         gpu = False
         try:
-            configured = _token_configured(os.environ.get(TOKEN_ENV))
+            configured = _upstream_auth_mode() or _token_configured(
+                os.environ.get(TOKEN_ENV))
             loaded = getattr(self.module, "nlp", None) is not None
             gpu = getattr(self.module, "device", None) == 0
         except Exception:
@@ -252,18 +270,22 @@ class CloudService:
         if method in ("GET", "HEAD") and isinstance(path, str) \
                 and path in HEALTH_PATHS:
             return self.health(environ, start_response)
-        try:
-            token = os.environ.get(TOKEN_ENV)
-        except Exception:
-            token = None
-        if not _token_configured(token):
-            return _error_response(environ, start_response, _UNAVAILABLE)
-        if not _authorized(environ, token):
-            return _error_response(environ, start_response, _UNAUTHORIZED)
+        if not _upstream_auth_mode():
+            try:
+                token = os.environ.get(TOKEN_ENV)
+            except Exception:
+                token = None
+            if not _token_configured(token):
+                return _error_response(environ, start_response, _UNAVAILABLE)
+            if not _authorized(environ, token):
+                return _error_response(environ, start_response, _UNAUTHORIZED)
         return self.delegate(environ, start_response)
 
 
 def _require_token() -> None:
+    """Require the local token unless the exact upstream auth mode is selected."""
+    if _upstream_auth_mode():
+        return
     if not _token_configured(os.environ.get(TOKEN_ENV)):
         raise RuntimeError(_MISSING_TOKEN) from None
 
@@ -319,7 +341,7 @@ def _sanitize_logging(module) -> None:
 
 
 def create_app() -> "CloudService":
-    """Gunicorn factory: token, CUDA, then the existing Flask application."""
+    """Gunicorn factory: local token unless upstream mode, CUDA, then Flask."""
     _require_token()
     _require_cuda()
     module = _import_application()

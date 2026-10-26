@@ -17,7 +17,7 @@
 > selection). Wire types are
 > version 0.3.0 and unchanged in 0.4.0: the processing budget and the admission settings are
 > server-side configuration and add no request or response field. Pre-body ordering is explicit:
-> token configuration, credentials, model readiness and admission checks return 503, 401, 503 or 429
+> in default local-authentication mode, token configuration, credentials, model readiness and admission checks return 503, 401, 503 or 429
 > before the body is read; media type and charset are validated and the body cap is chosen for that
 > media type before the bounded read. Combined-invalid requests can therefore have a different
 > outcome from historical error precedence, and not every historical invalid-request outcome is
@@ -38,7 +38,7 @@ schema; this document records the semantics, limits and decisions behind it.
 | Endpoint | `POST /api/v1/analyses`, one route for both media types |
 | Request | JSON: `text` (required) plus optional `dictionary` and `categories`; the 0.1.0 fields are preserved. Multipart: repeated `files` (max 10) plus optional `text`, `dictionary` and `categories` |
 | Response | JSON: exactly one result (`input_id: "text"`). Multipart: 1 to 11 results (`file_1` to `file_10` in part order, then `text`), plus one aggregate `dictionary_delta` |
-| Authentication | Bearer secret `PII_API_TOKEN`; 503 when unset, 401 when missing or wrong; evaluated before any body byte is read |
+| Authentication | Default: Bearer secret `PII_API_TOKEN`; 503 when unset, 401 when missing or wrong; evaluated before any body byte is read. Exact opt-in exception: `PII_AUTH_MODE=upstream` (see Authentication) |
 | Readiness | Model readiness checked after credentials and before admission, still before any body read; 503 even when seed or placeholders cover the text. Guardrail readiness covers the model only; `/health` is unchanged and has no PDF-capability field |
 | State | No cross-request mapping or file cache; request-scoped references are released after the response, with no secure-erasure guarantee |
 | Placeholders | Canonical `[LABEL_N]`; 24 `TAG_NAMES` labels; N from 1 to 999999999 |
@@ -141,20 +141,29 @@ built only for the duration of the request. Legacy request fields such as `exclu
 - After credentials, model readiness is checked before admission; an unavailable model
   answers `503` with code `unavailable` even when the text could be resolved from the seed or
   from placeholders already present.
-- No other authentication mode is accepted.
+- The one exception is the exact server environment value `PII_AUTH_MODE=upstream`, an opt-in for
+  deployments where a trusted upstream provider authenticates every caller before traffic reaches
+  the service. In that mode the local token is not required and not checked: the factory, the
+  health probe, the global wrapper and the guardrail shell skip it, so `PII_API_TOKEN` may be unset.
+  Any other value, including an absent, blank or differently cased one, keeps the local Bearer
+  behavior described above. The mode is read only from the server environment, never from request
+  headers, query or body, and the image does not default to it.
+- Upstream mode changes who authenticates, not the contract: CUDA, model readiness, limits,
+  admission and `Cache-Control: no-store` are unchanged, and no request or response field is added
+  or changed.
 
 ### Request ordering and the body read
 
 - The endpoint evaluates, in order: token configured (`503` `unavailable`), credentials (`401`
-  `unauthorized`), model readiness (`503` `unavailable`), admission (`429` `busy`), media
+  `unauthorized`; both skipped in upstream mode), model readiness (`503` `unavailable`), admission (`429` `busy`), media
   type and charset validation (`415` `unsupported_media_type` for an unsupported overall media
   type or charset), raw body cap selection by media type, bounded body read, processing clock
   start with the timeout read once per request before the deadline snapshot, parse and
   extraction, anonymization. The media-type and charset check and the cap choice
   happen before the read, so an unsupported type is rejected without reading the body; the body
   cap is applied to the bytes actually read.
-- Authentication, readiness and admission happen before any body byte is read or parsed.
-  An unauthenticated request is answered `401` without touching or parsing the payload. No body
+- Local authentication when required, readiness and admission happen before any body byte is read or parsed.
+  In default local-authentication mode, an unauthenticated request is answered `401` without touching or parsing the payload. No body
   byte is read while a request waits in the queue, but a waiting request that is admitted then reads
   the body and is processed normally, with a `200` or the usual errors. No body byte is read when a
   request is rejected because the queue is full or disabled, or when its wait expires; only those
@@ -177,6 +186,11 @@ built only for the duration of the request. Legacy request fields such as `exclu
 ## Deployment
 
 - The service stays internal and authenticated, on loopback or a private network.
+- `PII_AUTH_MODE=upstream` is safe only when the provider authenticates every route, including all
+  analyses, settings and legacy routes, and no untrusted caller can reach the container directly.
+  On a publicly reachable endpoint without such a provider it leaves the service unauthenticated.
+  Enabling it is a deployment decision: this document does not claim any deployment is configured
+  or verified.
 - Exposing it beyond loopback or a private network requires an authenticated internal proxy and
   TLS in front of the service. The endpoint must not be reachable directly from untrusted
   networks.
@@ -925,7 +939,7 @@ Stable codes:
 | 422 | `no_extractable_text` | A multipart PDF is valid but has no non-blank extractable text; message `File has no extractable text. OCR is not available.` |
 | 401 | `unauthorized` | Missing or wrong Bearer credential |
 | 429 | `busy` | All active slots are taken and the queue is full or disabled, or the queue wait expired |
-| 503 | `unavailable` | `PII_API_TOKEN` unset or blank (endpoint disabled), model not ready, detector unavailable mid-request, service unavailable, or native MuPDF privacy controls unavailable for guardrail PDF extraction |
+| 503 | `unavailable` | `PII_API_TOKEN` unset or blank (endpoint disabled, except in upstream mode), model not ready, detector unavailable mid-request, service unavailable, or native MuPDF privacy controls unavailable for guardrail PDF extraction |
 | 504 | `deadline_exceeded` | The configured cooperative processing budget was reached |
 | 500 | `internal_error` | Unexpected processing failure |
 

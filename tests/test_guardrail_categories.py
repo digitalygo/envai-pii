@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT / "src" / "app"))
 
 import guardrail_api  # noqa: E402
 import guardrail_inputs  # noqa: E402
+import model_batching
 import pii_dictionary  # noqa: E402
 import runtime_execution
 
@@ -738,7 +739,9 @@ def _load_adapter_functions():
                  if isinstance(node, ast.FunctionDef) and node.name in wanted]
     if len(functions) != len(wanted):
         raise AssertionError("adapter guardrail non trovato in app.py")
-    namespace = {"runtime_execution": runtime_execution}
+    namespace = {"runtime_execution": runtime_execution,
+                 "model_batching": model_batching,
+                 "MODEL_BATCH_SIZE": 1}
     exec(compile(ast.Module(functions, []), "app.py", "exec"), namespace)
     return namespace
 

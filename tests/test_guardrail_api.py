@@ -29,6 +29,7 @@ sys.path.insert(0, str(ROOT / "src" / "app"))
 
 import guardrail_api  # noqa: E402
 import guardrail_inputs  # noqa: E402
+import model_batching
 import runtime_execution
 
 try:
@@ -105,7 +106,9 @@ def _load_adapter():
                     None)
     if function is None:
         raise AssertionError("_guardrail_detect non trovata in app.py")
-    namespace = {"runtime_execution": runtime_execution}
+    namespace = {"runtime_execution": runtime_execution,
+                 "model_batching": model_batching,
+                 "MODEL_BATCH_SIZE": 1}
     exec(compile(ast.Module([function], []), "app.py", "exec"), namespace)
     return namespace
 

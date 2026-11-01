@@ -66,6 +66,7 @@ from werkzeug.exceptions import HTTPException
 
 import guardrail_api
 import guardrail_inputs
+import model_batching
 import pdf_export
 import pdf_text
 import pii_dictionary
@@ -228,6 +229,7 @@ if not getattr(sys, "_MEIPASS", None) and not os.path.isdir(MODEL_DIR):
 APP_VERSION = "2.0.0"                    # versione applicativa riportata da /health
 MAX_WORDS = 120      # parole per chunk (~180 subword, sotto i 512 del training)
 OVERLAP = 20         # parole di sovrapposizione tra chunk consecutivi
+MODEL_BATCH_SIZE = model_batching.resolve_model_batch_size()
 
 # --------------------------------------------------------------------------- #
 # Caricamento modello (una sola volta all'avvio)
@@ -582,35 +584,59 @@ def analyze(text, excluded=None, mapping_enabled=True):
 def _guardrail_detect(text, check_deadline, categories=None):
     """Rilevamento su un tratto NON protetto per la guardrail API.
 
-    Differenza voluta da detect_model(): l'inferenza gira un chunk per volta, cosi'
-    il callback di deadline viene controllato tra un chunk e l'altro. Una singola
-    chiamata a nlp() non e' interrompibile; il contratto lo dice esplicitamente
-    (docs/GUARDRAIL_API.md, sezione Deadline): la deadline e' cooperativa.
-    `categories` opzionale restringe modello E rete regex PRIMA di _merge
-    (None = tutte): una regex di una categoria inattiva non deve sopprimere un
-    candidato attivo del modello nella fusione.
+    Con MODEL_BATCH_SIZE=1 l'inferenza conserva la forma storica: una chiamata per
+    chunk, senza parametro di batch, con la deadline controllata tra un chunk e
+    l'altro. Con un valore maggiore i chunk dello stesso tratto vengono raggruppati
+    e la pipeline riceve il batch esplicito; la deadline viene controllata prima di
+    ogni gruppo e la corsia nativa la ricontrolla dopo il ritorno e durante l'attesa.
+    Una singola chiamata a nlp() non e' interrompibile; il contratto lo dice
+    esplicitamente (docs/GUARDRAIL_API.md, sezione Deadline): la deadline e'
+    cooperativa. `categories` opzionale restringe modello E rete regex PRIMA di
+    _merge (None = tutte): una regex di una categoria inattiva non deve sopprimere
+    un candidato attivo del modello nella fusione.
     """
     model = nlp
     if model is None:
         raise guardrail_api.ModelUnavailable()
     ents = []
-    for chunk, offset in chunk_text(text):
-        check_deadline()
-        results = runtime_execution.MODEL_LANE.run(
-            model, [chunk], check_deadline=check_deadline)  # stessa forma batch, un chunk per call
-        if isinstance(results, dict):
-            results = [results]
-        res = (results[0] if len(results) == 1 and isinstance(results[0], (list, tuple))
-               else results)
-        for e in res:
-            ents.append({
-                "label": e["entity_group"],
-                "start": int(e["start"]) + offset,
-                "end": int(e["end"]) + offset,
-                "score": float(e["score"]),
-                "validated": False,
-                "source": "modello",
-            })
+    chunks = chunk_text(text)
+    if MODEL_BATCH_SIZE == 1:
+        for chunk, offset in chunks:
+            check_deadline()
+            results = runtime_execution.MODEL_LANE.run(
+                model, [chunk], check_deadline=check_deadline)  # stessa forma batch, un chunk per call
+            if isinstance(results, dict):
+                results = [results]
+            res = (results[0] if len(results) == 1 and isinstance(results[0], (list, tuple))
+                   else results)
+            for e in res:
+                ents.append({
+                    "label": e["entity_group"],
+                    "start": int(e["start"]) + offset,
+                    "end": int(e["end"]) + offset,
+                    "score": float(e["score"]),
+                    "validated": False,
+                    "source": "modello",
+                })
+    else:
+        for group in model_batching.chunk_groups(chunks, MODEL_BATCH_SIZE):
+            check_deadline()
+            inputs = [chunk for chunk, _offset in group]
+            results = runtime_execution.MODEL_LANE.run(
+                model, inputs, check_deadline=check_deadline,
+                batch_size=MODEL_BATCH_SIZE)
+            rows = model_batching.normalize_batch_results(results, inputs)
+            for index, row in enumerate(rows):
+                _chunk, offset = group[index]
+                for entity in row:
+                    ents.append({
+                        "label": entity["label"],
+                        "start": entity["start"] + offset,
+                        "end": entity["end"] + offset,
+                        "score": entity["score"],
+                        "validated": False,
+                        "source": "modello",
+                    })
     complete_time(ents, text)
     check_deadline()
     regex_ents = detect_regex(text)

@@ -261,7 +261,7 @@ class GpuImageContract(unittest.TestCase):
             with self.assertRaises(ValueError):
                 run_check("80.10.2", {"jaraco.context": "6.1.0", "wheel": "invalid"})
 
-    def test_gunicorn_single_worker_derived_threads_factory_without_preload(self):
+    def test_gunicorn_config_controls_workers_and_keeps_derived_threads(self):
         commands = [line for line in self.instructions if line.startswith("CMD ")]
         self.assertEqual(len(commands), 1)
         command = commands[0]
@@ -272,7 +272,7 @@ class GpuImageContract(unittest.TestCase):
         self.assertIn("cloud_service:create_app()", command)
         self.assertIn("--worker-class gthread", command)
         self.assertIn("--config /app/src/app/gunicorn_config.py", command)
-        self.assertRegex(command, r"--workers\s+1(?:\s|$)")
+        self.assertNotRegex(command, r"--workers(?:\s|=)")
         self.assertNotRegex(command, r"--threads(?:\s|=)")
         self.assertRegex(command, r"--timeout\s+600(?:\s|$)")
         self.assertRegex(command, r"--graceful-timeout\s+30(?:\s|$)")
@@ -441,8 +441,11 @@ class GpuImageContract(unittest.TestCase):
             if line.startswith(("COPY ", "ADD ")):
                 self.assertNotIn(".env", line)
 
-    def test_upstream_auth_mode_is_not_baked_into_the_image(self):
-        self.assertNotIn("PII_AUTH_MODE", self.instruction_text)
+    def test_worker_and_auth_settings_are_not_baked_into_the_image(self):
+        for setting in (
+                "PII_AUTH_MODE", "PII_GUNICORN_WORKERS",
+                "PII_MODEL_BATCH_SIZE", "PII_VERIFY_MODEL_STARTUP"):
+            self.assertNotIn(setting, self.instruction_text)
 
     def test_build_context_is_repository_root_with_explicit_app_copies(self):
         self.assertIn(

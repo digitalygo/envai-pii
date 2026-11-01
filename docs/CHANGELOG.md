@@ -5,6 +5,16 @@ Le voci più recenti in alto. (Codice: `src/training/train_pii.py` salvo diverso
 
 ---
 
+## 2026-11-01 - Worker GPU configurabili e batching nel percorso ordinario
+
+L'immagine GPU legge `PII_GUNICORN_WORKERS` all'avvio (valori canonici da `1` a `8`, default `1`) senza un override CLI fisso. Il detector v1 supporta `PII_MODEL_BATCH_SIZE=1/4/8/16`, mantenendo `1` come default e separando richieste, file e tratti protetti. Pesi v1.5.0, precisione float32, autenticazione e contratto API restano invariati.
+
+Con `PII_VERIFY_MODEL_STARTUP=1`, ogni worker verifica CUDA e float32 ed esegue un warmup sintetico reale prima di servire richieste. A B8 verifica 63 chunk in 8 chiamate, con coda di 7, ed emette solo metadati bounded. `/health` non costituisce una barriera globale degli otto processi. Build e pubblicazione della prerelease `dev` usano GitHub Actions con scansione del digest remoto; la distribuzione sul solo test Verda richiede verifiche live separate, senza promozione in produzione.
+
+Configurazione, limiti e verifica: [worker GPU e batching all'avvio](gpu-worker-startup.md).
+
+---
+
 ## 2026-10-26 - Verda CUDA 12.6 verificata su GPU e scale-to-zero
 
 L'immagine `1.0.0-dev.7` (`cu126`, sorgente `4c4db76ee1712283ba8f5778da70871b2b43e169`, [pubblicazione 40402660173](https://github.com/digitalygo/envai-pii/actions/runs/40402660173)) e' stata distribuita sul deployment Verda `envai-pii-test` e provata su GPU reale con dati sintetici.

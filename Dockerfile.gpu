@@ -94,4 +94,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
 # per-request deadline for gthread workers, so a proxy timeout must sit above
 # PII_ANALYSIS_TIMEOUT_SECONDS plus upload and native PDF margin. Access logs
 # are intentionally disabled because requests can carry personal data.
-CMD ["sh", "-c", "exec gunicorn --config /app/src/app/gunicorn_config.py --chdir /app/src/app --bind \"${PII_HOST}:${PII_PORT}\" --worker-class gthread --workers 1 --timeout 600 --graceful-timeout 30 --access-logfile /dev/null --error-logfile - 'cloud_service:create_app()'"]
+CMD ["sh", "-c", "exec gunicorn --config /app/src/app/gunicorn_config.py --chdir /app/src/app --bind \"${PII_HOST}:${PII_PORT}\" --worker-class gthread --timeout 600 --graceful-timeout 30 --access-logfile /dev/null --error-logfile - 'cloud_service:create_app()'"]

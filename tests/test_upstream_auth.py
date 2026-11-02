@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Upstream authentication mode across both HTTP layers.
 
 Only the exact server environment value ``PII_AUTH_MODE=upstream`` removes the
@@ -24,9 +23,9 @@ for directory in (ROOT / "src" / "app", ROOT / "tests"):
     if str(directory) not in sys.path:
         sys.path.insert(0, str(directory))
 
-import cloud_service as cs  # noqa: E402
-import guardrail_api as ga  # noqa: E402
-import test_cloud_service as cloud_helpers  # noqa: E402
+import cloud_service as cs
+import guardrail_api as ga
+import test_cloud_service as cloud_helpers
 
 try:
     from flask import Flask

@@ -103,7 +103,9 @@ info:
     extraction, all inputs and allocation for both arms; queue wait is separate and does
     not consume this processing budget. Time spent waiting for serialized native
     execution is part of the processing budget. The deadline is cooperative, not a hard
-    cancellation or completion guarantee: it cannot interrupt an in-flight model call or
+    cancellation or completion guarantee: it is checked before and after each model
+    chunk or intra-analysis chunk group, and while waiting for a serialized native lane,
+    but it cannot interrupt an in-flight model call (singleton or batched group) or
     native PDF operation.
 
     HTTP admission is configured only by server environment variables.
@@ -113,7 +115,13 @@ info:
     from 0 to 32 (default 4); invalid values or values below 0 use the default, values
     above 32 are clamped, and 0 disables queueing. `PII_QUEUE_TIMEOUT_SECONDS` accepts
     a positive finite float up to 30 seconds (default 5); invalid, non-positive or
-    non-finite values use the default and values above 30 are clamped. These settings are
+    non-finite values use the default and values above 30 are clamped. Intra-analysis
+    model chunk batching for `POST /api/v1/analyses` is configured at process startup
+    from `PII_MODEL_BATCH_SIZE`, which strips surrounding whitespace and accepts
+    canonical values `1`, `4`, `8` and `16` (default `1` on unset, blank or invalid
+    values), grouping consecutive chunks only within a single unprotected text gap of a
+    single input (never across requests, files or protected gaps) and failing closed
+    with 500 `internal_error` on malformed or mismatched pipeline batch outputs. These settings are
     resolved at process startup and remain frozen until restart; they are not request
     properties. Admission limits are per process. The provided Gunicorn configuration
     uses one worker, sets `preload_app` to false, and sizes the request thread pool to
@@ -175,7 +183,10 @@ paths:
         `PII_MAX_QUEUED_ANALYSES` (0..32, default 4; 0 disables queueing), and
         `PII_QUEUE_TIMEOUT_SECONDS` (positive finite float up to 30, default 5). Invalid
         values use safe defaults, values above each ceiling are clamped, and settings are
-        frozen at process startup. Queue wait is separate from the processing budget;
+        frozen at process startup. Intra-analysis model chunk batching uses server-only
+        `PII_MODEL_BATCH_SIZE` (`1`, `4`, `8` or `16`, default `1`, read once at startup)
+        within a single unprotected gap of one input, checking the cooperative deadline
+        before and after each chunk group. Queue wait is separate from the processing budget;
         after admission, a lease covers the bounded body read and entire processing.
 
         `categories` is an optional request-only whitelist of canonical `TAG_NAMES`
@@ -518,8 +529,10 @@ components:
         unset, blank or invalid. It is resolved once per admitted request after the
         bounded body read, is independent of and does not include the queue-wait timeout,
         and cannot be set by the client. Time spent waiting for a serialized native
-        execution lane counts toward this budget. It cannot interrupt an in-flight model
-        call or a native PDF operation, so it is not a cancellation or completion
+        execution lane counts toward this budget and is interruptible, and the deadline is
+        checked before and after each model chunk or `PII_MODEL_BATCH_SIZE` chunk group.
+        It cannot interrupt an in-flight model call (singleton or batched group) or a
+        native PDF operation, so it is not a cancellation or completion
         guarantee: deployments must also set a hard worker or proxy timeout longer than
         the configured budget plus upload and native-work margin. Code:
         `deadline_exceeded`.

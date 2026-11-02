@@ -201,6 +201,18 @@ built only for the duration of the request. Legacy request fields such as `exclu
 - Admission is also server configuration, read once at startup (see Concurrency). The container
   commands of both images load `src/app/gunicorn_config.py`, which sets one `gthread` worker,
   no `--preload` and `threads = active + queue + 2` (10 by default).
+- Intra-analysis model chunk batching for `POST /api/v1/analyses` is configured once at process
+  startup from the server-only environment variable `PII_MODEL_BATCH_SIZE`: surrounding whitespace
+  is stripped and canonical values `1`, `4`, `8` and `16` are accepted, while unset, blank or
+  invalid values fall back to the default `1` (see [chunk-batching.md](chunk-batching.md)). No
+  request field can set or override it, and legacy routes are unchanged. When `PII_MODEL_BATCH_SIZE`
+  is `4`, `8` or `16`, consecutive chunks within a single unprotected text gap of a single input
+  are grouped in input order and passed to the token-classification pipeline with explicit
+  `batch_size`; chunks are never batched across requests, across files or across protected gaps,
+  and malformed or mismatched batch outputs fail the whole analysis with `500` `internal_error`.
+  Enabling this setting in a container requires an image built from source that includes
+  `src/app/model_batching.py`; setting the variable on an older published image alone has no
+  effect.
 - Any worker or proxy in front of the service needs a timeout longer than the configured budget
   plus the queue wait, the upload and the native-work margin. Increasing a client or Postman
   timeout alone does not change the server-side budget. The RunPod HTTPS proxy enforces a fixed
@@ -971,12 +983,15 @@ messages; the new file codes use exactly the messages quoted in the table.
 - For the multipart arm the budget covers multipart parsing, extraction of every file, processing
   of every input and allocation. For the JSON arm it covers validation and anonymization.
 - The budget is global and checked cooperatively at stage boundaries (for example multipart
-  parsing, validation, extraction, page loops, seed location, model chunks, allocation and output
-  assembly) and between model chunks. It is not a hard cancellation or completion guarantee: it
-  cannot interrupt a native PDF operation or an in-flight model call, and a request that crosses
-  it fails with `504` only at the next check. Time spent waiting for the native owner thread during
-  processing does consume the budget and can interrupt the wait, but not a native PDF or model
-  call that is already running.
+  parsing, validation, extraction, page loops, seed location, model chunks or chunk groups,
+  allocation and output assembly) and before and after each model chunk or chunk group (of up to
+  `PII_MODEL_BATCH_SIZE` chunks within the same unprotected text gap). It is not a hard
+  cancellation or completion guarantee: it cannot interrupt a native PDF operation or an in-flight
+  model call (whether singleton or a multi-chunk group), and a request that crosses it fails with
+  `504` only at the next check. Time spent waiting for the native owner thread during processing
+  does consume the budget and can interrupt the wait, but not a native PDF or model call that is
+  already running; a larger `PII_MODEL_BATCH_SIZE` holds the model lane across a whole chunk group
+  at once and does not automatically increase the 60-second default budget.
 - Deployment must therefore impose a hard worker or proxy timeout that is longer than the
   configured budget plus the expected upload and native-work margin, because the cooperative
   budget alone neither bounds the body read nor stops an in-flight model call.

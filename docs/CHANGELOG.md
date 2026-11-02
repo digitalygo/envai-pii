@@ -5,13 +5,71 @@ Le voci più recenti in alto. (Codice: `src/training/train_pii.py` salvo diverso
 
 ---
 
-## 2026-11-01 - Worker GPU configurabili e batching nel percorso ordinario
+## 2026-11-02 - Servizio Verda N8 e B8 abilitato con scale-to-zero
 
-L'immagine GPU legge `PII_GUNICORN_WORKERS` all'avvio (valori canonici da `1` a `8`, default `1`) senza un override CLI fisso. Il detector v1 supporta `PII_MODEL_BATCH_SIZE=1/4/8/16`, mantenendo `1` come default e separando richieste, file e tratti protetti. Pesi v1.5.0, precisione float32, autenticazione e contratto API restano invariati.
+Il tentativo 5 sulla stessa L40S e immagine `v1.0.0-dev.8` supera l'accettazione live: otto worker CUDA/float32 a B8, cold HTTP 200 canonico in circa 39 s, salute/auth e 72/72 risposte valide a CC8/CC16. Osservati evento nativo di scale-to-zero e due letture a zero distanti oltre 5 s. Servizio healthy, non in pausa, min 0/max 1/CC16/TTL600; una sola resume, nessuna pausa finale o nuova release. Root 1246 test e client 62 PASS, delta privato coperto al 100%. Dettagli nel [report della messa online](../substrate/traces/reports/2026-11-02-verda-n8-b8-online.md).
 
-Con `PII_VERIFY_MODEL_STARTUP=1`, ogni worker verifica CUDA e float32 ed esegue un warmup sintetico reale prima di servire richieste. A B8 verifica 63 chunk in 8 chiamate, con coda di 7, ed emette solo metadati bounded. `/health` non costituisce una barriera globale degli otto processi. Build e pubblicazione della prerelease `dev` usano GitHub Actions con scansione del digest remoto; la distribuzione sul solo test Verda richiede verifiche live separate, senza promozione in produzione.
+---
 
-Configurazione, limiti e verifica: [worker GPU e batching all'avvio](gpu-worker-startup.md).
+## 2026-11-02 - Tentativo precedente bloccato per posizionamento del provider
+
+La messa online di `envai-pii-test` non e' stata raggiunta: il provider non ha posizionato la replica (indicazione di nodi non disponibili, classificazione locale `no_nodes_available`) e l'accettazione live finale e' `FAIL`. Il deployment e' in stato failure-safe: `paused`, `min=0`, `0` repliche. Sorgente, immagine `v1.0.0-dev.8` e oracolo sono invariati; nessuna release.
+
+Nel client privato, `62` test passano (`5/5` linee modificate nel recupero) e la suite root passa con `1246` test. Non c'e' prova di GPU a freddo, stock globale o allocazione fisica in questo giro.
+
+Dettagli: [report del 2026-11-02](../substrate/traces/reports/2026-11-02-verda-online-capacity-blocker.md).
+
+---
+
+## 2026-11-01 - Immagine ordinaria `v1.0.0-dev.8` (`N8 / B8`) pubblicata e rollout su Verda parziale/bloccato
+
+L'immagine GPU legge `PII_GUNICORN_WORKERS` all'avvio (valori canonici da `1` a `8`, default `1`) senza un override CLI fisso (`--workers 1` rimosso solo da `Dockerfile.gpu`, mantenuto nel `Dockerfile` CPU). Il detector v1 supporta `PII_MODEL_BATCH_SIZE=1/4/8/16`, mantenendo `1` come default e separando richieste, file e tratti protetti con validazione fail-closed (`normalize_batch_results`). Pesi v1.5.0, precisione `float32`, indice `cu126`, autenticazione e contratto API restano invariati. Con `PII_VERIFY_MODEL_STARTUP=1`, ogni worker verifica `cuda:0` e `float32` (`parameter_bytes=1230259380`, `buffer_bytes=512`) ed esegue un warmup sintetico reale (`6252` parole `"neutral"`, `63` chunk) prima di servire richieste (`8` chiamate a `B8` con coda di `7`), emettendo solo metadati numerici su `PII_WORKER_READY` (`/health` non costituisce una barriera globale degli `8` processi).
+
+- **Sorgente e pubblicazione CI (`v1.0.0-dev.8`):** commit `8773c86895577c6040c2cbc6fd2438bfea7d7ef8` su `dev` (albero `c17d0aa5864a652edfad56fffc27c98d2b6cdcbb`, pacchetto sorgente di `12` file `7dc956b761e4b27100249be3bf9e10053d96286d5809b5b9127167a67a6162eb`, `950` test del rilascio superati senza skip in `43,816 s` su Python 3.11 e su Python 3.11/3.13/3.14 in CI, `1246` test superati nel worktree completo in `72,839 s`, copertura delta produzione `217/235` pari al `92,34%` e test `680/691` pari al `98,41%`, `quality-gate-b` (primario DeepSeek noto offline) e `security-review-specialist-a` PASS). [Release 41342246921](https://github.com/digitalygo/envai-pii/actions/runs/41342246921) e [docker-publish 41342296083](https://github.com/digitalygo/envai-pii/actions/runs/41342296083) hanno pubblicato `ghcr.io/digitalygo/envai-pii@sha256:9d7a579b45513a0ae6de01298e7312e3f849fdef98c84ccc6238541a345c6f53` (configurazione `sha256:9d7ffed2d5008d745321f7740feb6476a16e9261f0340f9620744e908a37aab4`, tag `1.0.0-dev.8`, `dev`, `1.0.0-dev.8-8773c8689557`, scansione Trivy `0 blocker(s), 239 unfixed ignored`, residuo non zero). `main` (`30d6f9c...`) resta invariato.
+- **Configurazione di `envai-pii-test`:** rimossi l'overlay diagnostico `N16 / B8` e tutte le `97` variabili carrier `ENVAIPI_VERDA_*_ARCHIVE_*` (snapshot di rollback `0600` privo di segreti salvato privatamente); applicati l'immagine `1.0.0-dev.8`, `entrypoint_overrides.enabled=false`, le `11` variabili ordinarie in chiaro (`PII_AUTH_MODE=upstream`, `PII_ANALYSIS_TIMEOUT_SECONDS=60`, `PII_GUNICORN_WORKERS=8`, `PII_MODEL_BATCH_SIZE=8`, `PII_VERIFY_MODEL_STARTUP=1`, `PII_MAX_CONCURRENT_ANALYSES=16`, `PII_MAX_QUEUED_ANALYSES=32`, `PII_QUEUE_TIMEOUT_SECONDS=30`, `OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1`, `TOKENIZERS_PARALLELISM=false`) e lo scaling `min=0`, `max=1`, `concurrent_requests_per_replica=16`, `queue_message_ttl_seconds=600` (in `9` mutazioni complessive a deployment `paused`).
+- **Esito parziale e bloccato della validazione live:** nella seconda e ultima attivazione GPU autorizzata (`22:54:02.648537Z`, pod `envai-pii-test-5c77d7d87d-fc5n6`, dopo una prima attivazione `21:27:16Z` fermata da un bug del primo client che confrontava lo SHA-256 wire `b9b5b91f...` con l'hash JSON canonico `ddda56ee...` e dopo la correzione offline del client `85cc88f8...` con `34` test offline passati, `95,91%` di copertura delta e `quality-gate-b` primo FAIL poi PASS; la diagnosi intermedia su `cu130` vs `cu126` e' falsa e ritirata), tutti gli `8` worker (`PID 202..209`) hanno emesso `PII_WORKER_READY` (`11,128448 s` da `Listening at`, `34,837916 s` dal resume accettato) e il `POST /api/v1/analyses` a freddo (`35,746288 s`) ha restituito `HTTP 200` (`45746` byte wire) con SHA-256 JSON canonico esatto `ddda56ee9282f89ecc09aac2e33ae632e97a93e45105bb6da3a294b9d9755f40`. Alle `22:54:45.239459Z` il client si e' fermato a `auth_pre_positive` (`pod_zero_unknown_or_churn`) prima delle sonde `/health`/auth post-cold (`0` eseguite), del benchmark `CC8`/`CC16` (`0/72`, `N/A`) e dello scale-to-zero naturale: la guardia `running_replica_cohort` del client richiedeva `entry["name"]` su `/replicas`, mentre lo schema OpenAPI ufficiale di Verda (`ReplicaInfo`) definisce `id`, `status` e `started_at` senza `name` (payload grezzo di `/replicas` all'errore non persistito). La chiusura failure-safe ha confermato `status: "paused"`, `min_replica_count=0` e `0` repliche attive alle `22:55:17.079104Z` e alle `23:06:00.268201+00:00` (solo pausa forzata verificata, non scale-to-zero naturale).
+
+Dettagli: [report sul rollout dell'immagine ordinaria N8 e B8](../substrate/traces/reports/2026-11-01-verda-n8-b8-ordinary-image-rollout.md), [worker GPU e batching all'avvio](gpu-worker-startup.md), [guida Verda](verda-service.md) e [automazione CI e GHCR](ci-release.md).
+
+---
+
+## 2026-10-30 - Confronto di 8, 12 e 16 copie del modello a B8 e tempi di avvio
+
+Completata la nuova serie 3x6 a batch fisso `PII_MODEL_BATCH_SIZE=8` (`B8`) con `8`, `12` e `16` copie del modello su singola L40S (`envai-pii-test`, `float32`, immagine `1.0.0-dev.7`): `402/402` richieste HTTP `200` validate per conteggio (`1206/1206` totali su `81` raffiche e `27` gruppi per matrice, un warmup escluso per matrice e zero replay), con un controllo `N8` fresco (`copy-20261029-n8`) senza riutilizzare la riga `B8` della serie precedente. A concorrenza `32`, il throughput e' `3,861909 req/s` (`N8`, media `5,971478 s`, p95 `8,015375 s`), `4,001195 req/s` (`N12`, `+3,60665%` vs `N8`, media `5,793653 s`, p95 `7,899093 s`) e `3,818058 req/s` (`N16`, `-1,13547%` vs `N8`, media `5,637245 s`, p95 `8,197978 s`), senza guadagno materiale netto; a `CC16` guida leggermente `N16` (`3,726926 req/s` contro `3,675123` di `N8` e `3,602240` di `N12`). L'avvio same-pod Gunicorn (`Listening -> all ready`, una osservazione per conteggio) cresce da `15,450720 s` (`N8`) a `17,542707 s` (`N12`) e `19,874904 s` (`N16`, `+4,424184 s` / `+28,63416%`), mentre la VRAM massima sale da `14,106934 GiB` (`70,224%` libera su `47,376160 GiB`) a `21,160950 GiB` (`55,334%` libera) e `28,213013 GiB` (`40,449%` libera). **`8` copie con `B8` (`N8 / B8`) sono raccomandate come miglior compromesso candidato tra risorse, avvio e throughput fino a `32` client**, senza cambiare il default `1` nel sorgente ne' promuovere automaticamente il profilo.
+
+Esteso il pacchetto diagnostico di 21 file (`46d02491337709447e475ebaca92e61f444bf0ae9871f638a04ffce585047a0e`, archivio XZ `17216` byte `015dd46695c207a36af412bafde7e96031ccce1c5b81ae5a34726f9bbe13dcdb`, `56` argomenti comando e `56` env carrier) mantenendo invariato il core applicativo (`app.py`, `model_batching.py`): **1233 test superati senza skip** (`74,308 s`), copertura delta produzione `412/443` (`93,0023%`) e test `946/949` (`99,6839%`), `quality-gate-a` PASS su codice ed esecuzioni live e `security-review-specialist-a` PASS sul pacchetto di preparazione `2979376b44178d5a6568c421d8a529ec86372d9282010621901e9c07fc822acf` (seguito solo dalla disambiguazione numerica offline in `startup.py`). Conservati il primo tentativo `N8` rifiutato con HTTP `400` prima dell'attivazione (`n8-b8/`) e lo startup `partial_only` di `N8` recuperato in sola lettura (`leader-n8-startup.json`). Stato finale verificato alle `2026-10-30T00:44:20.956746+00:00`: `paused`, minimo `0`/massimo `1`/concorrenza `32`, zero repliche, profilo diagnostico `N16 / B8` inattivo. Nessun commit, push, release o altra risorsa.
+
+Dettagli nel [report su 8, 12 e 16 copie e startup](../substrate/traces/reports/2026-10-30-copy-count-startup.md), nella [guida Verda](verda-service.md) e nella [guida del batching](chunk-batching.md).
+
+---
+
+## 2026-10-29 - Confronto batching completato e GPU spenta
+
+Completate le matrici B4/B8/B16: 402/402 richieste corrette per variante, stesso oracolo del B1 preservato senza ripeterlo. A concorrenza32, B8 raggiunge 4,027 richieste/s contro 2,254 di B1 (+78,68%), con media5,975s e p958,248s; B16 ha media5,598s e p958,063s ma throughput3,920 richieste/s. B8 e' il candidato per una futura validazione di produzione, non una modifica automatica del default1 o un'immagine pubblicata.
+
+Aggiunti collector riutilizzabile e test del trasporto: 1187 test superati senza skip, copertura linee866/934 (92,72%), quality e security PASS sul nuovo pacchetto. Il core precedentemente verificato resta invariato. Il timeout di raccolta finale B16 e i tentativi intermedi sono conservati; l'audit storico indipendente chiude la raccolta senza rieseguire richieste. Finale verificato: paused, minimo0/massimo1/concorrenza32, zero repliche. Nessun commit, push, release o altra risorsa.
+
+Dettagli, guardie di memoria e limiti del singolo fixture nel [report completo del confronto batching](../substrate/traces/reports/2026-10-28-chunk-batching.md).
+
+---
+
+## 2026-10-29 - B1 verificato, B4 fermo per credito e spegnimento finale richiesto (storico)
+
+La replica tornata disponibile ha completato402/402misure B1 valide; il parent ha auditato279campioni GPU attivi. B4 e' ora configurato ma la ripresa e' stata rifiutata con `insufficient_funds`; nessun warmup o benchmark B4, B8/B16 mai applicati. Stato verificato: paused con zero repliche, minimo desiderato ancora1.
+
+L'utente richiede **minimo0, pausa e zero repliche verificate dopo tutti i test**: sostituisce il precedente mantenimento caldo. Il cambio finale e' ancora pendente, il compute e' gia' fermo nella pausa attuale. Nessuna nuova macchina, ricarica automatica, immagine pubblicata o guadagno di batching dichiarato. [Stato e risultati parziali](../substrate/traces/reports/2026-10-28-chunk-batching.md).
+
+---
+
+## 2026-10-28 - Batching dei chunk implementato, confronto L40S bloccato
+
+Aggiunto `PII_MODEL_BATCH_SIZE=1/4/8/16` per raggruppare i chunk della stessa analisi v1, con default `1`. Restano separati richieste, file e tratti protetti; risultati multi-chunk malformati falliscono senza output parziale. Deadline cooperativa per gruppo, nessuna modifica a pesi, precisione, legacy o schema wire.
+
+- verifiche indipendenti: 1119 test senza skip su Python 3.11 e 3.14, copertura eseguibile del delta 550/551 (99,82%), qualita' e sicurezza mirata superate;
+- nessuna nuova immagine pubblicata: l'immagine `dev.7` da sola non riconosce il parametro. Il confronto diagnostico e' stato fermato prima di qualsiasi inferenza, sia per le env unite dal PATCH del provider sia per `SchedulingFailed` con L40S non disponibile;
+- stato Verda verificato alle 14:40:37Z: `unhealthy`, non in pausa, minimo 1/massimo 1/concorrenza 32, replica in `error`, nessuna GPU running. Nessun batch maggiore di 1 attivato e nessun guadagno misurato.
+
+Dettagli: [guida del batching](chunk-batching.md) e [report con stato e limiti](../substrate/traces/reports/2026-10-28-chunk-batching.md).
 
 ---
 
@@ -56,6 +114,32 @@ Dettagli: [guida Verda](verda-service.md#risultati-e-limiti-verificati), [requis
 
 ---
 
+## 2026-10-26 - Chiave Verda fornita, avvio bloccato dal driver CUDA
+
+La chiave di inferenza e' disponibile. Una sola riattivazione controllata di `envai-pii-test`, con configurazione e immagine `1.0.0-dev.6` invariate, ha scaricato correttamente l'immagine ma il worker non e' riuscito ad avviare CUDA.
+
+- log verificati: `The NVIDIA driver on your system is too old (found version 12080)`, poi `RuntimeError: CUDA is unavailable.`; l'host espone l'API CUDA 12.8, incompatibile con la wheel `cu130` dell'immagine;
+- nessun caricamento del modello o test di inferenza/PDF completato; due health call con chiave sono scadute lato client. Non e' piu' un blocco per chiave mancante;
+- dopo un resume e una pausa condizionale il deployment e' **in pausa, zero repliche**; nessun cambio a immagine, pin, configurazione, modello o RunPod;
+- una build CUDA 12.6 con la stessa versione PyTorch 2.13.0 e' un'opzione da approvare e validare, non una correzione gia' applicata. Test e copertura del nuovo delta di repository non applicabili: solo operativita' e documentazione, sorgente invariato.
+
+Dettagli e limiti: [diagnosi del servizio Verda](verda-service.md#risultati-e-limiti-verificati).
+
+---
+
+## 2026-10-26 - Deployment Verda creato, collaudo bloccato e servizio in pausa
+
+Pubblicata e verificata l'immagine `1.0.0-dev.6` dal sorgente `8d8b4d583e550fd832f0d361a6702bb52552a0a4`, digest `sha256:7acfb87640edb9f81c6635c593cd8544ca92b7219b780a83f4f93b8974ef2cce`. La scansione passa con zero rilievi bloccanti e 258 vulnerabilita' non corrette ignorate, non zero vulnerabilita'. Le librerie OpenSSL sono aggiornate a `3.0.22-1~deb12u2`; `dev.5`, bloccata dal gate, non e' stata distribuita.
+
+- creato esattamente un deployment `envai-pii-test`, L40S x1, minimo 0 e massimo 1 replica, concorrenza 1, porta e probe `5005` con `/health`, comando dell'immagine, `PII_AUTH_MODE=upstream`, nessun token locale o chiave del provider nel container;
+- configurazione riletta e coerente; l'endpoint dichiarato dal provider restituisce `404` testuale alle chiamate senza chiave o con chiave non valida, non una risposta dell'app. Non e' prova di bypass, ma non soddisfa il collaudo atteso `401` o `403`;
+- manca la chiave di inferenza separata: nessuna inferenza o prova positiva GPU su Verda e nessuna accettazione completa. Stato finale indipendentemente verificato: **in pausa, zero repliche**;
+- sorgente: 899 test locali superati senza skip, test CI su tre versioni Python superati, copertura del delta di autenticazione 24/26 (92.31%). Configurazione Docker e deployment: copertura di produzione non applicabile. Revisioni di sorgente e proposta di configurazione superate, verifica del confine esterno ancora bloccata. RunPod e `main` invariati.
+
+Dettagli: [guida Verda con risultati e limiti](verda-service.md#risultati-e-limiti-verificati).
+
+---
+
 ## 2026-10-26 - Aggiornamento OpenSSL richiesto dal gate dell'immagine GPU
 
 La pubblicazione `v1.0.0-dev.5` ha costruito il container ma il gate Trivy ha bloccato due rilevamenti `HIGH` correggibili di `CVE-2026-84782`. I pacchetti `openssl` e `libssl3` ereditati dalla base non venivano aggiornati dalla sola installazione delle dipendenze applicative.
@@ -79,6 +163,57 @@ Modifica del sorgente per provider che autenticano i chiamanti prima del contain
 - nessuna distribuzione verificata: l'utente ha approvato dev e deploy su Verda, ma tag pubblicato e URL non sono ancora pronti e nulla e' stato applicato o provato.
 
 Dettagli: [guida di test Verda](verda-service.md), [guida del servizio RunPod](runpod-service.md) e [contratto API](GUARDRAIL_API.md#authentication).
+
+---
+
+## 2026-10-26 - Esperimento con coda a 4 modelli fissi (solo documentazione)
+
+Cattura parziale: round 0..6 completi (224 richieste), round 7 incompleto (escluso), round 8 assente; nessun `ERROR` registrato ma ultime 40 richieste non verificabili per timeout dei log nativi. Confronto bilanciato su 64 richieste per livello (CC4, CC8, CC16, 4 modelli, B16, una A40): QPS `3.394969`, `3.342771`, `3.351383`; a CC16 circa il 71% della media e' attesa nel gate nativo. Aumentare le richieste non ha aumentato il QPS; la latenza e' cresciuta quasi interamente per l'attesa.
+
+- non e' una release ne' un'ottimizzazione abilitata: nessuna modifica a sorgente, API, pin, dtype o precisione; il candidato (4 attive in totale con coda limitata a monte) richiede implementazione e validazione;
+- Pod `38bhifvthu51px` spento su richiesta dell'utente alle 23:31:46 UTC e `EXITED` verificato alle 23:31:48 UTC; configurazione baseline ripristinata, nessuna eliminazione;
+- verifiche sorgente: 856 test del repository superati, copertura del delta 667/802 (83.167%).
+
+Dettagli: [capacita' di una singola GPU](runpod-single-gpu-capacity.md) e [guida del servizio RunPod](runpod-service.md).
+
+---
+
+## 2026-10-25 - Report sulla capacita' di una singola GPU (solo documentazione)
+
+Esperimento diagnostico autorizzato di 15 minuti sul Pod `38bhifvthu51px` (una A40): 22 casi, 240 richieste misurate tutte `200` e valide, 0 skip, 0 errori. Il budget di 2 client era il budget seriale di allora, non un limite della GPU. Su una copia il batch di 16 chunk e' il migliore tra quelli provati (`1.877386x` rispetto a batch 1); 4 copie del modello sulla stessa GPU danno `3.013062` QPS aggregati contro `1.403390` di una copia a 16 client (`2.146990x`), con contesa GPU osservata e VRAM globale usata `6971129856` byte.
+
+- non e' una release ne' una funzione distribuita: il servizio pubblico resta con un worker, batch 1 e ammissione 4 attive, 4 in coda, 5 s; il candidato richiede implementazione e validazione con carico HTTP e accuratezza. Il Serverless minimo 0 e massimo 1 e' solo una proposta;
+- limiti: chiamate dirette al core senza HTTP, due ondate brevi, campioni piccoli, utilizzo GPU ad alta frequenza non disponibile;
+- sorgente invariato: 93 test temporanei e 856 test del repository superati senza skip, copertura `89.18%`; Pod ripristinato alla configurazione baseline, acceso a `0.59` USD/h.
+
+Dettagli: [capacita' di una singola GPU](runpod-single-gpu-capacity.md), [benchmark di carico e prezzi](runpod-load-pricing.md) e [guida del servizio RunPod](runpod-service.md).
+
+---
+
+## 2026-10-25 - Benchmark autorizzato di costo e carico sul Pod `38bhifvthu51px`
+
+Con l'autorizzazione dell'utente e' stato eseguito un benchmark personalizzato in Python (k6 non installato), con dati sintetici, sul Pod `38bhifvthu51px` (A40 x1, `0.59` USD/h, immagine `v1.0.0-dev.4`). Traffico dalle `18:15:42.609Z` alle `18:23:54.253Z` (491,644 s), 1075 chiamate (6 di preflight), 1044 risposte `200` validate e 25 `429` attese, nessun errore di rete, `5xx` o di validazione.
+
+- costo del solo Pod caldo e occupato su JSON lungo: circa `0.0056` USD per 1M di caratteri; Pod acceso 24x7: `424.80` USD per 30 giorni, `42.48` USD per 1M di caratteri a 10M di caratteri al mese. Non e' un prezzo di vendita;
+- carico con 45000 caratteri: throughput `+5.99%` con 4 client e `+8.53%` con 8 rispetto a 2, con media e coda peggiori e `429` a 6 e 8 client. Raccomandazione: tetto di 2 client per documenti lunghi; abbassare il limite del server da 4 a 2 richiede approvazione e un riavvio di configurazione separati e non e' stato applicato;
+- telemetria del provider (34 campioni, CPU fino al 14%, GPU fino al 36%) a granularita' grossolana: nessuna prova di margine per alzare la concorrenza. Nessun segnale di crash o esaurimento;
+- limiti: singola esecuzione calda, nessuna prova di accuratezza, GDPR o capacita' massima; stress di 15 minuti e k6 non eseguiti. Nessun Pod, immagine, chiave, limite o configurazione modificati; sorgente invariato, test e copertura del repository N/A per questa documentazione (driver: 40 test superati, 856 test del repository superati senza skip).
+
+Dettagli: [benchmark di carico e prezzi](runpod-load-pricing.md), [guida del servizio RunPod](runpod-service.md) e [automazione CI e GHCR](ci-release.md).
+
+---
+
+## 2026-10-25 - Nuovo Pod `38bhifvthu51px` con `v1.0.0-dev.4` e concorrenza reale provata
+
+Con il consenso esplicito dell'utente e' stato creato esattamente un nuovo Pod (A40 Secure Cloud EU-SE-1, `0.59` USD/h) perche' il vecchio host non aveva GPU libere. Il Pod `38bhifvthu51px` e' `RUNNING` con il digest `sha256:c71a392411ab14aed2d4b28bb8e84e5e727f32df6e24e5238b11715d3fbaf9ef` (tag `1.0.0-dev.4`, sorgente `0f16102`), host compatibile con CUDA 13.2, A40 x1 (48 GB di VRAM da catalogo; 50 GB di memoria di sistema e 9 vCPU sono dell'host), disco 20 GB, solo `5005/http`, SSH e Jupyter spenti, stesse variabili d'ambiente del vecchio Pod per riferimento al segreto. La creazione non ha letto il valore del segreto; i test hanno letto la chiave in memoria dalla collezione privata, senza stamparla o ruotarla. Modello su GPU pronto alle 15:16:51Z. URL base di test: `https://38bhifvthu51px-5005.proxy.runpod.net`.
+
+- smoke canonico: 6 su 6 superati in 3,18 s (misura, non benchmark);
+- concorrenza: quattro client HTTP con barriera, ciascuno con 45034 caratteri Unicode sintetici, tutte `200`, nessun `429` o `500`, intervalli sovrapposti, nessuna email altrui nei risultati o nei delta; durate 4,74, 4,51, 4,29 e 2,50 s, gruppo 4,79 s. Secondo gruppo misto (2 JSON e 2 PDF sintetici, categorie predefinite) tutte `200` in 0,23 a 0,32 s; `POST /pdf` legacy `200` con PDF valido;
+- limiti: le quattro sono richieste HTTP accettate e avanzate, non quattro forward GPU paralleli (il forward del modello resta serializzato di proposito; due thread proprietari nativi separati per modello e PDF). Nessuna prova di capacita' massima, throughput quadruplicato, accuratezza o GDPR; stress di 15 minuti e k6 non eseguiti. Controlli del server invariati (4 attive, 4 in coda, 5 s). Gate Trivy `0 blocker(s), 247 unfixed ignored`: non e' zero vulnerabilita';
+- Pod vecchio `2glj7taobhnhvg`: resta `EXITED`, configurazione invariata, non eliminato ne' avviato; il suo URL e' solo storico. Il rifiuto d'avvio per mancanza di GPU libere nelle voci sotto resta storico;
+- il nuovo Pod resta acceso per i test dell'utente (`0.59` USD/h) finche' l'utente non lo ferma; lo stop rilascia l'host GPU e un riavvio puo' fallire di nuovo. Nessun sorgente modificato, copertura del delta non applicabile (operativo e documentazione); suite locale Python 3.11 di 856 test superata senza skip. Il Markdown privato dei parametri e' aggiornato; nell'export Postman il vecchio `baseUrl` va sostituito localmente con il nuovo indirizzo.
+
+Dettagli: [guida del servizio RunPod](runpod-service.md) e [automazione CI e GHCR](ci-release.md).
 
 ---
 

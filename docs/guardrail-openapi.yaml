@@ -23,8 +23,10 @@ info:
     `tests/test_guardrail_multifiles.py` and `tests/test_guardrail_pdf_privacy.py`, with
     the bounded collector in `tests/test_pdf_text_limits.py`; category selection has
     dedicated coverage in `tests/test_guardrail_categories.py`. Pre-body ordering is
-    explicit: token configuration, credentials and model readiness yield 503, 401 and
-    503 before admission. Admission is a bounded per-process active limit with a finite
+    explicit: in default local-authentication mode, token configuration, credentials
+    and model readiness yield 503, 401 and 503 before admission (when
+    `PII_AUTH_MODE=upstream`, the local token configuration and credential checks are
+    skipped). Admission is a bounded per-process active limit with a finite
     FIFO queue. When all active slots are occupied, a full or disabled queue yields
     429 immediately and a queued request whose wait expires also yields 429; neither
     outcome reads or parses the body. An admission lease is held through the bounded
@@ -60,24 +62,42 @@ info:
       text-only: no OCR, no raster redaction, no PDF binary or ZIP output, no
       attachment extraction, and no promise that text inside images is protected.
 
-    Authentication is a server-only Bearer secret from the `PII_API_TOKEN` environment
-    variable. The value is never documented, logged or echoed. When the secret is unset
-    or blank the endpoint is disabled and answers 503; missing or wrong credentials
-    answer 401. Authentication and model readiness are evaluated before admission, and
-    the body is read only after an admission lease is acquired. Authentication failures,
-    unavailable readiness, a full or disabled queue, and expired queue waits therefore
-    do not read or parse body bytes. POST errors are sanitized to `{error, code}` with
-    stable codes and never echo request values, filenames, authorization headers or the
-    token. Successful responses intentionally contain input-derived `anonymized_text` and
-    newly allocated original values in `dictionary_delta`; text not detected as PII stays
-    unchanged. The service must not log request values, filenames, seed values, file
-    contents, placeholder-original pairs, authorization headers or the token. Request-scoped
-    state is released after the response; no global mapping or file cache is retained across
-    requests. Releasing references is not a secure-erasure guarantee, and runtime-managed
-    memory copies may remain. An unsupported method answers `405` with the framework's
-    generic JSON error body, not this envelope, and preserves the `Allow` header; an
-    automatic `OPTIONS` answers an empty `200`.
-    Every response at the path sets `Cache-Control: no-store`.
+    By default, authentication is a server-only Bearer secret from the `PII_API_TOKEN`
+    environment variable. The value is never documented, logged or echoed. In default
+    local-authentication mode, when the secret is unset or blank the endpoint is
+    disabled and answers 503, and missing or wrong credentials answer 401. The exact
+    server environment setting `PII_AUTH_MODE=upstream` is the only opt-in exception:
+    it skips the local token prerequisite and check so `PII_API_TOKEN` may be unset,
+    while absent, blank or any other value retains local Bearer enforcement. Clients
+    cannot select or override the authentication mode via headers, query parameters or
+    body fields. Authentication is not optional: `PII_AUTH_MODE=upstream` is valid only
+    when a trusted upstream proxy or provider authenticates every exposed route
+    (including analyses, settings and legacy routes) and no untrusted direct container
+    access is possible; provider inference credentials belong to the caller and provider
+    boundary and are never passed into the container (on Verda, callers send
+    `Authorization: Bearer <Verda inference key>`, not cloud management credentials).
+    Authentication (when checked locally) and model readiness are evaluated before
+    admission, and the body is read only after an admission lease is acquired.
+    Authentication failures, unavailable readiness, a full or disabled queue, and
+    expired queue waits therefore do not read or parse body bytes. Application POST
+    errors are sanitized to `{error, code}` with stable codes and never echo request
+    values, filenames, authorization headers or the token. Successful responses
+    intentionally contain input-derived `anonymized_text` and newly allocated original
+    values in `dictionary_delta`; text not detected as PII stays unchanged. The service
+    must not log request values, filenames, seed values, file contents,
+    placeholder-original pairs, authorization headers or the token. Request-scoped
+    state is released after the response; no global mapping or file cache is retained
+    across requests. Releasing references is not a secure-erasure guarantee, and
+    runtime-managed memory copies may remain. An unsupported method answers `405` with
+    the framework's generic JSON error body, not this envelope, and preserves the
+    `Allow` header; an automatic `OPTIONS` answers an empty `200`. Every application
+    response at the path sets `Cache-Control: no-store`. Edge or proxy rejections
+    generated before a request reaches the application (for example, the
+    provider-specific 19-byte plain-text `404` observed on Verda when the Bearer
+    inference key is missing or invalid; an observation, not a permanent status or
+    schema promise) are governed by that upstream boundary and are not covered by the
+    application's `{error, code}` error-envelope or `Cache-Control: no-store`
+    guarantees (a proxy may coincidentally emit the same header or shape).
 
     Bounded dictionary and JSON-body limits are resolved once per authenticated request.
     `PII_MAX_SEED_ENTRIES` defaults to 10000 and is capped at 20000;
@@ -123,12 +143,20 @@ info:
     single input (never across requests, files or protected gaps) and failing closed
     with 500 `internal_error` on malformed or mismatched pipeline batch outputs. These settings are
     resolved at process startup and remain frozen until restart; they are not request
-    properties. Admission limits are per process. The provided Gunicorn configuration
-    uses one worker, sets `preload_app` to false, and sizes the request thread pool to
-    active capacity plus queue capacity plus two (10 threads with defaults). More HTTP
-    admission capacity does not make native model forwards concurrent or guarantee
-    throughput improvement: model
-    execution remains serialized in its native lane, PDF work uses a separate
+    properties. Admission limits, model instances and native execution lanes are per
+    worker process. The provided Gunicorn configuration (`src/app/gunicorn_config.py`)
+    resolves `PII_GUNICORN_WORKERS` from canonical strings `"1"`..`"8"` after stripping
+    surrounding whitespace (default and fallback `1` when absent, blank or unsupported),
+    sets `preload_app` to false, and sizes each worker's `gthread` request thread pool
+    to active capacity plus queue capacity plus two (`active + queued + 2` per worker,
+    10 threads per worker with defaults). The CPU `Dockerfile` still forces `--workers 1`
+    on the command line so `PII_GUNICORN_WORKERS` does not change its worker count,
+    whereas `Dockerfile.gpu` does not force a CLI worker count and honors the configured
+    value, with each GPU worker process independently loading its own model copy. More
+    HTTP admission capacity within a worker does not make native model forwards
+    concurrent, and running multiple worker processes shares the same GPU and host
+    resources so neither is a linear throughput guarantee: within each worker process,
+    model execution remains serialized in its native lane, PDF work uses a separate
     single-thread lane, and native objects do not cross those lanes.
 
     `categories` is a request-only whitelist of canonical `TAG_NAMES` labels that selects
@@ -155,6 +183,13 @@ servers:
       Placeholder origin for an internal deployment behind an authenticated proxy with
       TLS. Replace with the real internal origin; do not expose the endpoint directly
       outside loopback or a private network.
+  - url: https://containers.datacrunch.io/envai-pii-test
+    description: |
+      Verda Containers test deployment endpoint behind provider-enforced Bearer
+      authentication (`Authorization: Bearer <Verda inference key>`, using a dedicated
+      inference key rather than cloud management credentials, with container
+      `PII_AUTH_MODE=upstream`). Listing this URL implies no live availability, replica
+      state or SLA guarantee.
 
 tags:
   - name: guardrail
@@ -221,11 +256,13 @@ paths:
         statuses, codes and messages once the pre-body checks pass, and adds only the
         optional `categories` field to the request schema. JSON-body and dictionary
         capacities use the bounded server defaults and hard ceilings above. Request-order
-        outcomes can differ when multiple conditions are invalid: configuration,
-        credentials and readiness are checked first; then admission is acquired, possibly
+        outcomes can differ when multiple conditions are invalid: in default
+        local-authentication mode, configuration, credentials and readiness are checked
+        first (when `PII_AUTH_MODE=upstream`, the local token configuration and
+        credential checks are skipped); then admission is acquired, possibly
         after a bounded FIFO queue wait. Only after admission are the overall media type
         and charset validated and the body cap chosen before the bounded read. Thus
-        configuration, authorization, readiness and admission outcomes take precedence
+        applicable configuration, authorization, readiness and admission outcomes take precedence
         over body errors; a full or disabled queue and an expired queue wait answer 429
         without reading or parsing the body, while an unsupported type or charset answers
         415 without reading it. This does not preserve every historical JSON error outcome.
@@ -376,16 +413,28 @@ components:
       type: http
       scheme: bearer
       description: |
-        Server-only secret from the `PII_API_TOKEN` environment variable. The value is
-        never documented, logged or echoed. When the variable is unset or blank the
-        endpoint is disabled and answers 503 before credentials are evaluated; a missing
-        or wrong credential answers 401. No other authentication mode is accepted.
+        Bearer authentication required on every call. By default, the application
+        verifies a server-only secret from the `PII_API_TOKEN` environment variable: the
+        value is never documented, logged or echoed; when the variable is unset or blank
+        the endpoint is disabled and answers 503 before credentials are evaluated, and a
+        missing or wrong credential answers 401 before any body byte is read. Only the
+        exact server environment setting `PII_AUTH_MODE=upstream` skips the local token
+        prerequisite and check (absent, blank or any other value keeps local Bearer
+        verification, and client headers, query parameters or body fields cannot select
+        it). Upstream mode is permitted only behind a trusted proxy or provider that
+        authenticates every exposed route (including analyses, settings and legacy
+        routes) with no untrusted direct container access; on Verda, callers send
+        `Authorization: Bearer <Verda inference key>` (never cloud management
+        credentials) and the provider key is never passed into the container.
 
   headers:
     NoStore:
       description: |
         Always `no-store`. Responses may contain personal data and must not be cached by
-        proxies. Set on every outcome, success and error, including 405 and OPTIONS.
+        proxies. Set on every application outcome, success and error, including 405 and
+        OPTIONS (upstream proxy or provider rejections before reaching the application
+        are governed by that boundary and are not covered by this application
+        guarantee).
       schema:
         type: string
         enum:
@@ -419,8 +468,14 @@ components:
             $ref: '#/components/schemas/Error'
     Unauthorized:
       description: |
-        Missing or wrong Bearer credential. Code: `unauthorized`. Evaluated before any
-        body byte is read.
+        Missing or wrong Bearer credential in default local-authentication mode. Code:
+        `unauthorized`. Evaluated before any body byte is read. When
+        `PII_AUTH_MODE=upstream`, the application skips local token verification and
+        relies on the upstream boundary to reject unauthenticated calls before they
+        reach the container; those upstream rejections are outside the application's
+        error-envelope and `Cache-Control: no-store` guarantees (for example, Verda's
+        observed 19-byte plain-text `404` on missing or invalid inference keys is an
+        observed provider rejection, not a permanent status or schema promise).
       headers:
         Cache-Control:
           $ref: '#/components/headers/NoStore'
@@ -507,9 +562,11 @@ components:
             $ref: '#/components/schemas/Error'
     Unavailable:
       description: |
-        `PII_API_TOKEN` is unset or blank, so the endpoint is disabled; the model is not
-        ready (readiness is checked before admission, even when the text could be resolved
-        entirely from the seed or from placeholders already present); the
+        In default local-authentication mode, `PII_API_TOKEN` is unset or blank, so the
+        endpoint is disabled (skipped only when the server environment sets the exact
+        value `PII_AUTH_MODE=upstream`); the model is not ready (readiness is checked
+        before admission, even when the text could be resolved entirely from the seed or
+        from placeholders already present); the
         detector became unavailable mid-request; the native MuPDF privacy controls
         required by the guardrail PDF branch are missing or broken; or the service is
         unavailable. Code: `unavailable`. The PDF condition blocks only PDF extraction:
@@ -827,12 +884,17 @@ components:
       type: object
       additionalProperties: false
       description: |
-        Error envelope for `POST /api/v1/analyses` only. The endpoint keeps the two-field
-        shape for every outcome, including file errors: no per-input error object and no
-        `input_id`. A request with an unsupported method does not use this envelope: it
-        answers `405` with the framework's generic JSON error body, preserves the `Allow`
-        header, and an automatic `OPTIONS` answers an empty `200`. Every response at the
-        path still sets `Cache-Control: no-store`.
+        Application error envelope for `POST /api/v1/analyses` only. The endpoint keeps
+        the two-field shape for every application outcome, including file errors: no
+        per-input error object and no `input_id`. A request with an unsupported method
+        does not use this envelope: it answers `405` with the framework's generic JSON
+        error body, preserves the `Allow` header, and an automatic `OPTIONS` answers an
+        empty `200`. Every application response at the path still sets
+        `Cache-Control: no-store`. Rejections generated by an upstream proxy or provider
+        before a request reaches the application are governed by that boundary and are
+        not covered by the application's `{error, code}` error-envelope or
+        `Cache-Control: no-store` guarantees (a proxy may coincidentally emit the same
+        header or shape).
       required:
         - error
         - code

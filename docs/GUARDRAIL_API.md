@@ -48,9 +48,9 @@ schema; this document records the semantics, limits and decisions behind it.
 | Delta | New pairs only, selected categories only, first normalized-original binding wins across categories, value is its first surface form, and the request-local binding is reused in later inputs |
 | Limits | JSON defaults: body 8388608 bytes, seed 10000 entries, 4096 chars per original and 1048576 aggregate chars; hard ceilings: 16777216 bytes, 20000 entries, 65536 chars per original and 2097152 aggregate chars. Multipart: body 20 MiB, each file 5 MiB, max 10 files, max 13 parts, dictionary field follows the configured JSON-body cap, other value fields 1 MiB, 100000 aggregate text chars, 200 pages per PDF |
 | Deadline | Server-configured cooperative processing budget, default 60 s from `PII_ANALYSIS_TIMEOUT_SECONDS`, after the bounded body read, while the admission lease is held; queue wait and upload time are not deducted; covers multipart parse, extraction, all inputs and allocation |
-| Concurrency | Per process, up to 4 active analyses and a FIFO queue of 4 waiting requests for at most 5 s (startup settings); a waiting request has its body unread while it is queued and, once admitted, reads the body and is processed normally (200 or the usual errors); only a full or disabled queue, or an expired wait, is rejected with 429 `busy` without reading the body |
-| Errors | Endpoint bodies are exactly `{error, code}`; JSON body-validation statuses, codes and messages are unchanged, but pre-body outcomes take precedence; multipart adds `unsupported_file_type` (415) and `empty_file`, `unreadable_file`, `no_extractable_text` (422) |
-| Caching | `Cache-Control: no-store` on every response at the endpoint path, including 405 and OPTIONS |
+| Concurrency | Per worker process, up to 4 active analyses and a FIFO queue of 4 waiting requests for at most 5 s (startup settings); a waiting request has its body unread while it is queued and, once admitted, reads the body and is processed normally (200 or the usual errors); only a full or disabled queue, or an expired wait, is rejected with 429 `busy` without reading the body |
+| Errors | Application endpoint error bodies are `{error, code}`; JSON body-validation statuses, codes and messages are unchanged, but pre-body outcomes take precedence; multipart adds `unsupported_file_type` (415) and `empty_file`, `unreadable_file`, `no_extractable_text` (422); upstream proxy or provider rejections before reaching the application are governed by that boundary and are not covered by application error-envelope or `Cache-Control: no-store` guarantees |
+| Caching | `Cache-Control: no-store` on every application response at the endpoint path, including 405 and OPTIONS |
 | Implementation | Both arms implemented; the optional `categories` field is the 0.3.0 addition and 0.4.0 changes only admission semantics; with `categories` absent the success shape and category defaults match the 0.1.0 contract; JSON-body and dictionary limits use the bounded server defaults documented below |
 | Out of scope | OCR, raster redaction, embedded attachments, PDF binary or ZIP output, JSON batch arrays, UI, training, AAAS changes |
 
@@ -98,10 +98,12 @@ The JSON arm of `/api/v1/analyses` keeps the schema 0.1.0 request fields and add
 body-validation statuses, codes and messages are preserved once pre-body checks pass. JSON body
 and dictionary capacities now have larger bounded defaults and server-configurable ceilings. A
 client that omits `categories` still sees the historical all-24-category behavior and the same
-success shape. Clients do not need to change their JSON request or success-response handling. Pre-body ordering is updated: configuration, credentials, model readiness and admission
-checks run before the body is read, taking precedence in the documented 503, 401, 503 and 429
-order. A combined-invalid request can therefore receive a different result from the historical
-body-read precedence.
+success shape. Clients do not need to change their JSON request or success-response handling.
+Pre-body ordering is updated: in default local-authentication mode, configuration, credentials,
+model readiness and admission checks run before the body is read, taking precedence in the
+documented 503, 401, 503 and 429 order (when `PII_AUTH_MODE=upstream`, the local configuration and
+credential checks are skipped). A combined-invalid request can therefore receive a different result
+from the historical body-read precedence.
 
 The multifile extension is additive and implemented: same path, same method, same authentication,
 same response envelope. It adds no JSON batch mode; its only wire additions are the optional
@@ -127,13 +129,13 @@ built only for the duration of the request. Legacy request fields such as `exclu
 
 ## Authentication
 
-- The credential is the server-only environment secret `PII_API_TOKEN`. Its value is never
-  documented, logged, echoed or returned. The token is configured on the server; clients cannot
-  supply or choose it.
-- When `PII_API_TOKEN` is unset or blank, the endpoint is disabled and answers `503` with code
-  `unavailable`.
-- Requests must send `Authorization: Bearer <token>`. A missing or wrong credential answers `401`
-  with code `unauthorized`.
+- By default, the credential is the server-only environment secret `PII_API_TOKEN`. Its value is
+  never documented, logged, echoed or returned. The token is configured on the server; clients
+  cannot supply or choose it.
+- In default local-authentication mode, when `PII_API_TOKEN` is unset or blank, the endpoint is
+  disabled and answers `503` with code `unavailable`.
+- In default local-authentication mode, requests must send `Authorization: Bearer <token>`. A
+  missing or wrong credential answers `401` with code `unauthorized`.
 - Credential comparison is constant-time and does not short-circuit on the value; the presented
   token is never logged or echoed.
 - Configuration state is evaluated before credentials: a disabled endpoint answers `503`
@@ -148,9 +150,20 @@ built only for the duration of the request. Legacy request fields such as `exclu
   Any other value, including an absent, blank or differently cased one, keeps the local Bearer
   behavior described above. The mode is read only from the server environment, never from request
   headers, query or body, and the image does not default to it.
-- Upstream mode changes who authenticates, not the contract: CUDA, model readiness, limits,
-  admission and `Cache-Control: no-store` are unchanged, and no request or response field is added
-  or changed.
+- Authentication is not optional in upstream mode: the upstream proxy or provider must authenticate
+  every exposed route (including analyses, settings and legacy routes) and no untrusted caller may
+  reach the container directly. Provider inference keys belong to the caller and provider boundary
+  and are never passed into the container; on Verda Containers (such as the test endpoint
+  `https://containers.datacrunch.io/envai-pii-test`), callers authenticate at the provider boundary
+  with `Authorization: Bearer <Verda inference key>`, never cloud management credentials.
+- Upstream mode changes who authenticates, not the application contract: CUDA, model readiness,
+  limits, admission and `Cache-Control: no-store` on application responses are unchanged, and no
+  request or response field is added or changed. Rejections generated by an upstream proxy or
+  provider before a request reaches the container (for example, the provider-specific 19-byte
+  plain-text `404` observed on Verda when the inference key is missing or invalid; an observation,
+  not a permanent status or schema promise) are governed by that upstream boundary and are not
+  covered by the application's `{error, code}` error-envelope or `Cache-Control: no-store`
+  guarantees (a proxy may coincidentally emit the same header or shape).
 
 ### Request ordering and the body read
 
@@ -198,9 +211,14 @@ built only for the duration of the request. Legacy request fields such as `exclu
   in the server environment (for example `PII_ANALYSIS_TIMEOUT_SECONDS=120`), independently of the
   `PII_API_TOKEN` secret. The value is read once per request before the deadline snapshot, and
   clients cannot override it.
-- Admission is also server configuration, read once at startup (see Concurrency). The container
-  commands of both images load `src/app/gunicorn_config.py`, which sets one `gthread` worker,
-  no `--preload` and `threads = active + queue + 2` (10 by default).
+- Admission is also server configuration, read once at startup per worker process (see Concurrency).
+  The container commands of both images load `src/app/gunicorn_config.py`, which resolves
+  `PII_GUNICORN_WORKERS` from canonical strings `"1"`..`"8"` after stripping surrounding whitespace
+  (defaulting and falling back to `1` when unset, blank or unsupported), sets `preload_app = False`
+  (no `--preload`), and sizes each `gthread` worker to `threads = active + queue + 2` per worker
+  (10 threads per worker by default). The CPU `Dockerfile` still passes `--workers 1` on the
+  Gunicorn command line, so `PII_GUNICORN_WORKERS` does not change its worker count;
+  `Dockerfile.gpu` omits that CLI flag and honors `gunicorn_config.py`.
 - Intra-analysis model chunk batching for `POST /api/v1/analyses` is configured once at process
   startup from the server-only environment variable `PII_MODEL_BATCH_SIZE`: surrounding whitespace
   is stripped and canonical values `1`, `4`, `8` and `16` are accepted, while unset, blank or
@@ -916,7 +934,7 @@ not send CSV, because `FULLNAME,EMAIL` is not valid JSON.
 
 ## Errors
 
-Every error response to `POST /api/v1/analyses` has exactly this body:
+Every application error response to `POST /api/v1/analyses` has exactly this body:
 
 ```json
 {"error": "Invalid request.", "code": "invalid_request"}
@@ -928,12 +946,17 @@ Every error response to `POST /api/v1/analyses` has exactly this body:
   contents, authorization headers, the token, stack traces or exception text.
 - The endpoint keeps the two-field envelope for every outcome, including file errors: there is no
   per-input error object and no `input_id` in the error body.
-- This envelope covers the endpoint's own outcomes only. A request to the same path with an
-  unsupported method keeps the framework's HTTP method semantics: a wrong method answers `405` with
-  the framework's generic JSON error body (not this envelope) and preserves the `Allow` header, and
-  an automatic `OPTIONS` answers an empty `200` with the framework's usual headers. Every response
-  at `/api/v1/analyses`, including those `405` and `OPTIONS` responses, still sets
-  `Cache-Control: no-store`.
+- This envelope covers the endpoint's own application outcomes only. A request to the same path
+  with an unsupported method keeps the framework's HTTP method semantics: a wrong method answers
+  `405` with the framework's generic JSON error body (not this envelope) and preserves the `Allow`
+  header, and an automatic `OPTIONS` answers an empty `200` with the framework's usual headers.
+  Every application response at `/api/v1/analyses`, including those `405` and `OPTIONS` responses,
+  still sets `Cache-Control: no-store`. Failures generated by an edge proxy or upstream provider
+  before a request reaches the application (for example, the provider-specific 19-byte plain-text
+  `404` observed on Verda when the Bearer inference key is missing or invalid; an observation, not
+  a permanent status or schema promise) are governed by that upstream boundary and are not covered
+  by the application's `{error, code}` error-envelope or `Cache-Control: no-store` guarantees (a
+  proxy may coincidentally emit the same header or shape).
 
 Stable codes:
 
@@ -949,7 +972,7 @@ Stable codes:
 | 422 | `empty_file` | A multipart text file is zero-byte or decodes to blank text; message `File is empty.` |
 | 422 | `unreadable_file` | A multipart PDF is corrupt, encrypted or otherwise unreadable; message `Unable to read file.` |
 | 422 | `no_extractable_text` | A multipart PDF is valid but has no non-blank extractable text; message `File has no extractable text. OCR is not available.` |
-| 401 | `unauthorized` | Missing or wrong Bearer credential |
+| 401 | `unauthorized` | Missing or wrong Bearer credential (default local-authentication mode; skipped when `PII_AUTH_MODE=upstream`) |
 | 429 | `busy` | All active slots are taken and the queue is full or disabled, or the queue wait expired |
 | 503 | `unavailable` | `PII_API_TOKEN` unset or blank (endpoint disabled, except in upstream mode), model not ready, detector unavailable mid-request, service unavailable, or native MuPDF privacy controls unavailable for guardrail PDF extraction |
 | 504 | `deadline_exceeded` | The configured cooperative processing budget was reached |
@@ -1019,13 +1042,16 @@ messages; the new file codes use exactly the messages quoted in the table.
   included.
 - The queue wait is a separate budget: it is not deducted from the analysis deadline, which still
   starts after the body read. Upload time is likewise excluded.
-- Native work is serialized by two dedicated single-owner threads, one for PDF and one for model
-  calls. A submission gate is held until the previous future completes, so the internal executor
-  backlog stays bounded; recursive PDF calls run inline and no native object is returned across
-  threads. The model cache stays one shared instance per process and model forwards are
-  intentionally serialized, so four active analyses do not mean four parallel GPU forwards or four
-  times the throughput. CPU-side request phases (body read, parsing, validation, anonymization)
-  run concurrently.
+- Native work is serialized within each worker process by two dedicated single-owner threads, one
+  for PDF and one for model calls. A submission gate is held until the previous future completes,
+  so the internal executor backlog stays bounded; recursive PDF calls run inline and no native
+  object is returned across threads. Admission limits, the model cache and the native lanes are per
+  worker process: in multi-worker GPU deployments (`PII_GUNICORN_WORKERS` `1`..`8`), each GPU
+  worker process independently loads its own model copy and runs its own admission controller and
+  native lanes. Within a single worker, model forwards remain serialized so four active analyses do
+  not mean four parallel GPU forwards; across multiple workers, adding worker processes shares the
+  same GPU and host resources and is not a linear throughput guarantee. CPU-side request phases
+  (body read, parsing, validation, anonymization) run concurrently across request threads.
 - Legacy PDF operations use the same PDF owner thread. The other legacy routes are not subject to
   the admission gate.
 
@@ -1050,7 +1076,7 @@ messages; the new file codes use exactly the messages quoted in the table.
   buffer is reset after every attempt in the guardrail PDF branch that reaches the native parser;
   this is a privacy measure for that path, not a secure-erasure guarantee, and it leaves legacy
   route behavior on the wire unchanged. See native PDF privacy controls above.
-- Every response at `/api/v1/analyses`, success or error, sets `Cache-Control: no-store`,
+- Every application response at `/api/v1/analyses`, success or error, sets `Cache-Control: no-store`,
   including framework-level `405` and automatic `OPTIONS` responses. Responses may contain
   personal data and must not be cached by proxies. Legacy routes keep their existing caching
   behaviour.
